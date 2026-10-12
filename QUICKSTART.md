@@ -31,6 +31,6 @@ python3 mirror.py import /media/usb/carry.tar             # or a received direct
 3. Set where it sends: `MIRROR_SEND_PATH` (a directory mounted on the runner), `NIFI_URL`, or `S3_BUCKET` with `S3_ENDPOINT` and the `AWS_*` keys. Set none to sync only.
 4. **Build > Pipelines > Run pipeline** on the default branch. `EXPORT_ALL=true` sends every image again.
 
-It works when the `sync` job log ends `sent: mirror-export-<pipeline>.tar` and the high `import` prints `imported: <host>/team/prometheus:v3.13.4@sha256:...`.
+It works when the `sync` job log ends `sent: container-images-<pipeline>.tar` and the high `import` prints `imported: <host>/team/prometheus:v3.13.4@sha256:...`.
 
 If `import` says a tag `does not move without --force`, the high tag points at another digest: check it, then rerun with `--force`.

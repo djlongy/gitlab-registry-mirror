@@ -796,7 +796,7 @@ def export(path, ledger_file, entries=(), listing=None, everything=False, output
     if not wanted:
         print("nothing new to export")
         return []
-    output = Path(output or datetime.now(timezone.utc).strftime("mirror-export-%Y%m%dT%H%M%SZ.tar"))
+    output = Path(output or datetime.now(timezone.utc).strftime("container-images-%Y%m%dT%H%M%SZ.tar"))
     if output.suffix != ".tar":
         raise MirrorError(f"{output}: the output must end in .tar")
     images = []
@@ -1363,7 +1363,7 @@ Low side:
   export TARGET_REGISTRY=registry.low.example.com
   mirror.py sync                                    # copy images.txt into TARGET_REGISTRY
   mirror.py export                                  # what sync added and send has not delivered, as one tar
-  mirror.py send mirror-export-*.tar --path /mnt/transfer       # or --nifi-url URL, or --s3-bucket NAME
+  mirror.py send container-images-*.tar --path /mnt/transfer       # or --nifi-url URL, or --s3-bucket NAME
 
 High side:
   export TARGET_REGISTRY=registry.high.example.com
@@ -1414,16 +1414,16 @@ def main(argv=None):
     export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag")
     export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
     export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
-    export_command.add_argument("-o", "--output", type=Path, help="the tar to write (default mirror-export-<UTC time>.tar here)")
+    export_command.add_argument("-o", "--output", type=Path, help="the tar to write (default container-images-<UTC time>.tar here)")
     export_command.add_argument("--max-size", default=os.environ.get("MIRROR_MAX_SIZE"),
                                 help="split into tars of at most this size, e.g. 4GiB (or MIRROR_MAX_SIZE; default one tar)")
     staging_flag(export_command)
     base_flag(export_command)
     send_command = command(
         "send", "deliver tars and their .sha256 files to NiFi, an S3 bucket or a directory",
-        "  mirror.py send mirror-export-*.tar --path /mnt/transfer     # an NFS share or a USB stick\n"
-        "  mirror.py send mirror-export-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
-        "  mirror.py send mirror-export-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys")
+        "  mirror.py send container-images-*.tar --path /mnt/transfer     # an NFS share or a USB stick\n"
+        "  mirror.py send container-images-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
+        "  mirror.py send container-images-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys")
     send_command.add_argument("tars", nargs="+", type=Path, help="tar files export wrote")
     where = send_command.add_mutually_exclusive_group(required=True)
     where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
