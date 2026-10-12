@@ -121,16 +121,42 @@ def run(*args):
 
 # Credentials come from skopeo's default auth file, written by `skopeo login` or
 # `podman login`. REGISTRY_AUTH_FILE moves it for both the login and this script.
-def options(side, direction=""):
+def options(side, direction="", reference=""):
     if side and os.environ.get(f"{side}_TLS_VERIFY") == "false":
         return [f"--{direction}tls-verify=false"]
-    return [f"--{direction}cert-dir={ca_files()[1]}"] if ca_files() else []
+    return [f"--{direction}cert-dir={cert_dir(host_of(reference))}"] if ca_files() else []
+
+
+def host_of(reference):
+    return reference.split("://", 1)[-1].split("/", 1)[0]
+
+
+# Where skopeo looks for a registry's own CA and client certificates, first match wins.
+CERTS_D = (Path.home() / ".config/containers/certs.d", Path("/etc/containers/certs.d"), Path("/etc/docker/certs.d"))
+
+
+@functools.cache
+def cert_dir(host):
+    """skopeo --cert-dir for host. --cert-dir replaces the host's certs.d directory, so link that
+    directory's files in beside CA_BUNDLE: what the system already trusts, and any client certificate,
+    keeps working."""
+    base = ca_files()[1]
+    own = next((d / host for d in CERTS_D if host and (d / host).is_dir()), None)
+    if own is None:
+        return base
+    directory = base / re.sub(r"[^A-Za-z0-9.-]", "_", host)
+    directory.mkdir()
+    shutil.copyfile(base / "ca.crt", directory / "mirror-ca-bundle.crt")
+    for item in own.iterdir():
+        (directory / item.name).symlink_to(item.resolve())
+    return directory
 
 
 @functools.cache
 def ca_files():
-    """CA_BUNDLE, a PEM file of one or more CA (or self-signed server) certificates, trusted by every
-    connection on top of the system roots: (the file, a skopeo cert dir, a bundle for curl). None when unset."""
+    """CA_BUNDLE, a PEM file of one or more CA (or self-signed server) certificates. Every connection
+    trusts it in addition to what the system already trusts, never instead: (the file, a skopeo cert dir,
+    curl's trust arguments). None when unset."""
     setting = os.environ.get("CA_BUNDLE", "").strip()
     if not setting:
         return None
@@ -150,7 +176,7 @@ def ca_files():
 
 def raw_digest(reference, side):
     # A manifest digest is the sha256 of its exact bytes, which --raw returns.
-    raw = run("skopeo", "inspect", "--raw", *options(side), reference)
+    raw = run("skopeo", "inspect", "--raw", *options(side, reference=reference), reference)
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
@@ -176,7 +202,7 @@ def side_of(reference):
 
 def fetch_manifest(reference, side=None):
     """The manifest bytes at reference@digest, checked against that digest."""
-    raw = run("skopeo", "inspect", "--raw", *options(side or side_of(reference)), reference)
+    raw = run("skopeo", "inspect", "--raw", *options(side or side_of(reference), reference=reference), reference)
     if "sha256:" + hashlib.sha256(raw).hexdigest() != reference.rsplit("@", 1)[1]:
         raise MirrorError(f"manifest digest mismatch: {reference}")
     return raw
@@ -190,9 +216,9 @@ def transport_reference(source):
 def copy(source, destination, source_side=None, destination_side=None):
     args = ["skopeo", "copy", "--all", "--preserve-digests", "--retry-times=3"]
     if source.startswith("docker://"):
-        args += options(source_side, "src-")
+        args += options(source_side, "src-", source)
     if destination.startswith("docker://"):
-        args += options(destination_side, "dest-")
+        args += options(destination_side, "dest-", destination)
     run(*args, source, destination)
 
 
@@ -397,7 +423,7 @@ def resolve_entry(source, target):
         raise MirrorError(f"{source} has no registry host; give the full reference, for example {normalise(source)}")
     if not SOURCE.fullmatch(name) or not TARGET.fullmatch(target):
         raise MirrorError("add needs registry/repo:tag and org/repo[/path]")
-    raw = run("skopeo", "inspect", "--raw", *options(side_of(source)), "docker://" + transport_reference(source))
+    raw = run("skopeo", "inspect", "--raw", *options(side_of(source), reference=source), "docker://" + transport_reference(source))
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
         raise MirrorError(f"{name} is a signature, attestation or metadata artifact, not a container image; "
@@ -494,14 +520,14 @@ def platform_digest(reference, digest, side):
     wanted = os.environ.get("MIRROR_PLATFORM", "").strip()
     if not wanted:
         return digest
-    data = json.loads(run("skopeo", "inspect", "--raw", *options(side), reference))
+    data = json.loads(run("skopeo", "inspect", "--raw", *options(side, reference=reference), reference))
     keys = ("os", "architecture", "variant")
     want = dict(zip(keys, wanted.split("/")))
     if chart(data):
         return digest  # a chart has no platform
     if "manifests" not in data:
         # A single image goes whole, but only when its config names the wanted platform.
-        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side), reference))
+        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side, reference=reference), reference))
         found = {k: config.get(k) for k in want} if isinstance(config, dict) else {}
         if found != want:
             raise MirrorError(f"{reference}: is a {'/'.join(str(v) for v in found.values())} image, not {wanted}")
@@ -516,7 +542,7 @@ def platform_digest(reference, digest, side):
         if "platform" in child:
             return child["platform"] or {}
         # The platform is optional in an index; the child image's config names it instead.
-        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side),
+        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side, reference=repository),
                                 f"{repository}@{child['digest']}"))
         return config if isinstance(config, dict) else {}
 
@@ -552,10 +578,10 @@ def app_version(reference, side):
     try:
         if not wanted:
             # Inspect one image of an index, not whichever platform this host happens to run.
-            children = json.loads(run("skopeo", "inspect", "--raw", *options(side), reference)).get("manifests")
+            children = json.loads(run("skopeo", "inspect", "--raw", *options(side, reference=reference), reference)).get("manifests")
             images = [child["digest"] for child in children or [] if image_child(child, None, 0)]
             reference = reference.rsplit("@", 1)[0] + "@" + images[0] if images else reference
-        data = json.loads(run("skopeo", *override, "inspect", *options(side), reference))
+        data = json.loads(run("skopeo", *override, "inspect", *options(side, reference=reference), reference))
     except MirrorError as error:
         raise MirrorError(f"cannot read the version of {reference}: {error}") from error
     labels = data.get("Labels") or {}
@@ -655,7 +681,7 @@ def image_bytes(reference, side):
     waiting = [reference]
     while waiting:
         current = waiting.pop()
-        raw = run("skopeo", "inspect", "--raw", *options(side), current)
+        raw = run("skopeo", "inspect", "--raw", *options(side, reference=current), current)
         manifest = json.loads(raw)
         total += len(raw)
         for child in manifest.get("manifests", []):
@@ -694,7 +720,7 @@ def export_tags(entry):
     host = match["host"] or registry("TARGET_REGISTRY")
     if match["tag"]:
         return [(host, match["repo"], match["tag"])]
-    listed = json.loads(run("skopeo", "list-tags", *options(side_of(host)), f"docker://{host}/{match['repo']}"))
+    listed = json.loads(run("skopeo", "list-tags", *options(side_of(host), reference=host), f"docker://{host}/{match['repo']}"))
     return [(host, match["repo"], tag) for tag in sorted(listed.get("Tags") or [])]
 
 
@@ -1181,7 +1207,7 @@ def login():
             continue
         host = registry(side)
         tls = "false" if os.environ.get(f"{side}_TLS_VERIFY") == "false" else "true"
-        trust = options(None) if tls == "true" else []
+        trust = options(None, reference=host) if tls == "true" else []
         result = subprocess.run(["skopeo", "login", f"--tls-verify={tls}", *trust, "--username", user, "--password-stdin", host],
                                 input=os.environ.get(f"{side}_PASSWORD", "").encode(), capture_output=True, check=False)
         if result.returncode:
