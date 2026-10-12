@@ -3,6 +3,8 @@
 one-way link and import them into a registry on the far side."""
 
 import argparse
+import atexit
+import functools
 import hashlib
 import hmac
 import json
@@ -120,7 +122,30 @@ def run(*args):
 # Credentials come from skopeo's default auth file, written by `skopeo login` or
 # `podman login`. REGISTRY_AUTH_FILE moves it for both the login and this script.
 def options(side, direction=""):
-    return [f"--{direction}tls-verify=false"] if side and os.environ.get(f"{side}_TLS_VERIFY") == "false" else []
+    if side and os.environ.get(f"{side}_TLS_VERIFY") == "false":
+        return [f"--{direction}tls-verify=false"]
+    return [f"--{direction}cert-dir={ca_files()[1]}"] if ca_files() else []
+
+
+@functools.cache
+def ca_files():
+    """CA_BUNDLE, a PEM file of one or more CA (or self-signed server) certificates, trusted by every
+    connection on top of the system roots: (the file, a skopeo cert dir, a bundle for curl). None when unset."""
+    setting = os.environ.get("CA_BUNDLE", "").strip()
+    if not setting:
+        return None
+    bundle = Path(setting).resolve()
+    if not bundle.is_file():
+        raise MirrorError(f"CA_BUNDLE {setting} is not a file")
+    directory = Path(tempfile.mkdtemp(prefix="mirror-ca-"))
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    shutil.copyfile(bundle, directory / "ca.crt")  # skopeo adds every *.crt in --cert-dir to the system roots
+    # curl --cacert replaces the system roots, so carry them: their file, or their directory with --capath.
+    system = ssl.get_default_verify_paths()
+    roots = Path(system.cafile).read_bytes() if system.cafile and Path(system.cafile).is_file() else b""
+    (directory / "curl.pem").write_bytes(roots + b"\n" + bundle.read_bytes())
+    capath = [] if roots or not system.capath or not Path(system.capath).is_dir() else ["--capath", system.capath]
+    return bundle, directory, ["--cacert", str(directory / "curl.pem"), *capath]
 
 
 def raw_digest(reference, side):
@@ -164,18 +189,18 @@ def transport_reference(source):
 
 def copy(source, destination, source_side=None, destination_side=None):
     args = ["skopeo", "copy", "--all", "--preserve-digests", "--retry-times=3"]
-    if source_side:
+    if source.startswith("docker://"):
         args += options(source_side, "src-")
-    if destination_side:
+    if destination.startswith("docker://"):
         args += options(destination_side, "dest-")
     run(*args, source, destination)
 
 
-def tls_context(ca=None, verify=True):
+def tls_context(verify=True):
     context = ssl.create_default_context()
     if not verify:
         context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
-    for bundle in {ca, os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
+    for bundle in {ca_files() and str(ca_files()[0]), os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
         context.load_verify_locations(cafile=bundle)
         # Python 3.13+ also demands RFC 5280 extensions an appliance's own CA often lacks (key usage);
         # trust still comes only from this CA.
@@ -200,21 +225,24 @@ def ledger_location(path):
 
 
 def package_request(method, data=None, url=None):
-    """The ledger file in the project's generic packages, or at url. PACKAGE_TOKEN (a personal, project
+    """The ledger file in the project's generic packages, or url (a full URL, or a path under the
+    project's packages API). PACKAGE_TOKEN (a personal, project
     or group access token) wins; in CI the job token reads and writes the job's own project."""
     api = (os.environ.get("GITLAB_API_URL") or os.environ.get("CI_API_V4_URL") or "").rstrip("/")
     project = os.environ.get("PACKAGE_PROJECT") or os.environ.get("CI_PROJECT_ID") or ""
     token = os.environ.get("PACKAGE_TOKEN")
     key, value = ("PRIVATE-TOKEN", token) if token else ("JOB-TOKEN", os.environ.get("CI_JOB_TOKEN", ""))
-    if not value or not (url or (api and project)):
+    absolute = bool(url) and url.startswith("http")
+    if not value or not (absolute or (api and project)):
         raise MirrorError("the ledger in the package registry needs PACKAGE_TOKEN, and GITLAB_API_URL and "
                           "PACKAGE_PROJECT or its URL (a CI job supplies all of them)")
-    url = url or (f"{api}/projects/{urllib.parse.quote(project, safe='')}/packages/generic/"
-                  f"{LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}")
+    if not absolute:  # a path under the project's packages API; none means the ledger file
+        url = (f"{api}/projects/{urllib.parse.quote(project, safe='')}/packages"
+               + (url or f"/generic/{LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}"))
     say(f"+ {method} {url}")
     request = urllib.request.Request(url, data=data, method=method, headers={key: value})
     try:
-        with urllib.request.urlopen(request, timeout=600, context=tls_context(os.environ.get("CA_BUNDLE"))) as response:
+        with urllib.request.urlopen(request, timeout=600, context=tls_context()) as response:
             return response.read()
     except urllib.error.HTTPError as error:
         if method == "GET" and error.code == 404:
@@ -257,10 +285,42 @@ def save_ledger(location, ledger):
         return False
     elif location == "gitlab":  # GitLab serves the newest upload of a file name
         package_request("PUT", json.dumps(ledger, indent=2, sort_keys=True).encode())
+        prune_ledger()
     else:
         location.parent.mkdir(parents=True, exist_ok=True)
         write_json(location, ledger)
     return True
+
+
+def prune_ledger(now=None):
+    """Delete uploads of the CI ledger older than MIRROR_LEDGER_KEEP_DAYS (default 7), always keeping the
+    newest two. GitLab keeps every upload; an older one is a rollback point. A token that may not delete
+    package files leaves them with a warning."""
+    days = float(os.environ.get("MIRROR_LEDGER_KEEP_DAYS") or 7)
+    cutoff = (now or datetime.now(timezone.utc)).timestamp() - days * 86400
+    try:
+        found = json.loads(package_request("GET", url=f"?package_type=generic&package_name={LEDGER_PACKAGE}") or b"[]")
+        uploads = []
+        for package in found:
+            if package["name"] != LEDGER_PACKAGE or package["version"] != LEDGER_VERSION:
+                continue
+            page = 1
+            while True:
+                batch = json.loads(package_request(
+                    "GET", url=f"/{package['id']}/package_files?per_page=100&page={page}") or b"[]")
+                uploads += [(f["created_at"], f["id"], package["id"]) for f in batch if f["file_name"] == LEDGER_NAME]
+                if len(batch) < 100:
+                    break
+                page += 1
+        uploads.sort(reverse=True)
+        old = [u for u in uploads[2:]
+               if datetime.fromisoformat(u[0].replace("Z", "+00:00")).timestamp() < cutoff]
+        for _, file, package in old:
+            package_request("DELETE", url=f"/{package}/package_files/{file}")
+        if old:
+            print(f"ledger: pruned {len(old)} upload(s) older than {days:g} day(s)", file=sys.stderr)
+    except MirrorError as error:
+        print(f"warning: old ledger uploads not pruned: {error}", file=sys.stderr)
 
 
 def normalise(source):
@@ -819,7 +879,7 @@ def s3_request(s3, method, key="", data=None, length=None, query=None):
     del headers["host"]  # urllib sends the same value
     if length is not None:
         headers["Content-Length"] = str(length)
-    context = tls_context(os.environ.get("S3_CA_BUNDLE"), os.environ.get("S3_TLS_VERIFY") != "false")
+    context = tls_context(os.environ.get("S3_TLS_VERIFY") != "false")
     say(f"+ {method} {url}")
     try:
         return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers),
@@ -860,7 +920,8 @@ def post_file(path, checksum, url):
     # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
     headers = ["Expect:", f"Filename: {path.name}", "Content-Type: application/octet-stream",
                f"X-Sha256: {checksum}", "X-Artifact-Type: container-images", "X-Artifact-Format: tar"]
-    status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
+    trust = ca_files()[2] if ca_files() else []
+    status = run("curl", "--http1.1", *trust, "--fail", "--show-error", "--silent", "--connect-timeout", "15",
                  "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
                  "--output", "/dev/null", "--write-out", "%{http_code}",
                  *[item for header in headers for item in ("--header", header)], "--upload-file", str(path), url)
@@ -1086,6 +1147,7 @@ RENAMED = {
     "LOW_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY", "HIGH_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY",
     "UPSTREAM_REGISTRY": "SOURCE_REGISTRY", "UPSTREAM_USERNAME": "SOURCE_REGISTRY_USERNAME",
     "UPSTREAM_PASSWORD": "SOURCE_REGISTRY_PASSWORD", "UPSTREAM_TLS_VERIFY": "SOURCE_REGISTRY_TLS_VERIFY",
+    "S3_CA_BUNDLE": "CA_BUNDLE (one bundle for every connection)",
     "MIRROR_SEND": "NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH (whichever is set says where the pipeline sends)",
     "MIRROR_BUNDLE_MAX_SIZE": "MIRROR_MAX_SIZE (export --max-size)",
     "MIRROR_STAGING_PATH": "MIRROR_STAGING_DIR", "MIRROR_STATE_DIR": "MIRROR_STAGING_DIR",
@@ -1119,7 +1181,8 @@ def login():
             continue
         host = registry(side)
         tls = "false" if os.environ.get(f"{side}_TLS_VERIFY") == "false" else "true"
-        result = subprocess.run(["skopeo", "login", f"--tls-verify={tls}", "--username", user, "--password-stdin", host],
+        trust = options(None) if tls == "true" else []
+        result = subprocess.run(["skopeo", "login", f"--tls-verify={tls}", *trust, "--username", user, "--password-stdin", host],
                                 input=os.environ.get(f"{side}_PASSWORD", "").encode(), capture_output=True, check=False)
         if result.returncode:
             raise MirrorError(f"skopeo login {host} failed: {result.stderr.decode(errors='replace').strip()[-300:]}")
@@ -1243,6 +1306,7 @@ def main(argv=None):
         os.environ["MIRROR_LEDGER"] = args.ledger
     try:
         check_renamed()
+        ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
         ledger_file = ledger_location(args.catalog)
         if args.command == "sync":
             sync(args.catalog, ledger_file)
