@@ -850,7 +850,8 @@ def checked(tar):
     """tar's sha256, after checking it against the .sha256 beside it."""
     sidecar = tar.with_name(tar.name + ".sha256")
     if not sidecar.exists():
-        raise MirrorError(f"{sidecar.name} is missing; it must travel with {tar.name}")
+        raise MirrorError(f"{sidecar.name} is missing; it must travel with {tar.name} "
+                          "(import --no-checksum imports a tar without it)")
     digest = sha256(tar)
     if (sidecar.read_text().split() or [""])[0] != digest:
         raise MirrorError(f"{tar.name} does not match {sidecar.name}")
@@ -1107,11 +1108,16 @@ def record_sent(tar, ledger_file):
             print("ledger: read only, the pipeline's ledger is unchanged")
 
 
-def import_tar(tar, staging=None, force=False, base=None, record=None):
+def import_tar(tar, staging=None, force=False, base=None, record=None, no_checksum=False):
     """Push every image in an export tar into TARGET_REGISTRY, tags and digests unchanged. Every image is
-    checked before the first push, so a refusal pushes nothing. A tag already at its digest is skipped."""
+    checked before the first push, so a refusal pushes nothing. A tag already at its digest is skipped.
+    With no_checksum a tar whose .sha256 is missing still imports: each image is still checked against
+    its digest in export.json, and the registry checks every layer."""
     high = registry("TARGET_REGISTRY")
-    checked(tar)
+    if no_checksum and not tar.with_name(tar.name + ".sha256").exists():
+        print(f"warning: {tar.name}.sha256 is missing; importing {tar.name} on its image digests alone", file=sys.stderr)
+    else:
+        checked(tar)
     if not hasattr(tarfile, "data_filter"):
         raise MirrorError("import needs Python 3.12, or 3.8.17 to 3.11.4 or later, for safe tar extraction")
     with staging_dir(tar.parent, staging) as layout:
@@ -1165,7 +1171,8 @@ def import_package(package, staging=None, force=False, base=None, record=None):
         import_tar(tar, unpacked, force, base, record)
 
 
-def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, record=None, keep=False):
+def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, record=None, keep=False,
+               no_checksum=False):
     """Import tar or .ffv3 files, every one in a directory, or every one in an S3 bucket. A directory or a
     bucket is an inbox: each file is removed once imported, unless keep, and one that fails stays put
     without holding up the rest. A file named on its own is kept."""
@@ -1205,14 +1212,17 @@ def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, re
                         package.unlink)
             for tar in sorted(source.glob("*.tar")):
                 sidecar = tar.with_name(tar.name + ".sha256")
-                if not sidecar.exists():
-                    print(f"waiting for {sidecar.name}; skipped")
+                if not sidecar.exists() and not no_checksum:
+                    print(f"waiting for {sidecar.name}; skipped (--no-checksum imports it now)")
                     continue
                 # The tar first: a .sha256 left alone is never listed.
-                attempt(f"{source}/{tar.name}", lambda: import_tar(tar, staging, force, base, record),
-                        lambda: (tar.unlink(), sidecar.unlink()))
+                attempt(f"{source}/{tar.name}", lambda: import_tar(tar, staging, force, base, record, no_checksum),
+                        lambda: (tar.unlink(), sidecar.unlink(missing_ok=True)))
+        elif source.suffix == ".ffv3":
+            import_package(source, staging, force, base, record)
+            done += 1
         else:
-            (import_package if source.suffix == ".ffv3" else import_tar)(source, staging, force, base, record)
+            import_tar(source, staging, force, base, record, no_checksum)
             done += 1
     if s3_bucket:
         s3 = s3_settings(s3_bucket)
@@ -1443,6 +1453,9 @@ def main(argv=None):
     import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
     import_command.add_argument("--keep", action="store_true", help="leave imported tars in the directory or bucket")
     import_command.add_argument("--force", action="store_true", help="move a tag that already points at another digest")
+    import_command.add_argument("--no-checksum", action="store_true",
+                                help="import a tar whose .sha256 is missing, on its image digests alone; "
+                                     "a .sha256 that is there is still checked")
     import_command.add_argument("--record", type=Path, help="append the image tags and digests pushed, for promote")
     staging_flag(import_command)
     base_flag(import_command)
@@ -1492,7 +1505,7 @@ def main(argv=None):
             if not args.sources and not args.s3_bucket:
                 raise MirrorError("import needs a tar, a directory or --s3-bucket")
             import_all(args.sources, args.s3_bucket, args.staging_dir, args.force, args.rewrite_base_path,
-                       args.record, args.keep)
+                       args.record, args.keep, args.no_checksum)
         elif args.command == "login":
             login()
         elif args.command == "add":

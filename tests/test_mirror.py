@@ -476,6 +476,27 @@ class MirrorTest(unittest.TestCase):
             self.assertIn('waiting for half.tar.sha256', self.out.getvalue())
             self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
 
+    def test_import_no_checksum_takes_a_tar_without_its_sha256_but_still_checks_one_that_is_there(self):
+        with Registry(self) as registry:
+            tar, digest = self.exported(registry)
+            sidecar = tar.with_name('carry.tar.sha256')
+            good = sidecar.read_text()
+            sidecar.unlink()
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', tar), 1)
+            inbox = self.root / 'inbox'
+            inbox.mkdir()
+            shutil.copyfile(tar, inbox / 'carry.tar')
+            self.assertEqual(self.cli('import', inbox), 0)  # waits for the .sha256
+            self.assertEqual(list(inbox.iterdir()), [inbox / 'carry.tar'])
+            self.assertEqual(self.cli('import', inbox, '--no-checksum'), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+            self.assertEqual(list(inbox.iterdir()), [])
+            self.assertEqual(self.cli('import', tar, '--no-checksum'), 0)
+            sidecar.write_text('0' * 64 + '  carry.tar\n')
+            self.assertEqual(self.cli('import', tar, '--no-checksum'), 1)  # present and wrong: refused
+            sidecar.write_text(good)
+
     def test_send_needs_one_destination_that_exists_and_writes_the_checksum_last(self):
         with Registry(self) as registry:
             tar, _ = self.exported(registry)
