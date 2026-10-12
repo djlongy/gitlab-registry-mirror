@@ -23,6 +23,9 @@ variables:
   NIFI_URL: ''
   S3_BUCKET: ''
   MIRROR_SEND_PATH: ''
+  # true: send one NAME.tar.ffv3 (NiFi FlowFile v3: the tar, X-Sha256 and the other attributes) to
+  # S3_BUCKET or MIRROR_SEND_PATH instead of the tar and its .sha256.
+  MIRROR_SEND_FLOWFILE: 'false'
   # Run pipeline with EXPORT_ALL=true sends every catalog image, not only what is new.
   EXPORT_ALL: 'false'
   # Split the export into tars of at most this size, e.g. 4GiB. Empty: one tar.

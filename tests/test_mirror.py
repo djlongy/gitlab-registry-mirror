@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -504,13 +505,64 @@ class MirrorTest(unittest.TestCase):
         posted = [c.args for c in call.call_args_list]
         self.assertEqual([args[args.index('--upload-file') + 1] for args in posted], [str(tar), str(tar) + '.sha256'])
         headers = [posted[0][i + 1] for i, a in enumerate(posted[0]) if a == '--header']
-        for header in ('Filename: carry.tar', f'X-Sha256: {mirror.sha256(tar)}', 'X-Artifact-Type: container-images',
-                       'Expect:'):
+        for header in ('Filename: carry.tar', 'Content-Type: application/octet-stream', f'X-Sha256: {mirror.sha256(tar)}',
+                       'X-Artifact-Type: container-images', 'X-Artifact-Format: tar', 'Expect:'):
             self.assertIn(header, headers)
         self.assertIn('--http1.1', posted[0])
         self.assertNotIn('--data-binary', posted[0])
         self.assertIn('posted to NiFi: carry.tar -> http://nifi.example.internal:9099/contentListener', self.out.getvalue())
         self.assertNotIn('secret', self.out.getvalue())
+
+    def test_send_flowfile_writes_one_package_with_the_http_attributes_and_import_reads_it(self):
+        with Registry(self) as registry:
+            tar, digest = self.exported(registry)
+            transfer = self.root / 'transfer'
+            transfer.mkdir()
+            self.assertEqual(self.cli('send', tar, '--path', transfer, '--flowfile'), 0)
+            self.assertEqual([p.name for p in transfer.iterdir()], ['carry.tar.ffv3'])
+            unpacked = self.root / 'unpacked'
+            unpacked.mkdir()
+            # One FlowFile: the tar, its checksum an attribute, so the link carries one file.
+            self.assertEqual(mirror.read_flowfiles(transfer / 'carry.tar.ffv3', unpacked), [
+                (unpacked / 'carry.tar', {'filename': 'carry.tar', **mirror.attributes(tar, mirror.sha256(tar))})])
+            self.assertEqual(list(mirror.attributes(tar, '')), ['Filename', 'Content-Type', 'X-Sha256', 'X-Artifact-Type',
+                                                                'X-Artifact-Format'])
+            self.assertEqual((unpacked / 'carry.tar').read_bytes(), tar.read_bytes())
+            self.assertEqual(self.cli('send', tar, '--nifi-url', 'http://nifi.example.internal', '--flowfile'), 1)
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', transfer), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+            self.assertEqual(list(transfer.iterdir()), [])
+        # A bad package in the inbox stays put and does not hold up a good one behind it.
+        mirror.write_flowfiles(transfer / 'a-bad.ffv3', [(tar, {'filename': 'carry.tar', 'X-Sha256': '0' * 64})])
+        with Registry(self) as registry:
+            self.assertEqual(self.cli('send', tar, '--path', transfer, '--flowfile'), 0)
+            registry.tags.clear()
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', transfer), 1)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+        self.assertEqual([p.name for p in transfer.iterdir()], ['a-bad.ffv3'])
+        # The sender refuses a name the far side would refuse, and a failed write leaves nothing.
+        odd = tar.with_name('my carry.tar')
+        shutil.copyfile(tar, odd)
+        shutil.copyfile(tar.with_name('carry.tar.sha256'), odd.with_name('my carry.tar.sha256'))
+        os.environ['TARGET_REGISTRY'] = LOW
+        self.assertEqual(self.cli('send', odd, '--path', transfer, '--flowfile'), 1)
+        with self.assertRaises(OSError):
+            mirror.land(transfer / 'x.ffv3', lambda hidden: (hidden.write_bytes(b'half'), open('/nonexistent/x')))
+        self.assertEqual([p.name for p in transfer.iterdir()], ['a-bad.ffv3'])
+        huge = self.root / 'huge.ffv3'
+        huge.write_bytes(mirror.FLOWFILE_MAGIC + (1).to_bytes(2, 'big') + b'\xff\xff' + (1 << 30).to_bytes(4, 'big'))
+        with self.assertRaisesRegex(mirror.MirrorError, 'attribute of 1073741824 bytes'):
+            mirror.read_flowfiles(huge, unpacked)
+        evil = self.root / 'evil.ffv3'
+        mirror.write_flowfiles(evil, [(tar, {'filename': '../escape.tar'})])
+        with self.assertRaisesRegex(mirror.MirrorError, 'unsafe filename'):
+            mirror.read_flowfiles(evil, unpacked)
+        mirror.write_flowfiles(evil, [(tar, {'filename': 'carry.tar'})])
+        evil.write_bytes(evil.read_bytes()[:-5])
+        with self.assertRaisesRegex(mirror.MirrorError, 'truncated'):
+            mirror.read_flowfiles(evil, unpacked)
 
     def s3_env(self):
         os.environ.update({'S3_ENDPOINT': 'https://s3.example.internal:9000', 'AWS_ACCESS_KEY_ID': 'AKID',
@@ -518,7 +570,7 @@ class MirrorTest(unittest.TestCase):
 
     def test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket(self):
         self.s3_env()
-        bucket, calls = {}, []
+        bucket, calls, metadata = {}, [], {}
 
         def urlopen(request, **_):
             parts = mirror.urllib.parse.urlsplit(request.full_url)
@@ -529,6 +581,11 @@ class MirrorTest(unittest.TestCase):
             method = request.get_method()
             if method == 'PUT':
                 bucket[key] = request.data.read()
+                metadata[key] = {k.lower()[len('x-amz-meta-'):]: v for k, v in request.headers.items()
+                                 if k.lower().startswith('x-amz-meta-')}
+                signed = request.headers['Authorization'].split('SignedHeaders=')[1].split(',')[0].split(';')
+                self.assertTrue({'content-type', *(f'x-amz-meta-{k}' for k in metadata[key])} <= set(signed))
+                metadata[key]['content-type'] = request.headers['Content-type']
                 self.assertEqual(request.headers['Content-length'], str(len(bucket[key])))
             elif method == 'DELETE':
                 del bucket[key]
@@ -547,10 +604,20 @@ class MirrorTest(unittest.TestCase):
             self.assertEqual(self.cli('send', tar, '--s3-bucket', 'transfer'), 0)
             self.assertEqual(sorted(bucket), ['mirror/carry.tar', 'mirror/carry.tar.sha256'])
             self.assertEqual([c[1] for c in calls], ['/transfer/mirror/carry.tar', '/transfer/mirror/carry.tar.sha256'])
+            # The HTTP header names and values; S3 keeps metadata names in lowercase.
+            self.assertEqual(metadata['mirror/carry.tar'],
+                             {k.lower(): v for k, v in mirror.attributes(tar, mirror.sha256(tar)).items()})
             os.environ['TARGET_REGISTRY'] = 'high.example.internal'
             os.chdir(self.root)
             self.assertEqual(self.cli('import', '--s3-bucket', 'transfer'), 0)
             self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+            self.assertEqual(bucket, {})
+            # A .ffv3 in the bucket keeps the attribute names case for case.
+            os.environ['TARGET_REGISTRY'] = LOW
+            self.assertEqual(self.cli('send', tar, '--s3-bucket', 'transfer', '--flowfile'), 0)
+            self.assertEqual(sorted(bucket), ['mirror/carry.tar.ffv3'])
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', '--s3-bucket', 'transfer'), 0)
             self.assertEqual(bucket, {})
             self.assertEqual([p.name for p in self.root.glob('.mirror-staging-*')], [])
 
