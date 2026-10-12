@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -841,8 +841,8 @@ def write_export(tar, images, staging, base):
         checksum = sha256(built)
         sidecar = work / (tar.name + ".sha256")
         sidecar.write_text(f"{checksum}  {tar.name}\n")
-        land(built, tar, move=True)
-        land(sidecar, tar.with_name(sidecar.name), move=True)
+        land(tar, lambda hidden: shutil.move(built, hidden))
+        land(tar.with_name(sidecar.name), lambda hidden: shutil.move(sidecar, hidden))
     print(f"wrote {tar} and {tar.name}.sha256 ({len(entries)} image tag(s), {tar.stat().st_size} bytes)")
 
 
@@ -880,16 +880,16 @@ def s3_settings(bucket=None):
     return settings
 
 
-def s3_request(s3, method, key="", data=None, length=None, query=None):
+def s3_request(s3, method, key="", data=None, length=None, query=None, extra=None):
     """One path-style request to an S3-compatible store, signed with AWS Signature Version 4. A file-like
-    data needs its length, or urllib would send it chunked, which S3 refuses."""
+    data needs its length, or urllib would send it chunked, which S3 refuses. extra headers are signed too."""
     path = f"/{urllib.parse.quote(s3['bucket'])}" + (f"/{urllib.parse.quote(key)}" if key else "")
     canonical_query = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
                                for k, v in sorted((query or {}).items()))
     url = s3["endpoint"] + path + (f"?{canonical_query}" if canonical_query else "")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     headers = {"host": urllib.parse.urlsplit(url).netloc, "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-               "x-amz-date": stamp}
+               "x-amz-date": stamp, **{name.lower(): value for name, value in (extra or {}).items()}}
     signed = ";".join(sorted(headers))
     canonical = "\n".join([method, urllib.parse.urlsplit(url).path, canonical_query,
                            *(f"{name}:{headers[name]}" for name in sorted(headers)), "", signed, "UNSIGNED-PAYLOAD"])
@@ -933,8 +933,16 @@ def s3_list(s3):
             return keys
 
 
+def attributes(path, checksum):
+    """What each delivered file carries, names case for case: the HTTP headers to NiFi, the FlowFile
+    attributes in a .ffv3, and S3 object metadata (which an S3 store may lowercase; a .ffv3 in the bucket
+    keeps the case)."""
+    return {"Filename": path.name, "Content-Type": "application/octet-stream", "X-Sha256": checksum,
+            "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar"}
+
+
 def post_file(path, checksum, url):
-    """POST one file to a NiFi ListenHTTP, streamed, with its name and sha256 as headers."""
+    """POST one file to a NiFi ListenHTTP, streamed, with its attributes as headers."""
     parts = urllib.parse.urlsplit(url)
     shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
     file_size = path.stat().st_size
@@ -942,8 +950,7 @@ def post_file(path, checksum, url):
     # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
     # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
     # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
-    headers = ["Expect:", f"Filename: {path.name}", "Content-Type: application/octet-stream",
-               f"X-Sha256: {checksum}", "X-Artifact-Type: container-images", "X-Artifact-Format: tar"]
+    headers = ["Expect:", *(f"{name}: {value}" for name, value in attributes(path, checksum).items())]
     trust = ca_files()[2] if ca_files() else []
     status = run("curl", "--http1.1", *trust, "--fail", "--show-error", "--silent", "--connect-timeout", "15",
                  "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
@@ -952,40 +959,132 @@ def post_file(path, checksum, url):
     print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes)")
 
 
-def land(source, destination, move=False):
-    """Write destination as a hidden .NAME.partial, then rename it in one step on the same filesystem (NFS
-    included). A directory watcher never sees half a file: NiFi ListFile and GetFile skip dot files by
-    default, and import only reads NAME.tar."""
+def land(destination, write):
+    """Have write fill a hidden .NAME.partial, then rename it to destination in one step on the same
+    filesystem (NFS included). A directory watcher never sees half a file: NiFi ListFile and GetFile skip
+    dot files by default, and import reads only NAME.tar and NAME.tar.ffv3."""
     hidden = destination.with_name(f".{destination.name}.partial")
-    (shutil.move if move else shutil.copyfile)(source, hidden)
+    try:
+        write(hidden)
+    except BaseException:
+        hidden.unlink(missing_ok=True)  # a full disk or a dropped share leaves nothing behind
+        raise
     os.replace(hidden, destination)
 
 
-def copy_file(path, directory):
-    land(path, directory / path.name)
+FLOWFILE_MAGIC = b"NiFiFF3"
+# A name a FlowFile may carry and import writes: no path, not hidden, short enough for any filesystem.
+SAFE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,199}")
 
 
-def send(tars, ledger_file, nifi_url=None, s3_bucket=None, directory=None):
+def write_flowfiles(target, files):
+    """A NiFi FlowFile v3 stream (UnpackContent, flowfile-stream-v3): each (path, attributes) in turn."""
+    def field(length):
+        return length.to_bytes(2, "big") if length < 0xFFFF else b"\xff\xff" + length.to_bytes(4, "big")
+
+    with target.open("wb") as stream:
+        for path, attrs in files:
+            stream.write(FLOWFILE_MAGIC + field(len(attrs)))
+            for text in (item for pair in attrs.items() for item in pair):
+                stream.write(field(len(text.encode())) + text.encode())
+            stream.write(path.stat().st_size.to_bytes(8, "big"))
+            with path.open("rb") as content:
+                shutil.copyfileobj(content, stream, 8 * 1024 * 1024)
+
+
+def read_flowfiles(source, directory):
+    """Unpack a FlowFile v3 stream into directory, each content under its filename attribute:
+    [(path, attributes)]."""
+    def exact(stream, size):
+        data = stream.read(size)
+        if len(data) != size:
+            raise MirrorError(f"{source.name}: truncated FlowFile package")
+        return data
+
+    def field(stream):
+        length = int.from_bytes(exact(stream, 2), "big")
+        return int.from_bytes(exact(stream, 4), "big") if length == 0xFFFF else length
+
+    def text(stream):  # a package from the far side is untrusted: bound what it makes us hold in memory
+        length = field(stream)
+        if length > 65536:
+            raise MirrorError(f"{source.name}: attribute of {length} bytes")
+        try:
+            return exact(stream, length).decode()
+        except UnicodeDecodeError as error:
+            raise MirrorError(f"{source.name}: attribute is not UTF-8") from error
+
+    written = []
+    with source.open("rb") as stream:
+        while magic := stream.read(len(FLOWFILE_MAGIC)):
+            if magic != FLOWFILE_MAGIC:
+                raise MirrorError(f"{source.name} is not a NiFi FlowFile v3 package")
+            count = field(stream)
+            if count > 1000:
+                raise MirrorError(f"{source.name}: {count} attributes")
+            attrs = {}
+            for _ in range(count):
+                key = text(stream)
+                attrs[key] = text(stream)
+            name = attrs.get("filename", "")
+            if not SAFE_NAME.fullmatch(name):
+                raise MirrorError(f"{source.name}: unsafe filename attribute {name[:80]!r}")
+            remaining = int.from_bytes(exact(stream, 8), "big")
+            with (directory / name).open("wb") as out:
+                while remaining:
+                    chunk = exact(stream, min(remaining, 8 * 1024 * 1024))
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            written.append((directory / name, attrs))
+    return written
+
+
+def deliver(path, attrs, nifi_url, s3, directory):
+    if nifi_url:
+        post_file(path, attrs["X-Sha256"], nifi_url)
+    elif s3:
+        metadata = {f"x-amz-meta-{name}": value for name, value in attrs.items() if name != "Content-Type"}
+        with path.open("rb") as stream:
+            s3_request(s3, "PUT", s3_key(s3, path.name), stream, path.stat().st_size,
+                       extra={"Content-Type": attrs["Content-Type"], **metadata}).close()
+        print(f"uploaded: {path.name} -> s3 {s3['bucket']}/{s3_key(s3, path.name)}")
+    else:
+        land(Path(directory) / path.name, lambda hidden: shutil.copyfile(path, hidden))
+        print(f"copied: {path.name} -> {directory}")
+
+
+def send(tars, ledger_file, nifi_url=None, s3_bucket=None, directory=None, flowfile=False):
     """Deliver each tar, then its .sha256, to one place: a NiFi ListenHTTP, an S3 bucket or a directory
-    (an NFS share, a USB stick). Once a tar is delivered its images count as sent in the ledger."""
+    (an NFS share, a USB stick). With flowfile, a directory or a bucket gets one NAME.tar.ffv3 instead: the
+    tar with its attributes, X-Sha256 among them, so a link that delivers files out of order or hours apart
+    has one file to carry. Once a tar is delivered its images count as sent in the ledger."""
     if sum(bool(where) for where in (nifi_url, s3_bucket, directory)) != 1:
         raise MirrorError("send needs exactly one of --nifi-url, --s3-bucket or --path")
     s3 = s3_settings(s3_bucket) if s3_bucket else None
     if directory and not Path(directory).is_dir():  # a share that is not mounted must not turn into a local directory
         raise MirrorError(f"{directory} does not exist; mount or create it first")
     digests = {Path(tar): checked(Path(tar)) for tar in tars}  # every tar is checked before the first is sent
+    if flowfile and nifi_url:
+        raise MirrorError("--flowfile goes with --path or --s3-bucket; NiFi gets the attributes as headers")
+    for tar in digests:  # the far side writes files by these names; refuse here what it would refuse there
+        if not SAFE_NAME.fullmatch(tar.name + ".sha256"):
+            raise MirrorError(f"{tar.name}: use letters, digits, '.', '_' and '-' only, under 190 characters")
     for tar, digest in digests.items():
         sidecar = tar.with_name(tar.name + ".sha256")
-        for path in (tar, sidecar):  # the .sha256 last: a tar is complete once its checksum is there
-            if nifi_url:
-                post_file(path, digest if path is tar else sha256(sidecar), nifi_url)
-            elif s3:
-                with path.open("rb") as stream:
-                    s3_request(s3, "PUT", s3_key(s3, path.name), stream, path.stat().st_size).close()
-                print(f"uploaded: {path.name} -> s3 {s3['bucket']}/{s3_key(s3, path.name)}")
-            else:
-                copy_file(path, Path(directory))
-                print(f"copied: {path.name} -> {directory}")
+        files = [(tar, attributes(tar, digest)), (sidecar, attributes(sidecar, sha256(sidecar)))]
+        if not flowfile:
+            for path, attrs in files:  # the .sha256 last: a tar is complete once its checksum is there
+                deliver(path, attrs, nifi_url, s3, directory)
+        else:
+            # Also the lowercase core filename attribute: UnpackContent and PutFile name the file by it.
+            packed = [(tar, {"filename": tar.name, **files[0][1]})]
+            with staging_dir(tar.parent) if s3 else nullcontext(Path(directory)) as where:
+                package = where / (tar.name + ".ffv3")
+                land(package, lambda hidden: write_flowfiles(hidden, packed))
+                print(f"packaged: {tar.name} with X-Sha256 {digest} as {package}")
+                if s3:
+                    deliver(package, {**attributes(package, sha256(package)), "X-Artifact-Format": "ffv3"},
+                            None, s3, None)
         record_sent(tar, ledger_file)
         print(f"sent: {tar.name}")
 
@@ -1052,44 +1151,84 @@ def import_tar(tar, staging=None, force=False, base=None, record=None):
     print(f"{tar.name}: {len(plan)} image tag(s) in {high}, digests verified")
 
 
+def import_package(package, staging=None, force=False, base=None, record=None):
+    """Import the tar inside a .ffv3 that send --flowfile (or NiFi PackageFlowFile) wrote, checked against
+    its X-Sha256 attribute."""
+    with staging_dir(package.parent, staging) as unpacked:
+        tars = [(path, attrs) for path, attrs in read_flowfiles(package, unpacked) if path.suffix == ".tar"]
+        if len(tars) != 1:
+            raise MirrorError(f"{package.name} holds {len(tars)} tars, not one")
+        tar, attrs = tars[0]
+        if not re.fullmatch(r"[0-9a-f]{64}", attrs.get("X-Sha256", "")):
+            raise MirrorError(f"{package.name}: {tar.name} has no X-Sha256 attribute")
+        tar.with_name(tar.name + ".sha256").write_text(f"{attrs['X-Sha256']}  {tar.name}\n")  # checked by import_tar
+        import_tar(tar, unpacked, force, base, record)
+
+
 def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, record=None, keep=False):
-    """Import tar files, every tar in a directory, or every tar in an S3 bucket. A directory or a bucket is
-    an inbox: each tar it held is removed once imported, unless keep. A tar named on its own is kept."""
-    done = 0
+    """Import tar or .ffv3 files, every one in a directory, or every one in an S3 bucket. A directory or a
+    bucket is an inbox: each file is removed once imported, unless keep, and one that fails stays put
+    without holding up the rest. A file named on its own is kept."""
+    done, failed = 0, []
+
+    def attempt(name, work, remove):
+        nonlocal done
+        try:
+            work()
+        except MirrorError as error:
+            print(f"error: {name}: {error}; left in place", file=sys.stderr)
+            failed.append(name)
+            return
+        done += 1
+        if not keep:
+            remove()
+            print(f"removed: {name}")
+
+    def fetch(s3, key, local):
+        with s3_request(s3, "GET", key) as response, local.open("wb") as stream:
+            shutil.copyfileobj(response, stream, 8 * 1024 * 1024)
+
+    def from_s3(s3, key, sidecar):
+        with staging_dir(".", staging) as download:
+            local = download / key.rsplit("/", 1)[-1]
+            fetch(s3, key, local)
+            if sidecar:
+                fetch(s3, key + ".sha256", local.with_name(local.name + ".sha256"))
+                import_tar(local, download, force, base, record)
+            else:
+                import_package(local, download, force, base, record)
+
     for source in map(Path, sources):
         if source.is_dir():
+            for package in sorted(source.glob("*.ffv3")):
+                attempt(f"{source}/{package.name}", lambda: import_package(package, staging, force, base, record),
+                        package.unlink)
             for tar in sorted(source.glob("*.tar")):
-                if not tar.with_name(tar.name + ".sha256").exists():
-                    print(f"waiting for {tar.name}.sha256; skipped")
+                sidecar = tar.with_name(tar.name + ".sha256")
+                if not sidecar.exists():
+                    print(f"waiting for {sidecar.name}; skipped")
                     continue
-                import_tar(tar, staging, force, base, record)
-                done += 1
-                if not keep:
-                    tar.unlink()  # the tar first: a .sha256 left alone is never listed
-                    tar.with_name(tar.name + ".sha256").unlink()
-                    print(f"removed from {source}: {tar.name}")
+                # The tar first: a .sha256 left alone is never listed.
+                attempt(f"{source}/{tar.name}", lambda: import_tar(tar, staging, force, base, record),
+                        lambda: (tar.unlink(), sidecar.unlink()))
         else:
-            import_tar(source, staging, force, base, record)
+            (import_package if source.suffix == ".ffv3" else import_tar)(source, staging, force, base, record)
             done += 1
     if s3_bucket:
         s3 = s3_settings(s3_bucket)
         keys = set(s3_list(s3))
+        for key in sorted(k for k in keys if k.endswith(".ffv3")):
+            attempt(f"s3 {s3['bucket']}/{key}", lambda: from_s3(s3, key, False),
+                    lambda: s3_request(s3, "DELETE", key).close())
         for key in sorted(k for k in keys if k.endswith(".tar")):
             if key + ".sha256" not in keys:
                 print(f"waiting for {key}.sha256; skipped")
                 continue
-            with staging_dir(".", staging) as download:
-                tar = download / key.rsplit("/", 1)[-1]
-                for name, local in ((key, tar), (key + ".sha256", tar.with_name(tar.name + ".sha256"))):
-                    with s3_request(s3, "GET", name) as response, local.open("wb") as stream:
-                        shutil.copyfileobj(response, stream, 8 * 1024 * 1024)
-                import_tar(tar, download, force, base, record)
-            done += 1
-            if not keep:
-                for name in (key, key + ".sha256"):
-                    s3_request(s3, "DELETE", name).close()
-                print(f"removed from s3 {s3['bucket']}: {key}")
-    print(f"imported {done} tar(s)" if done else "nothing to import")
+            attempt(f"s3 {s3['bucket']}/{key}", lambda: from_s3(s3, key, True),
+                    lambda: [s3_request(s3, "DELETE", name).close() for name in (key, key + ".sha256")])
+    print(f"imported {done} file(s)" if done else "nothing to import")
+    if failed:
+        raise MirrorError(f"{len(failed)} could not be imported and are left in place: {', '.join(failed)}")
 
 
 def promote(record, base=None):
@@ -1290,6 +1429,10 @@ def main(argv=None):
     where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
     where.add_argument("--s3-bucket", help="a bucket at S3_ENDPOINT (S3_PREFIX optional)")
     where.add_argument("--path", help="a directory; it must exist")
+    send_command.add_argument("--flowfile", action="store_true",
+                              default=os.environ.get("MIRROR_SEND_FLOWFILE", "").lower() == "true",
+                              help="with --path or --s3-bucket, deliver one NAME.tar.ffv3 (NiFi FlowFile v3) holding the tar and its "
+                                   ".sha256 with their attributes (or MIRROR_SEND_FLOWFILE=true)")
     import_command = command(
         "import", "push the images in export tars into TARGET_REGISTRY, tags and digests unchanged",
         "  mirror.py import /mnt/diode/received          # every tar there; each removed once imported\n"
@@ -1344,7 +1487,7 @@ def main(argv=None):
             export(args.catalog, ledger_file, args.images, args.list, args.all, args.output, args.max_size,
                    args.staging_dir, args.rewrite_base_path)
         elif args.command == "send":
-            send(args.tars, ledger_file, args.nifi_url, args.s3_bucket, args.path)
+            send(args.tars, ledger_file, args.nifi_url, args.s3_bucket, args.path, args.flowfile)
         elif args.command == "import":
             if not args.sources and not args.s3_bucket:
                 raise MirrorError("import needs a tar, a directory or --s3-bucket")

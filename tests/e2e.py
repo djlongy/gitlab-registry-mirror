@@ -163,7 +163,7 @@ if __name__ == '__main__':
         if bucket:
             cli('low', 'export', '--all', '-o', out / 's3.tar')
             cli('low', 'send', out / 's3.tar', '--s3-bucket', bucket)
-            assert 'imported 1 tar(s)' in cli('high', 'import', '--s3-bucket', bucket)
+            assert 'imported 1 file(s)' in cli('high', 'import', '--s3-bucket', bucket)
             assert 'nothing to import' in cli('high', 'import', '--s3-bucket', bucket)
             checks.append('s3-send-and-import')
 
