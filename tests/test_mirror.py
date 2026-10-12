@@ -485,9 +485,12 @@ class MirrorTest(unittest.TestCase):
         transfer.mkdir()
         order = []
         real = os.replace
-        with mock.patch.object(mirror.os, 'replace', side_effect=lambda a, b: (order.append(Path(b).name), real(a, b))):
+        with mock.patch.object(mirror.os, 'replace',
+                               side_effect=lambda a, b: (order.append((Path(a).name, Path(b).name)), real(a, b))):
             self.assertEqual(self.cli('send', tar, '--path', transfer), 0)
-        self.assertEqual(order[-2:], ['carry.tar', 'carry.tar.sha256'])
+        # Written under a hidden name, which NiFi ListFile and GetFile skip by default, then renamed.
+        self.assertEqual(order[-2:], [('.carry.tar.partial', 'carry.tar'),
+                                      ('.carry.tar.sha256.partial', 'carry.tar.sha256')])
         self.assertEqual(sorted(p.name for p in transfer.iterdir()), ['carry.tar', 'carry.tar.sha256'])
         tar.with_name('carry.tar.sha256').write_text('0' * 64 + '  carry.tar\n')
         self.assertEqual(self.cli('send', tar, '--path', transfer), 1)  # checked before anything is sent

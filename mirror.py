@@ -841,10 +841,8 @@ def write_export(tar, images, staging, base):
         checksum = sha256(built)
         sidecar = work / (tar.name + ".sha256")
         sidecar.write_text(f"{checksum}  {tar.name}\n")
-        shutil.move(built, tar.with_name(tar.name + ".partial"))
-        os.replace(tar.with_name(tar.name + ".partial"), tar)
-        shutil.move(sidecar, tar.with_name(sidecar.name + ".partial"))
-        os.replace(tar.with_name(sidecar.name + ".partial"), tar.with_name(sidecar.name))
+        land(built, tar, move=True)
+        land(sidecar, tar.with_name(sidecar.name), move=True)
     print(f"wrote {tar} and {tar.name}.sha256 ({len(entries)} image tag(s), {tar.stat().st_size} bytes)")
 
 
@@ -954,11 +952,17 @@ def post_file(path, checksum, url):
     print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes)")
 
 
+def land(source, destination, move=False):
+    """Write destination as a hidden .NAME.partial, then rename it in one step on the same filesystem (NFS
+    included). A directory watcher never sees half a file: NiFi ListFile and GetFile skip dot files by
+    default, and import only reads NAME.tar."""
+    hidden = destination.with_name(f".{destination.name}.partial")
+    (shutil.move if move else shutil.copyfile)(source, hidden)
+    os.replace(hidden, destination)
+
+
 def copy_file(path, directory):
-    """Copy under a .partial name, then rename, so a reader of the directory never sees half a file."""
-    partial = directory / (path.name + ".partial")
-    shutil.copyfile(path, partial)
-    os.replace(partial, directory / path.name)
+    land(path, directory / path.name)
 
 
 def send(tars, ledger_file, nifi_url=None, s3_bucket=None, directory=None):
