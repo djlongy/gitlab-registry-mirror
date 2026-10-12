@@ -151,8 +151,9 @@ class MirrorTest(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {'TARGET_REGISTRY': LOW}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
-        mirror.ca_files.cache_clear()
-        self.addCleanup(mirror.ca_files.cache_clear)
+        for cached in (mirror.ca_files, mirror.cert_dir):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
         self.catalog = self.root / 'images.txt'
         self.ledger = self.root.resolve() / '.mirror-ledger.json'
         quiet = mock.patch('sys.stdout', new_callable=io.StringIO)
@@ -181,7 +182,19 @@ class MirrorTest(unittest.TestCase):
         mirror.ca_files.cache_clear()
         _, directory, curl = mirror.ca_files()
         curl = Path(curl[1])
-        self.assertEqual(mirror.options('TARGET_REGISTRY', 'dest-'), [f'--dest-cert-dir={directory}'])
+        self.assertEqual(mirror.options('TARGET_REGISTRY', 'dest-', f'docker://{LOW}/team/app:1'),
+                         [f'--dest-cert-dir={directory}'])
+        # A registry with its own certs.d directory keeps it: CA_BUNDLE is added, never swapped in.
+        own = self.root / 'certs.d' / 'reg.example.internal:5000'
+        own.mkdir(parents=True)
+        (own / 'ca.crt').write_text('their CA')
+        (own / 'client.cert').write_text('their client certificate')
+        with mock.patch.object(mirror, 'CERTS_D', (self.root / 'missing', self.root / 'certs.d')):
+            [flag] = mirror.options(None, 'src-', 'docker://reg.example.internal:5000/team/app:1')
+        mixed = Path(flag.split('=', 1)[1])
+        self.assertEqual(sorted(p.name for p in mixed.iterdir()), ['ca.crt', 'client.cert', 'mirror-ca-bundle.crt'])
+        self.assertEqual((mixed / 'ca.crt').read_text(), 'their CA')
+        self.assertEqual((mixed / 'mirror-ca-bundle.crt').read_text(), SELF_SIGNED)
         self.assertEqual(mirror.options(None), [f'--cert-dir={directory}'])
         self.assertEqual((directory / 'ca.crt').read_text(), SELF_SIGNED)
         self.assertTrue(curl.read_text().endswith(SELF_SIGNED))

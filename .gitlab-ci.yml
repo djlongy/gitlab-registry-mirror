@@ -29,8 +29,8 @@ variables:
   MIRROR_MAX_SIZE: ''
   # A disk with room for the export while it is built. Empty: the job directory.
   MIRROR_STAGING_DIR: ''
-  # PEM file of extra CAs (or self-signed certificates) every connection trusts on top of the system
-  # roots: registries, GitLab, S3 and NiFi. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
+  # PEM file of extra CAs (or self-signed certificates) for a runner that does not already trust them.
+  # Every connection (registries, GitLab, S3, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
   CA_BUNDLE: ''
 
 verify:

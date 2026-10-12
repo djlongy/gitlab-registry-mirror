@@ -18,7 +18,7 @@ Copies reviewed container images and OCI Helm charts into a registry, exports th
 | Optional | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account for `mirror.py login`; leave unset for a registry without auth |
 | Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD` | none | Login for one source registry, e.g. `docker.io` against rate limits. `promote` reads dev from it |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY`, `SOURCE_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
-| Optional | `CA_BUNDLE` | system roots | PEM file of extra CAs or self-signed certificates, e.g. `./certs/ca-bundle.crt`, trusted by every connection; skopeo then ignores `/etc/containers/certs.d` |
+| Optional | `CA_BUNDLE` | system roots | PEM file of extra CAs or self-signed certificates, e.g. `./certs/ca-bundle.crt`, trusted by every connection in addition to the system roots and `certs.d` |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform, e.g. `linux/amd64` |
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` beside `images.txt` | Ledger file, `gitlab`, or the pipeline ledger's `https://` URL, read only, with `PACKAGE_TOKEN` (`read_api`) |
 | Optional | `MIRROR_STAGING_DIR` | beside the tar | Disk where `export` and `import` build their working copy |
