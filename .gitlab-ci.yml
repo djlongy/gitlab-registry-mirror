@@ -157,7 +157,7 @@ sync:
       if [ "$#" -eq 0 ]; then
         echo "no NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH: sync only"
       else
-        python3 mirror.py export -o "export/mirror-export-$CI_PIPELINE_ID.tar" $([ "$EXPORT_ALL" = "true" ] && echo --all)
+        python3 mirror.py export -o "export/container-images-$CI_PIPELINE_ID.tar" $([ "$EXPORT_ALL" = "true" ] && echo --all)
         if ls export/*.tar >/dev/null 2>&1; then python3 mirror.py send export/*.tar "$@"; fi
       fi
     # Keep each sent image's SBOM and scan report, by digest, for audit.

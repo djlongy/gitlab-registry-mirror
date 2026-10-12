@@ -68,7 +68,7 @@ python3 mirror.py import /mnt/diode/received              # or --s3-bucket NAME,
 ## Out of scope
 
 - Signing or approving across the link: the `.sha256` catches corruption, not tampering.
-- Configuring NiFi, the diode or the bucket; they move `NAME.tar` and `NAME.tar.sha256` as files.
+- Configuring the diode or the bucket. The high-side NiFi flow is built by hand from `nifi/CONTAINER-IMAGES-HIGH-BY-HAND.md`.
 - Removing old tags from either registry.
 
 ## Expected result
