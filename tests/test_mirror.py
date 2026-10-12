@@ -1,9 +1,8 @@
-"""Archive integrity, publication ordering and receipt recovery contracts."""
+"""Catalog, sync, export, send and import contracts, with skopeo and the network mocked."""
 import hashlib
 import io
 import json
 import os
-import shutil
 import sys
 import tarfile
 import tempfile
@@ -14,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mirror
 
-REAL_IMAGE_BYTES = mirror.image_bytes
+LOW = 'low.example.internal'
 
 
 def blob(directory, data, name='{}'):
@@ -32,34 +31,55 @@ def image_manifest(directory, name='{}'):
 
 
 def place(stage, directory, root):
-    """Name a skopeo dir: copy after its root digest, as sync does."""
+    """Name a skopeo dir: copy after its root digest."""
     (directory / 'manifest.json').write_bytes((directory / root['digest'][7:]).read_bytes())
     (directory / root['digest'][7:]).unlink()
     final = stage / 'images' / root['digest'].replace(':', '-')
     final.parent.mkdir(parents=True, exist_ok=True)
     directory.rename(final)
-    (final / 'version').write_text('Directory Transport Version: 1.1\n')
     return final
 
 
-def fixture(stage):
-    root, layer = image_manifest(stage / 'building')
-    place(stage, stage / 'building', root)
-    image = mirror.parse_image('docker.io/library/alpine:3.20@' + root['digest'], 'mirror/alpine')
-    return image | {'transfer': root['digest'], 'tags': [image['tag']]}, layer
+class Registry:
+    """A fake pair of registries: tags to digests, and the manifest bytes skopeo would copy."""
 
+    def __init__(self, test):
+        self.tags, self.manifests, self.test = {}, {}, test
 
-def pack(stage, destination, sequence=1, full=True, image=None, stream='a' * 32):
-    if image is None:
-        image, _ = fixture(stage)
-    metadata = {'schema': 1, 'stream': stream, 'sequence': sequence, 'full': full, 'images': [image]}
-    (stage / 'images.json').write_text(json.dumps(metadata))
-    with tarfile.open(destination, 'w') as archive:
-        for path in sorted(stage.rglob('*')):
-            if path.is_file():
-                archive.add(path, arcname=str(path.relative_to(stage)), recursive=False)
-    destination.with_name(destination.name + '.sha256').write_text(f'{mirror.sha256(destination)}  {destination.name}\n')
-    return image
+    def image(self, name):
+        raw = json.dumps({'schemaVersion': 2, 'name': name}).encode()
+        digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+        self.manifests[digest] = raw
+        return digest
+
+    def digest(self, reference, _side=None):
+        name = reference.removeprefix('docker://')
+        if '@' in name:
+            return name.rsplit('@', 1)[1]
+        if name not in self.tags:
+            raise mirror.MirrorError('skopeo inspect failed: manifest unknown')
+        return self.tags[name]
+
+    def copy(self, source, destination, *_sides):
+        digest = self.digest(source) if source.startswith('docker://') else \
+            'sha256:' + hashlib.sha256(Path(source[4:], 'manifest.json').read_bytes()).hexdigest()
+        if destination.startswith('dir:'):
+            Path(destination[4:]).mkdir(parents=True)
+            Path(destination[4:], 'manifest.json').write_bytes(self.manifests[digest])
+            Path(destination[4:], 'f' * 64).write_bytes(b'shared layer')
+        else:
+            self.tags[destination.removeprefix('docker://')] = digest
+
+    def __enter__(self):
+        self.patches = [mock.patch.object(mirror, 'raw_digest', side_effect=self.digest),
+                        mock.patch.object(mirror, 'copy', side_effect=self.copy)]
+        for patch in self.patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *_):
+        for patch in self.patches:
+            patch.stop()
 
 
 class MirrorTest(unittest.TestCase):
@@ -69,29 +89,370 @@ class MirrorTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.stage = self.root / 'stage'
         self.stage.mkdir()
-        self.env = mock.patch.dict(os.environ, {
-            'TARGET_REGISTRY': 'low.example.internal',
-            'MIRROR_STATE_DIR': str(self.root / 'work'), 'MIRROR_BUNDLE_DIR': str(self.root / 'out'),
-            'IMPORT_STATE_DIR': str(self.root / 'import'),
-        }, clear=True)
+        self.env = mock.patch.dict(os.environ, {'TARGET_REGISTRY': LOW}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
-        # Bundle sizing asks the registry for every manifest; tests that script run() do not expect it.
-        sizing = mock.patch.object(mirror, 'image_bytes', return_value=1)
-        sizing.start()
-        self.addCleanup(sizing.stop)
-        # CI runs send straight after sync: unless a test says otherwise, each written bundle is delivered.
-        self.write_only = mirror.write_bundle
+        self.catalog = self.root / 'images.txt'
+        self.ledger = self.root.resolve() / '.mirror-ledger.json'
+        quiet = mock.patch('sys.stdout', new_callable=io.StringIO)
+        self.out = quiet.start()
+        self.addCleanup(quiet.stop)
+        errors = mock.patch('sys.stderr', new_callable=io.StringIO)
+        errors.start()
+        self.addCleanup(errors.stop)
 
-        def written_and_sent(work, out, state_file, state, *rest, **named):
-            bundle = self.write_only(work, out, state_file, state, *rest, **named)
-            (out / (bundle.name + '.send.json')).unlink()
-            state['pending'] = False
-            mirror.save_state(state_file, state)
-            return bundle
-        delivered = mock.patch.object(mirror, 'write_bundle', side_effect=written_and_sent)
-        delivered.start()
-        self.addCleanup(delivered.stop)
+    def cli(self, *args):
+        return mirror.main(['--catalog', str(self.catalog), *map(str, args)])
+
+    def two_images(self, registry):
+        app, db = registry.image('app'), registry.image('db')
+        self.catalog.write_text(f'docker.io/team/app:1.0@{app} team/app\ndocker.io/team/db:2@{db} team/db\n')
+        return app, db
+
+    # Ledger
+
+    def test_the_ledger_is_a_local_file_beside_the_catalog_or_the_package_registry_in_ci(self):
+        self.assertEqual(mirror.ledger_location(self.catalog), self.ledger)
+        with mock.patch.dict(os.environ, {'MIRROR_LEDGER': '/share/ledger.json'}):
+            self.assertEqual(mirror.ledger_location(self.catalog), Path('/share/ledger.json'))
+        with mock.patch.dict(os.environ, {'CI_JOB_TOKEN': 'x'}):
+            self.assertEqual(mirror.ledger_location(self.catalog), 'gitlab')
+            with mock.patch.dict(os.environ, {'MIRROR_LEDGER': 'false'}):
+                self.assertEqual(mirror.ledger_location(self.catalog), self.ledger)
+        self.assertIsNone(mirror.load_ledger(self.ledger, LOW, create=False))
+        ledger = mirror.load_ledger(self.ledger, LOW)
+        self.assertEqual(ledger['registry'], LOW)
+        mirror.save_ledger(self.ledger, ledger)
+        with self.assertRaisesRegex(mirror.MirrorError, 'belongs to low.example.internal'):
+            mirror.load_ledger(self.ledger, 'other.example.internal')
+
+    def test_the_ci_ledger_reads_and_writes_one_generic_package_file(self):
+        stored = {}
+
+        def urlopen(request, **_):
+            self.assertEqual(request.headers.get('Job-token'), 'job')
+            self.assertTrue(request.full_url.endswith('/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'))
+            if request.get_method() == 'PUT':
+                stored['body'] = request.data
+                return io.BytesIO(b'')
+            if 'body' not in stored:
+                raise mirror.urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
+            return io.BytesIO(stored['body'])
+
+        with mock.patch.dict(os.environ, {'CI_JOB_TOKEN': 'job', 'CI_API_V4_URL': 'https://git.example/api/v4',
+                                          'CI_PROJECT_ID': '7'}), \
+                mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
+            ledger = mirror.load_ledger('gitlab', LOW)
+            ledger['sent']['team/app:1.0'] = 'sha256:' + 'a' * 64
+            mirror.save_ledger('gitlab', ledger)
+            self.assertEqual(mirror.load_ledger('gitlab', LOW)['sent'], ledger['sent'])
+
+    def test_a_ledger_url_gives_a_manual_export_the_pipelines_delta_and_is_never_written(self):
+        url = 'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'
+        requests = []
+
+        def urlopen(request, **_):
+            requests.append((request.get_method(), request.full_url, request.headers.get('Private-token')))
+            return io.BytesIO(json.dumps(pipeline).encode())
+
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.cli('sync')
+            pipeline = json.loads(self.ledger.read_text())
+            pipeline['sent'] = {'team/app:1.0': app}  # the pipeline already sent app
+            os.environ.update(PACKAGE_TOKEN='token', MIRROR_LEDGER=url)
+            transfer = self.root / 'transfer'
+            transfer.mkdir()
+            with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
+                self.assertEqual(self.cli('export', '-o', self.root / 'manual.tar'), 0)
+                self.assertEqual(self.tar_images(self.root / 'manual.tar'), [(f'{LOW}/team/db:2', 'team/db', '2')])
+                self.assertEqual(self.cli('send', self.root / 'manual.tar', '--path', transfer), 0)
+                self.assertEqual(self.cli('sync'), 0)
+        self.assertEqual({r[0] for r in requests}, {'GET'})
+        self.assertEqual({r[1:] for r in requests}, {(url, 'token')})
+        os.environ['MIRROR_LEDGER'] = url + '-missing'
+        with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=mirror.urllib.error.HTTPError(
+                url, 404, 'Not Found', {}, None)):
+            self.assertEqual(self.cli('export'), 1)
+
+    # Sync
+
+    def test_sync_copies_by_digest_records_the_ledger_and_is_idempotent(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(registry.tags, {f'{LOW}/team/app:1.0': app, f'{LOW}/team/db:2': db})
+            ledger = json.loads(self.ledger.read_text())
+            self.assertEqual(ledger['synced']['team/app:1.0'], {'pin': app, 'digest': app, 'tags': ['1.0']})
+            with mock.patch.object(mirror, 'copy') as again:
+                self.assertEqual(self.cli('sync'), 0)
+            again.assert_not_called()
+            del registry.tags[f'{LOW}/team/db:2']  # deleted or expired: the next run puts it back
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertIn(f'{LOW}/team/db:2', registry.tags)
+
+    def test_latest_gets_its_version_tag_but_never_one_the_catalog_pins_or_pinned(self):
+        with Registry(self) as registry, mock.patch.object(mirror, 'app_version', return_value='8.10.2'):
+            latest, pinned = registry.image('latest'), registry.image('pinned')
+            self.catalog.write_text(f'docker.io/bitnami/redis:latest@{latest} team/redis\n')
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(registry.tags[f'{LOW}/team/redis:8.10.2'], latest)
+            self.catalog.write_text(f'docker.io/bitnami/redis:latest@{latest} team/redis\n'
+                                    f'docker.io/bitnami/redis:9.0.0@{pinned} team/redis\n')
+            with mock.patch.object(mirror, 'app_version', return_value='9.0.0'):
+                self.assertEqual(self.cli('sync'), 0)
+                self.assertEqual(registry.tags[f'{LOW}/team/redis:9.0.0'], pinned)
+                # The pin's line is removed; latest still does not take the tag the pin established.
+                self.catalog.write_text(f'docker.io/bitnami/redis:latest@{latest} team/redis\n')
+                ledger = json.loads(self.ledger.read_text())
+                ledger['platforms'] = {}
+                self.ledger.write_text(json.dumps(ledger))
+                self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(registry.tags[f'{LOW}/team/redis:9.0.0'], pinned)
+
+    def test_pending_lists_what_sync_has_not_copied(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(self.cli('pending'), 0)
+            self.assertEqual(self.out.getvalue().splitlines(), [f'docker.io/team/app:1.0@{app}', f'docker.io/team/db:2@{db}'])
+            self.cli('sync')
+            self.out.truncate(0)
+            self.out.seek(0)
+            self.cli('pending')
+            self.assertEqual(self.out.getvalue(), '')
+            os.environ['MIRROR_PLATFORM'] = 'linux/amd64'  # a platform change syncs again
+            self.cli('pending')
+            self.assertEqual(len(self.out.getvalue().splitlines()), 2)
+
+    # Export, send and import
+
+    def tar_images(self, tar):
+        with tarfile.open(tar) as archive:
+            return [(i['source'], i['target'], i['tag']) for i in json.load(archive.extractfile('./export.json'))['images']]
+
+    def test_export_takes_what_is_new_since_the_last_send(self):
+        transfer = self.root / 'transfer'
+        transfer.mkdir()
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(self.cli('export', '-o', self.root / 'none.tar'), 0)
+            self.assertIn('not synced yet, run sync first: team/app:1.0', self.out.getvalue())
+            self.assertFalse((self.root / 'none.tar').exists())
+            self.cli('sync')
+            first = self.root / 'first.tar'
+            self.assertEqual(self.cli('export', '-o', first), 0)
+            self.assertEqual(self.tar_images(first), [(f'{LOW}/team/app:1.0', 'team/app', '1.0'),
+                                                      (f'{LOW}/team/db:2', 'team/db', '2')])
+            # Not sent yet: the next export takes the same images again.
+            self.assertEqual(self.cli('export', '-o', self.root / 'again.tar'), 0)
+            self.assertEqual(len(self.tar_images(self.root / 'again.tar')), 2)
+            self.assertEqual(self.cli('send', first, '--path', transfer), 0)
+            self.assertEqual(json.loads(self.ledger.read_text())['sent'], {'team/app:1.0': app, 'team/db:2': db})
+            self.assertEqual(self.cli('export', '-o', self.root / 'quiet.tar'), 0)
+            self.assertIn('nothing new to export', self.out.getvalue())
+            self.assertFalse((self.root / 'quiet.tar').exists())
+            new = registry.image('app-1.1')
+            self.catalog.write_text(f'docker.io/team/app:1.1@{new} team/app\ndocker.io/team/db:2@{db} team/db\n')
+            self.cli('sync')
+            self.assertEqual(self.cli('export', '-o', self.root / 'delta.tar'), 0)
+            self.assertEqual(self.tar_images(self.root / 'delta.tar'), [(f'{LOW}/team/app:1.1', 'team/app', '1.1')])
+            self.assertEqual(self.cli('export', '--all', '-o', self.root / 'all.tar'), 0)
+            self.assertEqual(len(self.tar_images(self.root / 'all.tar')), 2)
+
+    def test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path(self):
+        with Registry(self) as registry:
+            registry.tags[f'{LOW}/team/app:1.0'] = registry.image('app')
+            registry.tags['other.example.com/team/web:3'] = registry.image('web')
+            listing = self.root / 'carry.txt'
+            listing.write_text('# carry these\nother.example.com/team/web:3\n')
+            tar = self.root / 'named.tar'
+            self.assertEqual(self.cli('export', 'team/app:1.0', '--list', listing, '-o', tar,
+                                      '--rewrite-base-path', 'new-org-dev'), 0)
+            self.assertEqual(self.tar_images(tar), [(f'{LOW}/team/app:1.0', 'new-org-dev/app', '1.0'),
+                                                    ('other.example.com/team/web:3', 'new-org-dev/web', '3')])
+            self.assertEqual(self.cli('export', 'team/app:1.0', '-o', tar), 1)  # never overwrites
+            self.assertEqual(mirror.rebase('team/prom/prometheus', 'new-org'), 'new-org/prom/prometheus')
+            self.assertEqual(mirror.rebase('team/app', None), 'team/app')
+            with self.assertRaises(mirror.MirrorError):
+                mirror.rebase('team/app', 'Bad Org')
+
+    def test_max_size_splits_whole_images_into_several_tars_and_none_means_one(self):
+        with Registry(self) as registry, mock.patch.object(mirror, 'image_bytes', side_effect=[3, 3, 9]):
+            for name in ('a', 'b', 'c'):
+                registry.tags[f'{LOW}/team/{name}:1'] = registry.image(name)
+            self.assertEqual(self.cli('export', 'team/a:1', 'team/b:1', 'team/c:1', '-o', self.root / 'carry.tar',
+                                      '--max-size', '6'), 0)
+            self.assertEqual(sorted(p.name for p in self.root.glob('carry-*.tar')),
+                             ['carry-001-of-002.tar', 'carry-002-of-002.tar'])
+            self.assertEqual(len(self.tar_images(self.root / 'carry-001-of-002.tar')), 2)
+            self.assertIn('over --max-size', self.out.getvalue())
+            self.assertEqual(self.cli('export', 'team/a:1', 'team/b:1', 'team/c:1', '-o', self.root / 'whole.tar'), 0)
+            self.assertEqual(len(self.tar_images(self.root / 'whole.tar')), 3)
+        self.assertEqual(mirror.size('4GiB'), 4 * 1024 ** 3)
+        with self.assertRaises(mirror.MirrorError):
+            mirror.size('4GB')
+
+    def test_staging_is_beside_the_tar_or_overridden_and_always_removed(self):
+        staging = self.root / 'big-disk'
+        with Registry(self) as registry:
+            registry.tags[f'{LOW}/team/app:1.0'] = registry.image('app')
+            with mock.patch.object(mirror, 'copy', side_effect=mirror.MirrorError('registry down')):
+                self.assertEqual(self.cli('export', 'team/app:1.0', '-o', self.root / 'out' / 'x.tar',
+                                          '--staging-dir', staging), 1)
+            self.assertEqual(list(staging.iterdir()), [])
+            self.assertEqual(list((self.root / 'out').iterdir()), [])
+            seen = []
+            real = registry.copy
+
+            def watch(source, destination, *sides):
+                seen.append((Path(destination[4:]).parent.parent.parent, os.environ['TMPDIR']))
+                real(source, destination, *sides)
+            with mock.patch.object(mirror, 'copy', side_effect=watch):
+                self.assertEqual(self.cli('export', 'team/app:1.0', '-o', self.root / 'out' / 'x.tar'), 0)
+            self.assertEqual(seen[0][0], self.root / 'out')
+            self.assertTrue(seen[0][1].startswith(str(self.root / 'out' / '.mirror-staging-')))
+            self.assertEqual(sorted(p.name for p in (self.root / 'out').iterdir()), ['x.tar', 'x.tar.sha256'])
+        self.assertNotIn('TMPDIR', os.environ)
+
+    def exported(self, registry, name='carry.tar', source=f'{LOW}/team/app:1.0'):
+        registry.tags[source] = registry.image(source)
+        tar = self.root / name
+        self.assertEqual(self.cli('export', source, '-o', tar), 0)
+        return tar, registry.tags[source]
+
+    def test_import_pushes_digests_unchanged_skips_present_and_never_moves_a_tag_without_force(self):
+        with Registry(self) as registry:
+            tar, digest = self.exported(registry)
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            record = self.root / 'imported.json'
+            self.assertEqual(self.cli('import', tar, '--record', record, '--rewrite-base-path', 'org-dev'), 0)
+            self.assertEqual(registry.tags['high.example.internal/org-dev/app:1.0'], digest)
+            self.assertEqual(json.loads(record.read_text()), [{'target': 'org-dev/app', 'tag': '1.0', 'digest': digest}])
+            self.assertTrue(tar.exists())  # a named tar is kept
+            with mock.patch.object(mirror, 'copy') as push:
+                self.assertEqual(self.cli('import', tar, '--rewrite-base-path', 'org-dev'), 0)
+            push.assert_not_called()
+            registry.tags['high.example.internal/team/app:1.0'] = 'sha256:' + 'b' * 64
+            self.assertEqual(self.cli('import', tar), 1)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], 'sha256:' + 'b' * 64)
+            self.assertEqual(self.cli('import', tar, '--force'), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+        with mock.patch.object(mirror, 'raw_digest', side_effect=mirror.MirrorError('skopeo inspect failed: unauthorized')), \
+                mock.patch.object(mirror, 'copy') as push:
+            self.assertEqual(self.cli('import', tar), 1)  # not read as an absent tag
+        push.assert_not_called()
+
+    def test_import_refuses_a_tar_without_a_matching_checksum(self):
+        tar = self.root / 'carry.tar'
+        tar.write_bytes(b'not the exported bytes')
+        with self.assertRaisesRegex(mirror.MirrorError, 'sha256 is missing'):
+            mirror.import_tar(tar)
+        tar.with_name('carry.tar.sha256').write_text('0' * 64 + '  carry.tar\n')
+        with self.assertRaisesRegex(mirror.MirrorError, 'does not match'):
+            mirror.import_tar(tar)
+
+    def test_a_directory_is_an_inbox_and_imported_tars_leave_it(self):
+        inbox = self.root / 'received'
+        inbox.mkdir()
+        with Registry(self) as registry:
+            tar, digest = self.exported(registry)
+            half, _ = self.exported(registry, 'half.tar', f'{LOW}/team/db:2')
+            for path in (tar, tar.with_name('carry.tar.sha256'), half):
+                os.replace(path, inbox / path.name)
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', inbox, '--keep'), 0)
+            self.assertTrue((inbox / 'carry.tar').exists())
+            self.assertEqual(self.cli('import', inbox), 0)
+            self.assertEqual(sorted(p.name for p in inbox.iterdir()), ['half.tar'])  # no .sha256 yet: waits
+            self.assertIn('waiting for half.tar.sha256', self.out.getvalue())
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+
+    def test_send_needs_one_destination_that_exists_and_writes_the_checksum_last(self):
+        with Registry(self) as registry:
+            tar, _ = self.exported(registry)
+        self.assertEqual(self.cli('send', tar, '--path', self.root / 'not-mounted'), 1)
+        with self.assertRaises(SystemExit):
+            self.cli('send', tar, '--path', self.root, '--s3-bucket', 'b')
+        transfer = self.root / 'transfer'
+        transfer.mkdir()
+        order = []
+        real = os.replace
+        with mock.patch.object(mirror.os, 'replace', side_effect=lambda a, b: (order.append(Path(b).name), real(a, b))):
+            self.assertEqual(self.cli('send', tar, '--path', transfer), 0)
+        self.assertEqual(order[-2:], ['carry.tar', 'carry.tar.sha256'])
+        self.assertEqual(sorted(p.name for p in transfer.iterdir()), ['carry.tar', 'carry.tar.sha256'])
+        tar.with_name('carry.tar.sha256').write_text('0' * 64 + '  carry.tar\n')
+        self.assertEqual(self.cli('send', tar, '--path', transfer), 1)  # checked before anything is sent
+
+    def test_send_to_nifi_posts_the_tar_then_its_checksum_streamed_without_credentials_in_the_log(self):
+        with Registry(self) as registry:
+            tar, _ = self.exported(registry)
+        url = 'http://user:secret@nifi.example.internal:9099/contentListener'
+        with mock.patch.object(mirror, 'run', return_value=b'200') as call:
+            self.assertEqual(self.cli('send', tar, '--nifi-url', url), 0)
+        posted = [c.args for c in call.call_args_list]
+        self.assertEqual([args[args.index('--upload-file') + 1] for args in posted], [str(tar), str(tar) + '.sha256'])
+        headers = [posted[0][i + 1] for i, a in enumerate(posted[0]) if a == '--header']
+        for header in ('Filename: carry.tar', f'X-Sha256: {mirror.sha256(tar)}', 'X-Artifact-Type: container-images',
+                       'Expect:'):
+            self.assertIn(header, headers)
+        self.assertIn('--http1.1', posted[0])
+        self.assertNotIn('--data-binary', posted[0])
+        self.assertIn('posted to NiFi: carry.tar -> http://nifi.example.internal:9099/contentListener', self.out.getvalue())
+        self.assertNotIn('secret', self.out.getvalue())
+
+    def s3_env(self):
+        os.environ.update({'S3_ENDPOINT': 'https://s3.example.internal:9000', 'AWS_ACCESS_KEY_ID': 'AKID',
+                           'AWS_SECRET_ACCESS_KEY': 'secret', 'S3_PREFIX': 'mirror'})
+
+    def test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket(self):
+        self.s3_env()
+        bucket, calls = {}, []
+
+        def urlopen(request, **_):
+            parts = mirror.urllib.parse.urlsplit(request.full_url)
+            calls.append((request.get_method(), parts.path, parts.query))
+            self.assertIn('AWS4-HMAC-SHA256 Credential=AKID/', request.headers['Authorization'])
+            self.assertIn('x-amz-content-sha256', request.headers['Authorization'])
+            key = mirror.urllib.parse.unquote(parts.path.split('/', 2)[2]) if parts.path.count('/') > 1 else ''
+            method = request.get_method()
+            if method == 'PUT':
+                bucket[key] = request.data.read()
+                self.assertEqual(request.headers['Content-length'], str(len(bucket[key])))
+            elif method == 'DELETE':
+                del bucket[key]
+            elif not key:
+                self.assertIn('list-type=2', parts.query)
+                self.assertIn('prefix=mirror%2F', parts.query)
+                items = ''.join(f'<Contents><Key>{k}</Key></Contents>' for k in sorted(bucket))
+                return io.BytesIO(f'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{items}'
+                                  '<IsTruncated>false</IsTruncated></ListBucketResult>'.encode())
+            else:
+                return io.BytesIO(bucket[key])
+            return io.BytesIO(b'')
+
+        with Registry(self) as registry, mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
+            tar, digest = self.exported(registry)
+            self.assertEqual(self.cli('send', tar, '--s3-bucket', 'transfer'), 0)
+            self.assertEqual(sorted(bucket), ['mirror/carry.tar', 'mirror/carry.tar.sha256'])
+            self.assertEqual([c[1] for c in calls], ['/transfer/mirror/carry.tar', '/transfer/mirror/carry.tar.sha256'])
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            os.chdir(self.root)
+            self.assertEqual(self.cli('import', '--s3-bucket', 'transfer'), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
+            self.assertEqual(bucket, {})
+            self.assertEqual([p.name for p in self.root.glob('.mirror-staging-*')], [])
+
+    def test_variables_from_an_older_release_fail_with_what_replaces_them(self):
+        os.environ.update({'LOW_QUAY_HOST': 'low.example.internal', 'RESEND_SEQUENCE': '3..', 'MIRROR_SEND': 'nifi'})
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(mirror.main(['targets']), 1)
+        said = err.getvalue()
+        self.assertIn('LOW_QUAY_HOST is replaced by TARGET_REGISTRY', said)
+        self.assertIn('RESEND_SEQUENCE is replaced by EXPORT_IMAGES', said)
+        self.assertIn('MIRROR_SEND is replaced by NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH', said)
+
+    # Catalog, add, platforms and promote
 
     def test_catalog_requires_a_digest_and_an_org_and_repository(self):
         pinned = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64
@@ -228,54 +589,6 @@ class MirrorTest(unittest.TestCase):
         self.assertEqual(mirror.transport_reference(reference),
                          'registry.example.internal:5000/team/image@sha256:' + 'a'*64)
 
-    def test_manifest_list_children_and_blobs_are_verified(self):
-        building = self.stage / 'building'
-        child, layer = image_manifest(building, '{}.manifest.json')
-        child['platform'] = {'architecture': 'amd64', 'os': 'linux'}
-        root = blob(building, {'schemaVersion': 2, 'manifests': [child]})
-        directory = place(self.stage, building, root)
-        mirror.verify_image(directory, root['digest'])
-        (directory / layer['digest'][7:]).write_text('corrupt')
-        with self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
-            mirror.verify_image(directory, root['digest'])
-        (directory / layer['digest'][7:]).unlink()
-        with self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
-            mirror.verify_image(directory, root['digest'])
-
-    def test_import_rejects_corrupt_content_even_with_recomputed_archive_checksum(self):
-        image, layer = fixture(self.stage)
-        (self.stage / 'images' / image['digest'].replace(':', '-') / layer['digest'][7:]).write_text('bad')
-        bundle = self.root / 'mirror-bad.tar'
-        pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
-            mirror.import_one(bundle)
-        push.assert_not_called()
-
-    def test_metadata_digest_substitution_fails_before_push(self):
-        image, _ = fixture(self.stage)
-        image = mirror.parse_image('docker.io/library/alpine:3.20@sha256:' + 'f'*64, 'mirror/alpine')
-        image.update(transfer=image['digest'], tags=[image['tag']])
-        bundle = self.root / 'mirror-wrong.tar'
-        pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
-            mirror.import_one(bundle)
-        push.assert_not_called()
-
-    def test_import_receipt_is_written_only_after_verified_push(self):
-        bundle = self.root / 'mirror-first.tar'
-        image = pack(self.stage, bundle)
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value='sha256:'+'0'*64), \
-                self.assertRaisesRegex(mirror.MirrorError, 'high mirror digest mismatch'):
-            mirror.import_one(bundle)
-        self.assertFalse((self.root / 'import/received.json').exists())
-        with mock.patch.object(mirror, 'copy') as push, mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            record = self.root / 'imported.json'
-            record.write_text('[]\n')
-            mirror.import_one(bundle, record=record)
-            mirror.import_one(bundle, record=record)  # already imported: nothing new to record
-        self.assertEqual(push.call_count, 1)
-        self.assertEqual(json.loads(record.read_text()),
-                         [{'target': image['target'], 'tag': tag, 'digest': image['transfer']} for tag in image['tags']])
 
     def test_promote_copies_recorded_digests_from_dev_to_prod_and_verifies_both(self):
         os.environ.update({'SOURCE_REGISTRY': 'dev.example.internal', 'TARGET_REGISTRY': 'prod.example.internal',
@@ -306,78 +619,6 @@ class MirrorTest(unittest.TestCase):
         os.environ['TARGET_REGISTRY'] = 'dev.example.internal'
         with self.assertRaisesRegex(mirror.MirrorError, 'same registry'):
             mirror.promote(record)
-
-    def test_bundle_from_a_sender_without_version_tags_imports_its_catalog_tag(self):
-        image, _ = fixture(self.stage)
-        image.update(tag='latest', source=image['source'].replace(':3.20@', ':latest@'))
-        del image['tags']
-        bundle = self.root / 'mirror-old.tar'
-        pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            self.assertEqual(mirror.main(['import', str(bundle)]), 0)
-        self.assertEqual([c.args[1] for c in push.call_args_list], ['docker://low.example.internal/mirror/alpine:latest'])
-
-    def test_missing_delta_and_old_replay_fail_full_resend_recovers(self):
-        image, _ = fixture(self.stage)
-        first, gap, recovery = [self.root / f'mirror-{n}.tar' for n in (1, 3, 4)]
-        pack(self.stage, first, image=image)
-        pack(self.stage, gap, sequence=3, full=False, image=image)
-        pack(self.stage, recovery, sequence=4, full=True, image=image)
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            mirror.import_one(first)
-            with self.assertRaisesRegex(mirror.MirrorError, r'missing earlier bundle 2 \(imported up to 1, received 3\)'
-                                                            r'.*RESEND_SEQUENCE=2\.\.'):
-                mirror.import_one(gap)
-            mirror.import_one(recovery)
-            with self.assertRaisesRegex(mirror.MirrorError, 'refusing rollback'):
-                mirror.import_one(first)
-
-    def test_new_stream_requires_explicit_adoption_of_full_bundle(self):
-        image, _ = fixture(self.stage)
-        first, other = self.root / 'mirror-first.tar', self.root / 'mirror-other.tar'
-        pack(self.stage, first, image=image)
-        pack(self.stage, other, image=image, stream='b'*32)
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            mirror.import_one(first)
-            with self.assertRaisesRegex(mirror.MirrorError, 'different sender'):
-                mirror.import_one(other)
-            mirror.import_one(other, adopt_stream=True)
-
-    def test_inbox_full_recovery_unblocks_waiting_deltas(self):
-        image, _ = fixture(self.stage)
-        inbox = self.root / 'inbox'
-        inbox.mkdir()
-        pack(self.stage, inbox / 'mirror-3.tar', sequence=3, full=False, image=image)
-        pack(self.stage, inbox / 'mirror-4.tar', sequence=4, full=True, image=image)
-        with mock.patch.object(mirror, 'copy') as push, mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            mirror.import_inbox(inbox)
-        self.assertEqual(push.call_count, 1)
-        self.assertEqual(len(list((inbox / 'done').glob('*.tar'))), 2)
-
-    def test_inbox_waits_for_readiness_marker(self):
-        (self.root / 'mirror-partial.tar').write_bytes(b'partial')
-        with mock.patch.object(mirror, 'import_one') as importer:
-            self.assertEqual(mirror.main(['import', '--inbox', str(self.root)]), 0)
-        importer.assert_not_called()
-
-    def test_unsafe_duplicate_and_link_archive_members_fail(self):
-        for names, kind in [(['../escape'], tarfile.REGTYPE),
-                            (['images.json', 'images.json'], tarfile.REGTYPE),
-                            (['images.json'], tarfile.SYMTYPE)]:
-            with self.subTest(names=names, kind=kind):
-                bundle = self.root / 'unsafe.tar'
-                with tarfile.open(bundle, 'w') as archive:
-                    for name in names:
-                        item = tarfile.TarInfo(name)
-                        item.type = kind
-                        item.size = 1 if kind == tarfile.REGTYPE else 0
-                        archive.addfile(item, io.BytesIO(b'x') if item.size else None)
-                with self.assertRaisesRegex(mirror.MirrorError, 'unsafe or duplicate'):
-                    mirror.extract(bundle, self.stage)
-
-    def test_state_defaults_to_the_home_directory(self):
-        with mock.patch.dict(os.environ, {'HOME': str(self.root)}, clear=True):
-            self.assertEqual(mirror.state_path('MIRROR_STATE_DIR', 'registry-mirror'), self.root / '.local/state/registry-mirror')
 
     def test_platform_selection_picks_one_child_or_fails(self):
         child = {'digest': 'sha256:' + 'b'*64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}
@@ -464,7 +705,7 @@ class MirrorTest(unittest.TestCase):
                                 mock.patch.object(mirror, 'raw_digest', return_value=impostor['digest']):
                             self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
                         transport.assert_not_called()
-                        self.assertFalse((self.root / 'out').exists())
+                        self.assertFalse(self.ledger.exists())
 
     def test_index_of_another_platform_without_platforms_is_not_mirrored(self):
         building = self.stage / 'building'
@@ -480,7 +721,7 @@ class MirrorTest(unittest.TestCase):
                 mock.patch.object(mirror, 'raw_digest', return_value=root['digest']):
             self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
         transport.assert_not_called()
-        self.assertFalse((self.root / 'work/sent.json').exists())
+        self.assertFalse(self.ledger.exists())
 
     def test_single_image_of_another_platform_is_not_mirrored(self):
         building = self.stage / 'building'
@@ -496,28 +737,7 @@ class MirrorTest(unittest.TestCase):
                 mock.patch.object(mirror, 'raw_digest', return_value=root['digest']):
             self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
         transport.assert_not_called()
-        self.assertFalse((self.root / 'work/sent.json').exists())
-
-    def test_platform_image_must_belong_to_the_approved_index(self):
-        image, _ = fixture(self.stage)
-        directory = self.stage / 'images' / image['transfer'].replace(':', '-')
-        index = json.dumps({'schemaVersion': 2, 'manifests': [{'digest': image['transfer']}]}).encode()
-        approved = 'sha256:' + hashlib.sha256(index).hexdigest()
-        (directory / f'{approved[7:]}.manifest.json').write_bytes(index)
-        platform = image | {'source': 'docker.io/library/alpine:3.20@' + approved, 'digest': approved}
-        mirror.verify_platform(directory, platform)
-        for forged in ({'transfer': 'sha256:' + 'e'*64}, {'digest': 'sha256:' + 'f'*64}):
-            with self.subTest(forged=forged), self.assertRaises(mirror.MirrorError):
-                mirror.verify_platform(directory, platform | forged)
-        # Listed is not enough: a referrer or nested index is never the platform image.
-        for listed in ({'artifactType': 'application/vnd.dev.cosign.artifact.sig.v1+json'},
-                       {'annotations': {'vnd.docker.reference.type': 'attestation-manifest'}},
-                       {'mediaType': mirror.INDEXES[0]}):
-            index = json.dumps({'schemaVersion': 2, 'manifests': [{'digest': image['transfer']} | listed]}).encode()
-            approved = 'sha256:' + hashlib.sha256(index).hexdigest()
-            (directory / f'{approved[7:]}.manifest.json').write_bytes(index)
-            with self.subTest(listed=listed), self.assertRaisesRegex(mirror.MirrorError, 'not an image'):
-                mirror.verify_platform(directory, platform | {'digest': approved})
+        self.assertFalse(self.ledger.exists())
 
     def test_latest_is_paired_with_its_version_tag(self):
         inspected = {'Labels': {'org.opencontainers.image.version': '8.10.2'}, 'Env': ['APP_VERSION=8.10.1']}
@@ -547,456 +767,6 @@ class MirrorTest(unittest.TestCase):
             with mock.patch.object(mirror, 'app_version', return_value=version):
                 self.assertEqual(mirror.publish_tags('latest', stored, 'docker://up/redis', 'SOURCE_REGISTRY'), expected)
                 self.assertEqual(mirror.publish_tags('3.20', stored, 'docker://up/redis', 'SOURCE_REGISTRY'), ['3.20'])
-        image, _ = fixture(self.stage)
-        image.update(tag='latest', source=image['source'].replace(':3.20@', ':latest@'),
-                     tags=['latest', '8.10.2'])
-        bundle = self.root / 'mirror-latest.tar'
-        pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            mirror.import_one(bundle)
-        self.assertEqual([c.args[1].rsplit(':', 1)[1] for c in push.call_args_list], image['tags'])
-        versioned = image | {'tag': '3.20', 'source': image['source'].replace(':latest@', ':3.20@'), 'tags': ['3.20', '9.9']}
-        for forged in (image | {'tags': ['latest', '8.10.2', '9.9']}, image | {'tags': ['8.10.2']}, versioned):
-            pack(self.stage, bundle, image=forged, sequence=5)
-            with self.subTest(tags=forged['tags']), mock.patch.object(mirror, 'copy'), \
-                    self.assertRaisesRegex(mirror.MirrorError, 'invalid image entry'):
-                mirror.import_one(bundle)
-
-    def latest_entry(self):
-        image, _ = fixture(self.stage)
-        path = self.root / 'images.txt'
-        path.write_text(image['source'].replace(':3.20@', ':latest@') + ' ' + image['target'] + '\n')
-        low = {}
-
-        def fake_copy(_source, destination, *_args):
-            if destination.startswith('dir:'):
-                shutil.copytree(self.stage / 'images' / image['digest'].replace(':', '-'), Path(destination[4:]))
-            else:
-                low[destination] = image['digest']
-
-        def fake_digest(reference, _side):
-            if reference.startswith('docker://low.example.internal/') and reference not in low:
-                raise mirror.MirrorError('manifest unknown')
-            return image['digest']
-
-        return path, low, fake_copy, fake_digest
-
-    def bundled_tags(self, bundle):
-        with tarfile.open(bundle) as archive:
-            return [i['tags'] for i in json.load(archive.extractfile('images.json'))['images']]
-
-    def test_failed_version_lookup_fails_sync_and_is_asked_again(self):
-        path, low, fake_copy, fake_digest = self.latest_entry()
-        answers = [mirror.MirrorError('inspect timed out'), {}, {'Env': ['APP_VERSION=8.10.2']}]
-
-        def fake_run(*args):
-            if '--raw' in args:
-                return b'{"schemaVersion": 2}'
-            answer = answers.pop(0)
-            if isinstance(answer, Exception):
-                raise answer
-            return json.dumps(answer).encode()
-
-        with mock.patch.object(mirror, 'run', side_effect=fake_run), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest):
-            self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
-            self.assertFalse((self.root / 'work/sent.json').exists())
-            # The image reports no version yet: latest alone, and nothing cached for it.
-            self.assertEqual(self.bundled_tags(mirror.sync(path)), [['latest']])
-            self.assertEqual(self.bundled_tags(mirror.sync(path, full=True)), [['latest', '8.10.2']])
-        self.assertIn('docker://low.example.internal/mirror/alpine:8.10.2', low)
-        self.assertEqual(answers, [])
-
-    def test_daily_sync_tracks_and_repairs_version_tags(self):
-        path, low, fake_copy, fake_digest = self.latest_entry()
-        version = 'docker://low.example.internal/mirror/alpine:8.10.2'
-        reported = {}
-
-        def fake_run(*args):
-            return b'{"schemaVersion": 2}' if '--raw' in args else json.dumps(reported).encode()
-
-        with mock.patch.object(mirror, 'run', side_effect=fake_run), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy) as transport, \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest):
-            self.assertEqual(self.bundled_tags(mirror.sync(path)), [['latest']])
-            # An unchanged latest pin that now reports a version sends a delta carrying the new tag.
-            reported['Env'] = ['APP_VERSION=8.10.2']
-            self.assertEqual(self.bundled_tags(mirror.sync(path)), [['latest', '8.10.2']])
-            self.assertIn(version, low)
-            before = transport.call_count
-            self.assertIsNone(mirror.sync(path))
-            self.assertEqual(transport.call_count, before)
-            del low[version]  # deleted or expired: the daily run puts it back without sending
-            self.assertIsNone(mirror.sync(path))
-            self.assertIn(version, low)
-            self.assertEqual(transport.call_args.args, ('docker://low.example.internal/mirror/alpine@'
-                                                       + low[version], version, 'TARGET_REGISTRY', 'TARGET_REGISTRY'))
-        ledger = json.loads((self.root / 'work/sent.json').read_text())
-        self.assertEqual(ledger['aliases'], {'mirror/alpine:latest': ['8.10.2']})
-
-    def test_removed_pin_keeps_its_tag_when_latest_reports_that_version(self):
-        latest, pinned = 'sha256:' + 'a'*64, 'sha256:' + 'b'*64
-        path = self.root / 'images.txt'
-        entries = {'latest': f'docker.io/bitnami/redis:latest@{latest} mirror/redis\n',
-                   'pin': f'docker.io/bitnami/redis:8.10.2@{pinned} mirror/redis\n'}
-        version = 'docker://low.example.internal/mirror/redis:8.10.2'
-        low = {}
-
-        def fake_copy(source, destination, *_args):
-            if destination.startswith('dir:'):
-                Path(destination[4:]).mkdir(parents=True)
-            else:
-                low[destination] = source.rsplit('@', 1)[1]
-
-        def fake_digest(reference, _side):
-            if reference.startswith('docker://low.example.internal/') and reference not in low:
-                raise mirror.MirrorError('manifest unknown')
-            return low.get(reference) or reference.rsplit('@', 1)[1]
-
-        def fake_run(*args):
-            return b'{"schemaVersion": 2}' if '--raw' in args else b'{"Env": ["APP_VERSION=8.10.2"]}'
-
-        with mock.patch.object(mirror, 'run', side_effect=fake_run), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'verify_image'):
-            path.write_text(entries['latest'] + entries['pin'])
-            self.assertEqual(sorted(self.bundled_tags(mirror.sync(path))), [['8.10.2'], ['latest']])
-            self.assertEqual(low[version], pinned)
-            # Removing the pin stops its updates; latest does not take the tag the pin established.
-            path.write_text(entries['latest'])
-            self.assertIsNone(mirror.sync(path))
-            self.assertEqual(low[version], pinned)
-            self.assertEqual(self.bundled_tags(mirror.sync(path, full=True)), [['latest']])
-            self.assertEqual(low[version], pinned)
-        # A pin copied by a sync that failed before sent.json was updated is protected too.
-        shutil.rmtree(self.root / 'work')
-        shutil.rmtree(self.root / 'out')
-        low.clear()
-        with mock.patch.object(mirror, 'run', side_effect=fake_run), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'verify_image'):
-            path.write_text(entries['latest'] + entries['pin'])
-            with mock.patch.object(mirror, 'write_tar', side_effect=mirror.MirrorError('disk full')):
-                self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
-            self.assertEqual(low[version], pinned)
-            self.assertEqual(json.loads((self.root / 'work/sent.json').read_text())['sent'], {})
-            path.write_text(entries['latest'])
-            self.assertEqual(self.bundled_tags(mirror.sync(path)), [['latest']])
-            self.assertEqual(low[version], pinned)
-
-    def test_ledger_from_before_version_tags_gains_the_version_tag(self):
-        path, low, fake_copy, _ = self.latest_entry()
-        image = mirror.catalog(path)[0]
-        work = self.root / 'work'
-        work.mkdir()
-        # sent.json as written by the release without version tags: digest only, a transfer cache.
-        mirror.write_json(work / 'sent.json', {
-            'stream': 'a'*32, 'sequence': 1, 'registry': 'low.example.internal', 'pending': False,
-            'sent': {'mirror/alpine:latest': image['digest']}, 'platforms': {image['digest']: image['digest']}})
-        low['docker://low.example.internal/mirror/alpine:latest'] = image['digest']
-        with mock.patch.object(mirror, 'run', return_value=json.dumps({'Env': ['APP_VERSION=8.10.2']}).encode()), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=lambda reference, side: image['digest']):
-            bundle = mirror.sync(path)
-        self.assertEqual(self.bundled_tags(bundle), [['latest', '8.10.2']])
-        self.assertIn('docker://low.example.internal/mirror/alpine:8.10.2', low)
-
-    def test_shared_digest_platform_change_and_wiped_target_registry(self):
-        image, _ = fixture(self.stage)
-        latest = image | {'tag': 'latest', 'source': image['source'].replace(':3.20@', ':latest@')}
-        path = self.root / 'images.txt'
-        path.write_text(f"{image['source']} {image['target']}\n{latest['source']} {latest['target']}\n")
-        low = {}
-
-        def fake_copy(source, destination, *_args):
-            if destination.startswith('dir:'):
-                shutil.copytree(self.stage / 'images' / image['digest'].replace(':', '-'), Path(destination[4:]))
-            else:
-                low[destination] = image['digest']
-
-        def fake_digest(reference, _side):
-            if reference.startswith('docker://low.example.internal/'):
-                if reference not in low:
-                    raise mirror.MirrorError('manifest unknown')
-                return low[reference]
-            return image['digest']
-
-        # latest reports 3.20, which images.txt already pins: no clash, and each entry keeps its own tags.
-        with mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'app_version', return_value='3.20'):
-            with tarfile.open(mirror.sync(path)) as archive:
-                entries = json.load(archive.extractfile('images.json'))['images']
-            self.assertEqual(sorted(e['tags'] for e in entries), [['3.20'], ['latest']])
-            low.clear()  # target registry wiped: the next run repairs every tag without sending
-            self.assertIsNone(mirror.sync(path))
-            self.assertEqual(len(low), 2)
-            with mock.patch.dict(os.environ, {'MIRROR_PLATFORM': 'linux/amd64'}), \
-                    mock.patch.object(mirror, 'platform_digest', return_value=image['digest']):
-                self.assertIsNotNone(mirror.sync(path))
-
-    def test_concurrent_work_is_refused(self):
-        with mirror.locked(self.root / 'work'), \
-                self.assertRaisesRegex(mirror.MirrorError, 'another mirror process'), \
-                mirror.locked(self.root / 'work'):
-            self.fail('lock was not exclusive')
-
-    def test_sync_repairs_low_even_when_nothing_is_due_and_failed_delivery_recovers(self):
-        image, _ = fixture(self.stage)
-        path = self.root / 'images.txt'
-        path.write_text(image['source'] + ' ' + image['target'] + '\n')
-
-        def fake_copy(_source, destination, *_args):
-            if destination.startswith('dir:'):
-                shutil.copytree(self.stage / 'images' / image['digest'].replace(':', '-'), Path(destination[4:]))
-
-        with mock.patch.object(mirror, 'copy', side_effect=fake_copy) as transport, \
-                mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            first = mirror.sync(path)
-            self.assertTrue(first.exists())
-            before = transport.call_count
-            self.assertIsNone(mirror.sync(path))
-            self.assertEqual(transport.call_count, before)
-            # Written but never sent: the CI job's outbox is gone with it, and the ledger is still pending.
-            with mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only):
-                mirror.sync(path, full=True)
-            with self.assertRaisesRegex(mirror.MirrorError, 'not sent yet'):
-                mirror.sync(path)
-            shutil.rmtree(self.root / 'out')
-            recovery = mirror.sync(path)
-            with tarfile.open(recovery) as archive:
-                metadata = json.load(archive.extractfile('images.json'))
-            self.assertTrue(metadata['full'])
-            self.assertEqual(metadata['sequence'], 3)
-
-
-
-class LedgerTest(unittest.TestCase):
-    """The GitLab-package ledger, resend and registry import, against an in-memory package store."""
-
-    setUp = MirrorTest.setUp
-    latest_entry = MirrorTest.latest_entry
-    bundled_tags = MirrorTest.bundled_tags
-
-    def store(self):
-        files = {}
-
-        def get(package, version, name, destination=None):
-            data = files.get((package, version, name))
-            if data is None or destination is None:
-                return data
-            Path(destination).write_bytes(data)
-            return destination
-
-        def put(package, version, name, data):
-            files[(package, version, name)] = data
-
-        def exists(package, version, name):
-            return (package, version, name) in files
-
-        os.environ['MIRROR_LEDGER'] = 'true'
-        for name, fake in (('package_get', get), ('package_put', put), ('store_exists', exists)):
-            patcher = mock.patch.object(mirror, name, side_effect=fake)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return files
-
-    def manifest(self, bundle):
-        with tarfile.open(bundle) as archive:
-            return json.load(archive.extractfile('images.json'))
-
-    def test_a_lost_runner_resumes_from_the_ledger_and_resends_by_sequence_or_image(self):
-        files = self.store()
-        path, _, fake_copy, fake_digest = self.latest_entry()
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest):
-            first = mirror.sync(path)
-            record = json.loads(files[('registry-mirror-ledger', '000000000001', 'images.json')])
-            self.assertEqual((record['kind'], record['bundle'], record['sequence']), ('full', first.name, 1))
-            self.assertRegex(record['created'], r'^\d{4}-\d\d-\d\dT')
-            shutil.rmtree(self.root / 'work')  # the runner and its sent.json are gone
-            self.assertIsNone(mirror.sync(path))
-            by_image = self.manifest(mirror.resend(image='mirror/alpine'))
-            self.assertEqual((by_image['sequence'], by_image['full'], 'from' in by_image), (2, False, False))
-            by_range = self.manifest(mirror.resend(sequences='1..'))
-            self.assertEqual((by_range['sequence'], by_range['from']), (3, 1))
-            self.assertIsNone(mirror.resend(since='2999-01-01'))
-        self.assertEqual(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['sequence'], 3)
-        for bad in ({}, {'since': 'yesterday'}, {'sequences': '3..1'}):
-            with self.subTest(bad), self.assertRaises(mirror.MirrorError):
-                mirror.resend(**bad)
-
-    def test_a_resend_carries_the_newest_digest_of_each_tag(self):
-        files = self.store()
-        old, new = 'sha256:' + 'a'*64, 'sha256:' + 'b'*64
-
-        def entry(digest):
-            image = mirror.parse_image(f'docker.io/bitnami/redis:latest@{digest}', 'mirror/redis')
-            return image | {'transfer': digest, 'tags': ['latest']}
-
-        for sequence, digest, created in ((1, old, '2026-09-01T00:00:00Z'), (2, new, '2026-10-01T00:00:00Z')):
-            files[('registry-mirror-ledger', f'{sequence:012d}', 'images.json')] = json.dumps(
-                {'sequence': sequence, 'created': created, 'images': [entry(digest)]}).encode()
-        files[('registry-mirror-ledger', 'head', 'state.json')] = json.dumps(
-            {'stream': 'a'*32, 'sequence': 2, 'sent': {}, 'registry': 'low.example.internal'}).encode()
-        with mock.patch.object(mirror, 'write_bundle') as send:
-            mirror.resend(since='2026-08-01')
-        self.assertEqual([i['transfer'] for i in send.call_args.args[5]], [new])
-        self.assertEqual(send.call_args.args[7:], ('resend', 1))
-
-    def test_import_accepts_a_resend_only_over_the_gap_it_covers(self):
-        image, _ = fixture(self.stage)
-        bundle = self.root / 'mirror-1.tar'
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            pack(self.stage, bundle, image=image)
-            mirror.import_one(bundle)
-            for start, sequence in ((3, 4), (99, 4)):
-                pack(self.stage, bundle, image=image, sequence=sequence, full=False)
-                metadata = json.loads((self.stage / 'images.json').read_text()) | {'from': start}
-                (self.stage / 'images.json').write_text(json.dumps(metadata))
-                pack_metadata(self.stage, bundle)
-                with self.subTest(start=start), self.assertRaises(mirror.MirrorError):
-                    mirror.import_one(bundle)
-            metadata['from'] = 2
-            (self.stage / 'images.json').write_text(json.dumps(metadata))
-            pack_metadata(self.stage, bundle)
-            mirror.import_one(bundle)
-        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 4)
-
-    def test_registry_import_catches_up_on_missed_triggers_and_waits_for_half_a_bundle(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream = 'c' * 32
-        for sequence in (1, 2, 3):
-            stem = f'mirror-{stream}-{sequence:012d}'
-            pack(self.stage, self.root / f'{stem}.tar', sequence=sequence, full=sequence == 1, image=image, stream=stream)
-            for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
-                if (sequence, name[-6:]) != (3, 'sha256'):  # bundle 3's checksum has not arrived
-                    files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch('builtins.print') as said:
-            # The first trigger was lost: the second still imports bundle 1 before bundle 2.
-            mirror.import_registry(f'mirror-{stream}-000000000002.tar')
-            mirror.import_registry(f'mirror-{stream}-000000000003.tar')
-        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 2)
-        self.assertIn(mock.call(f'waiting for mirror-{stream}-000000000003.tar.sha256'), said.call_args_list)
-        with self.assertRaisesRegex(mirror.MirrorError, 'not a bundle name'):
-            mirror.import_registry('../../etc/passwd')
-
-    def test_the_registry_receipt_survives_a_fresh_runner(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream = 'd' * 32
-        for sequence in (1, 2):
-            stem = f'mirror-{stream}-{sequence:012d}'
-            pack(self.stage, self.root / f'{stem}.tar', sequence=sequence, full=sequence == 1, image=image, stream=stream)
-            for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
-                files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch('builtins.print') as said:
-            mirror.import_registry(f'mirror-{stream}-000000000001.tar')
-            shutil.rmtree(self.root / 'import')  # the next job runs on a clean runner
-            mirror.import_registry(f'mirror-{stream}-000000000001.tar')
-        # Without the registry's receipt the second run would push both bundles again.
-        self.assertEqual(said.call_args_list[-2:], [mock.call(f'superseded: mirror-{stream}-000000000001.tar'),
-                                                    mock.call(f'not checking the store for mirror-{stream}-000000000001: '
-                                                              'IMPORT_DELETE_BUNDLES is not true')])
-        self.assertEqual(json.loads(files[('registry-mirror-receipt', 'head', 'received.json')])['sequence'], 2)
-
-    def test_s3_store_signs_a_path_style_request_and_reads_a_missing_key_as_none(self):
-        os.environ.update({'IMPORT_STORE': 's3', 'S3_ENDPOINT': 'https://s3.example.internal:8443',
-                           'S3_BUCKET': 'mirror-high', 'AWS_ACCESS_KEY_ID': 'AKIDEXAMPLE',
-                           'AWS_SECRET_ACCESS_KEY': 'secret'})
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"sequence": 4}'
-        with mock.patch.object(mirror.urllib.request, 'urlopen', return_value=response) as opened:
-            self.assertEqual(mirror.store_get('registry-mirror-receipt', 'head', 'received.json'), b'{"sequence": 4}')
-        request = opened.call_args.args[0]
-        self.assertEqual(request.full_url, 'https://s3.example.internal:8443/mirror-high/registry-mirror-receipt/head/received.json')
-        os.environ['S3_PREFIX'] = 'mirror'  # no trailing slash: one is added
-        with mock.patch.object(mirror.urllib.request, 'urlopen', return_value=response) as opened:
-            mirror.store_get('registry-mirror-receipt', 'head', 'received.json')
-        self.assertEqual(opened.call_args.args[0].full_url,
-                         'https://s3.example.internal:8443/mirror-high/mirror/registry-mirror-receipt/head/received.json')
-        del os.environ['S3_PREFIX']
-        self.assertRegex(request.get_header('Authorization'),
-                         r'^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/[0-9]{8}/us-east-1/s3/aws4_request, '
-                         r'SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$')
-        missing = mirror.urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
-        with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=missing):
-            self.assertIsNone(mirror.store_get('registry-mirror-bundles', 'x', 'x.tar'))
-
-    def test_delete_bundles_removes_each_import_and_a_late_trigger_is_already_imported(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream, stem = 'e' * 32, f"mirror-{'e' * 32}-000000000001"
-        pack(self.stage, self.root / f'{stem}.tar', sequence=1, image=image, stream=stream)
-        for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
-            files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
-        os.environ['IMPORT_DELETE_BUNDLES'] = 'true'
-        with self.assertRaisesRegex(mirror.MirrorError, 'needs PACKAGE_TOKEN'):  # a job token cannot delete
-            mirror.import_registry(f'{stem}.tar')
-        os.environ['PACKAGE_TOKEN'] = 'maintainer-token'
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch.object(mirror, 'store_delete', side_effect=[1, 0]) as deleted, \
-                mock.patch('builtins.print') as said:
-            mirror.import_registry(f'{stem}.tar')
-            mirror.import_registry(f'{stem}.tar.sha256')  # the second file's trigger, after the delete
-        self.assertEqual(deleted.call_count, 2)  # the import, then the late trigger's check for a leftover
-        deleted.assert_called_with('registry-mirror-bundles', stem, [f'{stem}.tar', f'{stem}.tar.sha256'])
-        printed = [c.args[0] for c in said.call_args_list]
-        self.assertIn(f'deleted from the store: {stem}', printed)
-        self.assertEqual(printed[-2:], [f'already imported: {stem}.tar', f'nothing to delete in the store: {stem}'])
-
-    def test_cleanup_says_why_a_bundle_stays_and_removes_a_leftover_once_enabled(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream, stem = 'f' * 32, f"mirror-{'f' * 32}-000000000001"
-        pack(self.stage, self.root / f'{stem}.tar', sequence=1, image=image, stream=stream)
-        for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
-            files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
-        os.environ['CI_ENVIRONMENT_NAME'] = 'dev'
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch.object(mirror, 'store_delete') as deleted, mock.patch('builtins.print') as said:
-            mirror.import_registry(f'{stem}.tar')  # IMPORT_DELETE_BUNDLES never reached the job
-        printed = [c.args[0] for c in said.call_args_list]
-        deleted.assert_not_called()
-        self.assertIn('setting: IMPORT_DELETE_BUNDLES is not set in this job (environment dev): '
-                      'imported bundles stay in the store', printed)
-        self.assertIn(f'kept in the store: {stem} (IMPORT_DELETE_BUNDLES is not true)', printed)
-        os.environ.update({'IMPORT_DELETE_BUNDLES': 'true', 'PACKAGE_TOKEN': 'maintainer-token'})
-        with mock.patch.object(mirror, 'store_delete', return_value=1) as deleted, mock.patch('builtins.print') as said:
-            mirror.import_registry(f'{stem}.tar')  # a re-trigger once the setting is fixed
-        deleted.assert_called_once()
-        self.assertIn(mock.call(f'deleted from the store: {stem}'), said.call_args_list)
-        self.assertIn(mock.call('setting: PACKAGE_TOKEN=(set)'), said.call_args_list)
-        os.environ['NIFI_URL'] = 'https://user:secret@nifi.example.internal:9443/contentListener'
-        with mock.patch('builtins.print') as said:
-            mirror.settings(('NIFI_URL', 'not posted', False))
-        said.assert_called_once_with('setting: NIFI_URL=https://nifi.example.internal:9443/contentListener')
-        os.environ['IMPORT_DELETE_BUNDLES'] = 'yes'
-        with self.assertRaisesRegex(mirror.MirrorError, "IMPORT_DELETE_BUNDLES must be true or false, not 'yes'"):
-            mirror.import_registry(f'{stem}.tar')
-
-    def test_send_infers_the_method_from_its_flags(self):
-        self.assertEqual(mirror.send_arguments(['outbox'], '/mnt/transfer', None), ('dir', 'outbox'))
-        self.assertEqual(mirror.send_arguments(['dir', 'outbox'], '/mnt/transfer', None), ('dir', 'outbox'))
-        self.assertEqual(mirror.send_arguments([], None, 'transfer'), ('s3', None))
-        self.assertEqual(mirror.send_arguments(['outbox'], None, None), ('nifi', 'outbox'))
-        with self.assertRaises(mirror.MirrorError):
-            mirror.send_arguments(['outbox', 'extra'], '/mnt/transfer', None)
-
-    def test_send_takes_the_outbox_before_or_after_its_options(self):
-        with mock.patch.object(mirror, 'send', return_value=0) as send:
-            for argv in (['send', 'dir', '--path', '/m', 'ob'], ['send', '--path', '/m', 'ob'], ['send', 'dir', 'ob', '--path', '/m']):
-                self.assertEqual(mirror.main(argv), 0)
-                send.assert_called_with('dir', 'ob', '/m', 'ffv3')
-        with self.assertRaises(SystemExit):
-            mirror.main(['targets', 'extra'])
 
     def test_share_blobs_hardlinks_a_repeated_blob_and_keeps_it_readable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1012,228 +782,6 @@ class LedgerTest(unittest.TestCase):
                 (layout / '000003' / blob).write_bytes(b'layer')
                 mirror.share_blobs(layout, {})
             self.assertEqual((layout / '000003' / blob).read_bytes(), b'layer')
-
-    def test_carry_records_nothing_when_the_export_fails(self):
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.dict(os.environ, {'MIRROR_STATE_DIR': f'{directory}/work', 'MIRROR_LEDGER': 'false'}):
-            catalog = Path(directory) / 'images.txt'
-            catalog.write_text('docker.io/library/alpine:3.20@sha256:' + 'b' * 64 + ' mirror/alpine\n')
-            target = Path(directory) / 'transfer'
-            with self.assertRaisesRegex(mirror.MirrorError, 'mount or create it first'):
-                mirror.carry(catalog, target)
-            target.mkdir()
-            with mock.patch.object(mirror, 'sync'), \
-                    mock.patch.object(mirror, 'export', side_effect=mirror.MirrorError('registry down')):
-                with self.assertRaises(mirror.MirrorError):
-                    mirror.carry(catalog, target)
-            self.assertEqual(sorted(p.name for p in target.iterdir()), ['.staging'])
-            self.assertEqual(list((target / '.staging').iterdir()), [])
-            with mock.patch('sys.stdout', new_callable=io.StringIO) as out:
-                mirror.pending(catalog, carried=True, targets=True)
-            self.assertEqual(out.getvalue(), 'mirror/alpine:3.20\n')  # still due next run
-
-    def test_scratch_sets_tmpdir_only_inside_the_block(self):
-        with mock.patch.dict(os.environ, {'TMPDIR': '/before'}):
-            with mirror.scratch('/share/tmp'):
-                self.assertEqual(os.environ['TMPDIR'], '/share/tmp')
-            self.assertEqual(os.environ['TMPDIR'], '/before')
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mirror.scratch('/share/tmp'):
-                pass
-            self.assertNotIn('TMPDIR', os.environ)
-
-    def test_export_needs_a_destination_and_cleans_its_working_directory(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
-            with self.assertRaisesRegex(mirror.MirrorError, 'say where the export goes'):
-                mirror.export(Path(os.devnull), ['team/app:v1'])
-            with self.assertRaisesRegex(mirror.MirrorError, 'takes no --tar or --staging'):
-                mirror.export(Path(os.devnull), ['team/app:v1'], out=directory, tar=Path(directory) / 'x.tar')
-            tar = Path(directory) / 'out' / 'carry.tar'
-            with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a' * 64), \
-                    mock.patch.object(mirror, 'copy', side_effect=mirror.MirrorError('registry down')):
-                with self.assertRaisesRegex(mirror.MirrorError, 'registry down'):
-                    mirror.export(Path(os.devnull), ['team/app:v1'], tar=tar, staging=directory)
-            self.assertEqual([p.name for p in Path(directory).iterdir()], [])  # no working directory, no tar
-
-    def test_load_will_not_move_a_tag_without_force(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
-            image = Path(directory) / '000001'
-            image.mkdir()
-            (image / 'manifest.json').write_bytes(b'{}')
-            digest = 'sha256:' + hashlib.sha256(b'{}').hexdigest()
-            Path(directory, mirror.EXPORT_INDEX).write_text(json.dumps(
-                {'images': [{'dir': '000001', 'target': 'team/app', 'tag': 'v1', 'digest': digest}]}))
-            with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a' * 64), \
-                    mock.patch.object(mirror, 'copy') as copy:
-                with self.assertRaisesRegex(mirror.MirrorError, 'does not move without load --force'):
-                    mirror.load(Path(directory))
-                copy.assert_not_called()
-            with mock.patch.object(mirror, 'raw_digest', side_effect=mirror.MirrorError('skopeo inspect failed: unauthorized')), \
-                    mock.patch.object(mirror, 'copy') as copy:
-                with self.assertRaisesRegex(mirror.MirrorError, 'unauthorized'):  # not read as an absent tag
-                    mirror.load(Path(directory))
-                copy.assert_not_called()
-
-    def test_load_refuses_a_tar_whose_checksum_does_not_match(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
-            bundle = Path(directory) / 'export.tar'
-            bundle.write_bytes(b'not the exported bytes')
-            with self.assertRaisesRegex(mirror.MirrorError, 'sha256 is missing'):
-                mirror.load(bundle)
-            bundle.with_name('export.tar.sha256').write_text('0' * 64 + '  export.tar\n')
-            with self.assertRaisesRegex(mirror.MirrorError, 'does not match'):
-                mirror.load(bundle)
-
-    def test_export_refuses_a_directory_that_is_not_empty(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
-            Path(directory, mirror.EXPORT_INDEX).write_text('{}')
-            with self.assertRaisesRegex(mirror.MirrorError, 'is not empty'):
-                mirror.export(Path(os.devnull), ['team/app:v1'], directory)
-
-    def test_send_delivers_each_file_once_and_clears_the_pending_ledger(self):
-        files = self.store()
-        path, _, fake_copy, fake_digest = self.latest_entry()
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only):
-            bundle = mirror.sync(path)
-        self.assertTrue(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
-        posted = []
-        with mock.patch.object(mirror, 'post_file', side_effect=[mirror.MirrorError('NiFi down'), None, None]) as post:
-            with self.assertRaisesRegex(mirror.MirrorError, 'NiFi down'):
-                mirror.send('nifi', target='http://nifi.example.internal:9098/contentListener')
-            self.assertTrue(bundle.exists())  # still there to send again
-            with mock.patch('builtins.print'):
-                self.assertEqual(mirror.send('nifi', target='http://nifi.example.internal:9098/contentListener'), 1)
-            posted = [c.args[0].name for c in post.call_args_list]
-        self.assertEqual(posted, [bundle.name, bundle.name])
-        self.assertEqual(list((self.root / 'out').iterdir()), [])
-        self.assertFalse(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
-        with mock.patch('builtins.print') as said:
-            self.assertEqual(mirror.send('nifi', target='http://x'), 0)
-        self.assertIn(mock.call(f"nothing to send in {self.root / 'out'}"), said.call_args_list)
-
-    def test_a_lost_bundle_keeps_the_ledger_pending_past_an_unrelated_resend(self):
-        files = self.store()
-        path, _, fake_copy, fake_digest = self.latest_entry()
-        head = lambda: json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])  # noqa: E731
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only), \
-                mock.patch.object(mirror, 'post_file'), mock.patch('builtins.print'):
-            mirror.sync(path)
-            mirror.send('nifi', target='http://nifi')
-            self.assertEqual((head()['pending'], head()['unsent']), (False, []))
-            lost = mirror.sync(path, full=True)  # written, then the CI job's outbox is lost
-            shutil.rmtree(self.root / 'out')
-            mirror.resend(image='mirror/alpine')  # no bridge: it does not stand in for the lost one
-            mirror.send('nifi', target='http://nifi')
-            self.assertEqual((head()['pending'], head()['unsent']), (True, [lost.name]))
-            recovery = mirror.sync(path)  # full, so it bridges the lost bundle
-            self.assertTrue(self.manifest(recovery)['full'])
-            mirror.send('nifi', target='http://nifi')
-            self.assertEqual((head()['pending'], head()['unsent']), (False, []))
-
-    def test_send_resumes_after_the_last_delivered_part_and_refuses_a_missing_one(self):
-        name = outbox_with(self.root / 'out', b'0123456789', 4)
-        posted, failures = [], [mirror.MirrorError('connection reset')]
-
-        def post(path, *_args):
-            if len(posted) == 1 and failures:
-                raise failures.pop()
-            posted.append(path.name)
-        with mock.patch.object(mirror, 'post_file', side_effect=post), mock.patch('builtins.print'):
-            with self.assertRaisesRegex(mirror.MirrorError, 'connection reset'):
-                mirror.send('nifi', target='http://nifi')
-            self.assertEqual(json.loads((self.root / 'out' / f'{name}.send.json').read_text())['delivered'],
-                             [f'{name}.part-001'])
-            (self.root / 'out' / f'{name}.part-003').unlink()
-            with self.assertRaisesRegex(mirror.MirrorError, 'part-003 is missing'):
-                mirror.send('nifi', target='http://nifi')
-        self.assertEqual(posted, [f'{name}.part-001', f'{name}.part-002'])
-
-    def test_unsent_tracking_through_bridges_crashes_and_old_ledgers(self):
-        name = lambda n: f"mirror-{'a' * 32}-{n:012d}.tar"  # noqa: E731
-        state = {'sequence': 5, 'unsent': [name(3), name(5)]}
-        state['sequence'] = 8
-        mirror.track_unsent(state, name(8), False, 4)  # a resend from 4 on covers 5, not 3
-        self.assertEqual(state['unsent'], [name(3), name(8)])
-        mirror.track_unsent(state, name(9), True, None)
-        self.assertEqual(state['unsent'], [name(9)])
-        old = {'sequence': 4, 'pending': True, 'unsent': ['an unsent bundle recorded by an older release']}
-        mirror.track_unsent(old, name(5), False, 2)
-        self.assertEqual(len(old['unsent']), 2)  # only a full bundle clears the old marker
-
-    def test_a_sequence_reserved_and_never_written_waits_for_a_full_bundle(self):
-        self.store()
-        (self.root / 'work').mkdir()
-        state = {'stream': 'a' * 32, 'sequence': 6, 'written': 5, 'unsent': [], 'pending': True, 'sent': {},
-                 'registry': 'low.example.internal'}
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'verify_image'), \
-                mock.patch('builtins.print'):
-            self.write_only(self.root / 'work', mirror.outbox(self.root / 'work'), self.root / 'work/sent.json',
-                            state, 'low', [], False, 'resend', None)
-        self.assertEqual(state['unsent'][0], 'sequence 6, reserved and never written')
-        self.assertEqual(len(state['unsent']), 2)
-
-    def test_a_reservation_without_a_bundle_keeps_the_ledger_pending(self):
-        files = self.store()
-        files[('registry-mirror-ledger', 'head', 'state.json')] = json.dumps(
-            {'stream': 'a' * 32, 'sequence': 6, 'written': 5, 'unsent': [], 'pending': True, 'sent': {},
-             'registry': 'low.example.internal'}).encode()
-        outbox_with(self.root / 'out', b'x', 1024, name=f"mirror-{'a' * 32}-000000000005.tar")
-        with mock.patch.object(mirror, 'post_file'), mock.patch('builtins.print'):
-            mirror.send('nifi', target='http://nifi')
-        self.assertTrue(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
-
-    def test_low_only_mirrors_low_and_records_nothing_sent(self):
-        files = self.store()
-        path, _, fake_copy, fake_digest = self.latest_entry()
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch('builtins.print') as said:
-            self.assertIsNone(mirror.sync(path, low_only=True))
-            self.assertIn('not bundled (--low-only)', said.call_args.args[0])
-            state = json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])
-            self.assertEqual((state['sequence'], state['sent']), (0, {}))
-            self.assertIsNotNone(mirror.sync(path))  # the next sync bundles what that one did not
-
-    def test_send_refuses_what_it_cannot_do(self):
-        with self.assertRaisesRegex(mirror.MirrorError, 'needs --url or NIFI_URL'):
-            mirror.send('nifi')
-        with self.assertRaisesRegex(mirror.MirrorError, '--format tar is for send dir'):
-            mirror.send('s3', form='tar')
-        out = self.root / 'out'
-        out.mkdir()
-        name = 'mirror-' + 'a' * 32 + '-000000000001.tar'
-        (out / f'{name}.part-001').write_bytes(b'x')
-        (out / f'{name}.sha256').write_text('x')
-        (out / f'{name}.send.json').write_text('{"kind": "delta", "sha256": "x", "parts": 1}')
-        with self.assertRaisesRegex(mirror.MirrorError, 'hand-carry needs whole bundles'):
-            mirror.send('dir', target=str(self.root / 'usb'), form='tar')
-
-    def test_hand_carry_copies_the_bundle_then_its_checksum(self):
-        out, usb = self.root / 'out', self.root / 'usb'
-        out.mkdir()
-        name = 'mirror-' + 'b' * 32 + '-000000000001.tar'
-        (out / name).write_bytes(b'tar')
-        (out / f'{name}.sha256').write_text(f'{hashlib.sha256(b"tar").hexdigest()}  {name}\n')
-        (out / f'{name}.send.json').write_text('{"kind": "delta", "sha256": "x", "parts": 0}')
-        with mock.patch('builtins.print'):
-            mirror.send('dir', target=str(usb), form='tar')
-        self.assertEqual(sorted(p.name for p in usb.iterdir()), [name, f'{name}.sha256'])
-        self.assertEqual(list(out.iterdir()), [])
-
-    def test_old_variable_names_fail_with_their_new_names(self):
-        os.environ.update({'LOW_QUAY_HOST': 'low.example.internal', 'EXPORT_SEQUENCE': '3..'})
-        with mock.patch('sys.stderr') as err:
-            self.assertEqual(mirror.main(['targets']), 1)
-        said = ''.join(c.args[0] for c in err.write.call_args_list)
-        self.assertIn('EXPORT_SEQUENCE is now RESEND_SEQUENCE', said)
-        self.assertIn('LOW_QUAY_HOST is now TARGET_REGISTRY', said)
 
     def test_login_skips_a_registry_without_credentials_and_keeps_the_password_off_argv(self):
         os.environ.update({'TARGET_REGISTRY_USERNAME': 'robot', 'TARGET_REGISTRY_PASSWORD': 'pw',
@@ -1264,42 +812,6 @@ class LedgerTest(unittest.TestCase):
             mirror.login()  # a high registry without authentication
         ran.assert_not_called()
 
-    def test_post_file_streams_only_the_bundle_with_its_checksum_header(self):
-        bundle = self.root / 'mirror-x.tar'
-        bundle.write_bytes(b'tar')
-        url = 'http://user:secret@nifi.example.internal:9099/contentListener'
-        with mock.patch.object(mirror, 'run', return_value=b'200') as call, \
-                mock.patch('builtins.print') as said:
-            mirror.post_file(bundle, mirror.attributes_of(bundle, 'resend'), url)
-        (args,) = [c.args for c in call.call_args_list]  # one POST: no .sha256 crosses the diode
-        self.assertIn('--http1.1', args)
-        self.assertEqual(args[args.index('--upload-file') + 1], str(bundle))  # streamed, not read into memory
-        self.assertNotIn('--data-binary', args)
-        (logged,) = [c.args[0] for c in said.call_args_list]
-        self.assertTrue(logged.startswith(
-            'posted to NiFi: mirror-x.tar -> http://nifi.example.internal:9099/contentListener (HTTP 200'))
-        self.assertNotIn('secret', logged)
-        headers = [args[i + 1] for i, a in enumerate(args) if a == '--header']
-        for header in ('X-Artifact-Type: container-images', 'X-Artifact-Action: mirror', 'X-Bundle-Kind: resend',
-                       'X-Artifact-Format: tar', f'X-Sha256: {mirror.sha256(bundle)}', f'Filename: {bundle.name}',
-                       'Expect:'):
-            self.assertIn(header, headers)
-
-    def test_pending_lists_what_the_ledger_has_not_sent(self):
-        files = self.store()
-        sent, fresh = 'sha256:' + 'a'*64, 'sha256:' + 'b'*64
-        path = self.root / 'images.txt'
-        path.write_text(f'docker.io/library/alpine:3.20@{sent} mirror/alpine\n'
-                        f'docker.io/library/busybox:1.37@{fresh} mirror/busybox\n')
-        files[('registry-mirror-ledger', 'head', 'state.json')] = json.dumps(
-            {'sent': {'mirror/alpine:3.20': sent, 'mirror/busybox:1.37': 'sha256:' + 'c'*64}}).encode()
-        with mock.patch('builtins.print') as said:
-            mirror.pending(path)
-        self.assertEqual([c.args[0] for c in said.call_args_list], [f'docker.io/library/busybox:1.37@{fresh}'])
-        os.environ['MIRROR_PLATFORM'] = 'linux/amd64'  # a platform change resends, so both are pending
-        with mock.patch('builtins.print') as said:
-            mirror.pending(path)
-        self.assertEqual(len(said.call_args_list), 2)
 
     def test_helm_charts_are_catalog_entries_without_a_platform(self):
         chart = {'schemaVersion': 2, 'config': {'mediaType': mirror.CHART_CONFIG},
@@ -1329,241 +841,6 @@ class LedgerTest(unittest.TestCase):
             with self.assertRaisesRegex(mirror.MirrorError, '2 image'):
                 mirror.covers(path, [str(containerfile), str(compose)])
         self.assertIn(mock.call(f'missing: nginx:1.29 ({compose}:3)'), said.call_args_list)
-
-
-def unpack_flowfile(data):
-    """NiFi's FlowFileUnpackagerV3, for one packaged file."""
-    assert data[:7] == b'NiFiFF3'
-    position = 7
-
-    def field():
-        nonlocal position
-        number = int.from_bytes(data[position:position + 2], 'big')
-        position += 2
-        if number == 0xFFFF:
-            number = int.from_bytes(data[position:position + 4], 'big')
-            position += 4
-        return number
-
-    def text():
-        nonlocal position
-        length = field()
-        position += length
-        return data[position - length:position].decode()
-    attributes = {text(): text() for _ in range(field())}
-    size = int.from_bytes(data[position:position + 8], 'big')
-    content = data[position + 8:]
-    assert len(content) == size
-    return attributes, content
-
-
-def outbox_with(out, data, cap, kind='delta', name='mirror-' + 'c' * 32 + '-000000000001.tar'):
-    """An outbox holding one bundle as write_bundle leaves it: whole, or parts of at most cap bytes."""
-    out.mkdir(exist_ok=True)
-    sink = mirror.PartSink(out, name, cap)
-    sink.write(data)
-    sink.flush_part()
-    parts = sink.number if sink.number > 1 else 0
-    if not parts:
-        os.replace(out / f'{name}.part-001', out / name)
-    checksum = hashlib.sha256(data).hexdigest()
-    (out / f'{name}.sha256').write_text(f'{checksum}  {name}' + (f'  {parts}' if parts else '') + '\n')
-    (out / f'{name}.send.json').write_text(json.dumps({'kind': kind, 'sha256': checksum, 'parts': parts}))
-    return name
-
-
-class SendTest(unittest.TestCase):
-    """mirror.py send: NiFi ListenHTTP, a directory or an S3 bucket the low NiFi collects from."""
-
-    setUp = MirrorTest.setUp
-
-    def test_parts_land_in_the_directory_as_flowfiles_with_their_attributes(self):
-        name = outbox_with(self.root / 'out', b'0123456789', 4)
-        drop = self.root / 'transfer'
-        with mock.patch('builtins.print'):
-            mirror.send('dir', target=str(drop))
-        self.assertEqual(sorted(p.name for p in drop.iterdir()),
-                         [f'{name}.part-00{n}.ffv3' for n in (1, 2, 3)])  # no .partial left
-        attributes, content = unpack_flowfile((drop / f'{name}.part-002.ffv3').read_bytes())
-        self.assertEqual(content, b'4567')
-        self.assertEqual(attributes, {
-            'filename': f'{name}.part-002', 'X-Sha256': hashlib.sha256(b'4567').hexdigest(),
-            'X-Artifact-Type': 'container-images', 'X-Artifact-Format': 'tar', 'X-Artifact-Action': 'mirror',
-            'X-Bundle-Kind': 'delta', 'X-Bundle-Name': name, 'X-Bundle-Sha256': hashlib.sha256(b'0123456789').hexdigest(),
-            'X-Bundle-Parts': '3'})
-        self.assertEqual(list((self.root / 'out').iterdir()), [])
-
-    def test_a_long_value_uses_the_wide_length_field(self):
-        attributes, content = unpack_flowfile(mirror.flowfile_v3({'a': 'v' * 70000}, 2) + b'ok')
-        self.assertEqual((len(attributes['a']), content), (70000, b'ok'))
-
-    def test_the_s3_drop_streams_the_package_with_its_length_and_metadata(self):
-        name = outbox_with(self.root / 'out', b'bundle', 1024, kind='full')
-        os.environ.update({'S3_BUCKET': 'transfer'})
-        sent = {}
-
-        def put(method, key, data, length, meta):
-            sent.update(method=method, key=key, body=data.read(), length=length, meta=meta)
-            return io.BytesIO()
-        with mock.patch.object(mirror, 's3_request', side_effect=put), mock.patch('builtins.print'):
-            mirror.send('s3')
-        self.assertEqual((sent['method'], sent['key'], sent['length']), ('PUT', f'{name}.ffv3', len(sent['body'])))
-        attributes, content = unpack_flowfile(sent['body'])
-        self.assertEqual((attributes['filename'], attributes['X-Bundle-Kind'], content), (name, 'full', b'bundle'))
-        self.assertEqual(sent['meta']['X-Sha256'], hashlib.sha256(b'bundle').hexdigest())
-
-    def test_metadata_headers_are_signed(self):
-        os.environ.update({'S3_ENDPOINT': 'http://s3.example.internal', 'S3_BUCKET': 'b',
-                           'AWS_ACCESS_KEY_ID': 'k', 'AWS_SECRET_ACCESS_KEY': 's'})
-        with mock.patch.object(mirror.urllib.request, 'urlopen') as opened:
-            mirror.s3_request('PUT', 'x', b'', 0, {'X-Sha256': 'abc'})
-        request = opened.call_args.args[0]
-        self.assertEqual(request.get_header('X-amz-meta-x-sha256'), 'abc')
-        self.assertIn('x-amz-meta-x-sha256', request.get_header('Authorization'))
-
-    def test_mirror_drop_names_the_send_command(self):
-        os.environ['MIRROR_DROP'] = 's3'
-        with mock.patch('sys.stderr') as err:
-            self.assertEqual(mirror.main(['targets']), 1)
-        self.assertIn('MIRROR_DROP is now mirror.py send', ''.join(c.args[0] for c in err.write.call_args_list))
-
-
-class BlobDeltaTest(unittest.TestCase):
-    """MIRROR_BLOB_DELTA: blobs the high side already holds, or this bundle carries once, are left out."""
-
-    setUp = MirrorTest.setUp
-
-    def two_images_one_layer(self):
-        first, layer = fixture(self.stage)
-        building = self.stage / 'second'
-        config = blob(building, {'architecture': 'arm64', 'os': 'linux'})
-        held = self.stage / 'images' / first['transfer'].replace(':', '-')
-        shutil.copy(held / layer['digest'][7:], building / layer['digest'][7:])
-        root = blob(building, {'schemaVersion': 2, 'config': config, 'layers': [layer]})
-        place(self.stage, building, root)
-        second = mirror.parse_image('docker.io/library/busybox:1@' + root['digest'], 'mirror/busybox')
-        return first, second | {'transfer': root['digest'], 'tags': ['1']}, layer
-
-    def metadata(self, images, **extra):
-        return {'schema': 1, 'stream': 'a' * 32, 'sequence': 2, 'full': False, 'images': images, **extra}
-
-    def test_a_layer_twice_in_one_bundle_travels_once(self):
-        first, second, layer = self.two_images_one_layer()
-        metadata = self.metadata([first, second])
-        with mock.patch('builtins.print'):
-            mirror.omit_known_blobs(self.stage, [first, second], {}, metadata)
-        name = second['transfer'].replace(':', '-')
-        self.assertEqual(metadata['omitted'], {name: {layer['digest']: ['bundle:' + first['transfer'].replace(':', '-')]}})
-        self.assertFalse((self.stage / 'images' / name / layer['digest'][7:]).exists())
-        mirror.validate_manifest(metadata)
-        mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
-        for image in (first, second):
-            mirror.verify_image(self.stage / 'images' / image['transfer'].replace(':', '-'), image['transfer'])
-
-    def test_a_layer_an_earlier_bundle_carried_is_read_back_from_the_high_registry(self):
-        first, second, layer = self.two_images_one_layer()
-        earlier = self.root / 'on-high'
-        shutil.copytree(self.stage / 'images' / first['transfer'].replace(':', '-'), earlier)
-        shutil.rmtree(self.stage / 'images' / first['transfer'].replace(':', '-'))
-        state = {}
-        mirror.remember_blobs(state, [first], {first['transfer']: {layer['digest']}})
-        metadata = self.metadata([second])
-        with mock.patch('builtins.print'):
-            mirror.omit_known_blobs(self.stage, [second], state, metadata)
-        hint = 'mirror/alpine@' + first['transfer']
-        self.assertEqual(list(metadata['omitted'].values()), [{layer['digest']: [hint]}])
-        mirror.validate_manifest(metadata)
-        os.environ['IMPORT_PATH_REWRITE'] = 'mirror/=prod/'
-        fetched = []
-
-        def fake_copy(source, destination, *_args):
-            fetched.append(source)
-            shutil.copytree(earlier, Path(destination[4:]))
-        with mock.patch.object(mirror, 'copy', side_effect=fake_copy), mock.patch('builtins.print'):
-            mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
-        self.assertEqual(fetched, ['docker://high.example.internal/prod/alpine@' + first['transfer']])
-        mirror.verify_image(self.stage / 'images' / second['transfer'].replace(':', '-'), second['transfer'])
-
-    def test_two_tags_on_one_digest_keep_their_shared_blobs(self):
-        first, _, layer = self.two_images_one_layer()
-        twin = first | {'tag': 'latest', 'tags': ['latest']}
-        metadata = self.metadata([first, twin])
-        with mock.patch('builtins.print'):
-            mirror.omit_known_blobs(self.stage, [first, twin], {}, metadata)
-        self.assertNotIn('omitted', metadata)
-        self.assertTrue((self.stage / 'images' / first['transfer'].replace(':', '-') / layer['digest'][7:]).exists())
-
-    def test_the_blob_memory_drops_the_oldest_first(self):
-        state = {'blobs': {f'sha256:{n:064x}': ['a/b@x'] for n in range(5)}}
-        with mock.patch.object(mirror, 'BLOB_MEMORY', 4):
-            mirror.remember_blobs(state, [{'target': 'a/c', 'transfer': 't'}], {'t': {f'sha256:{0:064x}'}})
-        self.assertEqual(list(state['blobs']), [f'sha256:{n:064x}' for n in (2, 3, 4, 0)])
-
-    def test_an_expired_hint_names_the_resend(self):
-        first, second, layer = self.two_images_one_layer()
-        metadata = self.metadata([second], schema=2, omitted={
-            second['transfer'].replace(':', '-'): {layer['digest']: ['mirror/alpine@' + first['transfer'],
-                                                                     'mirror/old@' + first['transfer']]}})
-        with mock.patch.object(mirror, 'copy', side_effect=mirror.MirrorError('manifest unknown')) as tried, \
-                self.assertRaisesRegex(mirror.MirrorError, 'RESEND_ALL=true'):
-            mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
-        self.assertEqual(tried.call_count, 2)  # each named image is tried before giving up
-
-    def test_omitted_metadata_is_checked(self):
-        first, second, layer = self.two_images_one_layer()
-        good = {second['transfer'].replace(':', '-'): {layer['digest']: ['mirror/alpine@' + first['transfer']]}}
-        for bad in ({'sha256-' + 'f' * 64: good[next(iter(good))]},  # not an image in this bundle
-                    {next(iter(good)): {layer['digest']: ['../../etc@' + first['transfer']]}},
-                    {next(iter(good)): {layer['digest']: ['bundle:sha256-' + 'e' * 64]}},
-                    {next(iter(good)): {layer['digest']: []}},
-                    {next(iter(good)): {layer['digest']: 'mirror/alpine@' + first['transfer']}}):
-            with self.subTest(bad), self.assertRaisesRegex(mirror.MirrorError, 'omitted-blob'):
-                mirror.validate_manifest(self.metadata([second], schema=2, omitted=bad))
-        with self.assertRaises(mirror.MirrorError):
-            mirror.validate_manifest(self.metadata([second], omitted=good))  # schema 1 cannot omit
-
-
-class LargeAndBulkTest(unittest.TestCase):
-    """Size-capped bundles, bulk lists, path rewrites and out-of-order arrival."""
-
-    setUp = MirrorTest.setUp
-    store = LedgerTest.store
-
-    def test_the_bundle_cap_parses_units_and_rejects_others(self):
-        for text, expected in (('', 4 * 1024 ** 3), ('500MiB', 500 * 1024 ** 2), ('2gib', 2 * 1024 ** 3), ('123', 123)):
-            os.environ['MIRROR_BUNDLE_MAX_SIZE'] = text
-            self.assertEqual(mirror.bundle_cap(), expected)
-        for text in ('4GB', '0', 'big'):
-            os.environ['MIRROR_BUNDLE_MAX_SIZE'] = text
-            with self.assertRaisesRegex(mirror.MirrorError, 'MIRROR_BUNDLE_MAX_SIZE'):
-                mirror.bundle_cap()
-
-    def test_images_split_into_bundles_under_the_cap_and_a_big_one_goes_alone(self):
-        os.environ['MIRROR_BUNDLE_MAX_SIZE'] = '4MiB'
-        mebibyte = 1024 ** 2
-        images = [{'target': f'team/{name}', 'tag': '1', 'transfer': 'sha256:' + c * 64, 'source': 'x'}
-                  for name, c in zip('abcd', '1234')]
-        sizes = {'a': 1, 'b': 2, 'c': 2, 'd': 5}
-        with mock.patch.object(mirror, 'image_bytes', side_effect=lambda ref, side: sizes[ref.split('/team/')[1][0]] * mebibyte), \
-                mock.patch('builtins.print') as said:
-            groups = mirror.batches(images, 'low.example.internal')
-        self.assertEqual([[i['target'][-1] for i in group] for group in groups], [['a', 'b'], ['c'], ['d']])
-        self.assertIn(mock.call('team/d:1 is 5242880 bytes, over MIRROR_BUNDLE_MAX_SIZE (4194304): it goes in a bundle of its own, sent in parts'), said.call_args_list)
-
-    def test_only_the_first_bundle_of_a_split_run_is_full_or_bridges_a_gap(self):
-        with mock.patch.object(mirror, 'batches', return_value=[['a'], ['b'], ['c']]), \
-                mock.patch.object(mirror, 'write_bundle', return_value='bundle') as sent:
-            mirror.send_batches('work', 'out', 'state', {}, 'low', ['a', 'b', 'c'], True, 'resend', bridges=7)
-        self.assertEqual([c.args[5:] for c in sent.call_args_list],
-                         [(['a'], True, 'resend', 7), (['b'], False, 'resend', None), (['c'], False, 'resend', None)])
-
-    def test_image_bytes_counts_every_manifest_config_and_layer_once(self):
-        layer = {'digest': 'sha256:' + 'l' * 64, 'size': 100}
-        child = json.dumps({'config': {'digest': 'sha256:' + 'c' * 64, 'size': 10}, 'layers': [layer, layer]}).encode()
-        index = json.dumps({'manifests': [{'digest': 'sha256:' + 'a' * 64}, {'digest': 'sha256:' + 'b' * 64}]}).encode()
-        with mock.patch.object(mirror, 'run', side_effect=lambda *args: index if args[-1].endswith('@root') else child):
-            total = REAL_IMAGE_BYTES('docker://low/team/app@root', 'TARGET_REGISTRY')
-        self.assertEqual(total, len(index) + 2 * len(child) + 10 + 100)  # the shared layer and config count once
 
     def test_add_list_expands_short_names_assumes_latest_skips_known_and_keeps_going(self):
         path = self.root / 'images.txt'
@@ -1603,181 +880,7 @@ class LargeAndBulkTest(unittest.TestCase):
         self.assertEqual([line.split('@')[0] for line in path.read_text().splitlines()],
                          ['# header', '# why b is pinned', 'docker.io/b/b:1', 'ghcr.io/g/g:1', 'quay.io/z/z:1'])
 
-    def test_rewrite_moves_whole_segments_and_the_longest_prefix_wins(self):
-        os.environ['IMPORT_PATH_REWRITE'] = 'team=company-dev, team/special=company-dev/vip'
-        self.assertEqual(mirror.rewrite('team/prom/prometheus', 'IMPORT_PATH_REWRITE'), 'company-dev/prom/prometheus')
-        self.assertEqual(mirror.rewrite('team/special/app', 'IMPORT_PATH_REWRITE'), 'company-dev/vip/app')
-        self.assertEqual(mirror.rewrite('teamwork/app', 'IMPORT_PATH_REWRITE'), 'teamwork/app')  # not a segment match
-        os.environ['IMPORT_PATH_REWRITE'] = 'team'
-        with self.assertRaisesRegex(mirror.MirrorError, 'old=new prefix pairs'):
-            mirror.rewrite('team/app', 'IMPORT_PATH_REWRITE')
-
-    def test_import_and_promote_push_to_the_rewritten_path(self):
-        image, _ = fixture(self.stage)
-        bundle = self.root / 'mirror-1.tar'
-        pack(self.stage, bundle, image=image)
-        record = self.root / 'imported.json'
-        record.write_text('[]\n')
-        os.environ['IMPORT_PATH_REWRITE'] = 'mirror=company-dev'
-        with mock.patch.object(mirror, 'copy') as copied, mock.patch('builtins.print') as said, \
-                mock.patch.object(mirror, 'raw_digest', return_value=image['transfer']):
-            mirror.import_one(bundle, record=record)
-        self.assertEqual(copied.call_args.args[1], f"docker://low.example.internal/company-dev/alpine:{image['tag']}")
-        self.assertTrue(any('(sent as mirror/alpine, IMPORT_PATH_REWRITE)' in str(c) for c in said.call_args_list))
-        self.assertEqual(json.loads(record.read_text())[0]['target'], 'company-dev/alpine')
-        os.environ.update({'SOURCE_REGISTRY': 'dev.example.internal', 'TARGET_REGISTRY': 'prod.example.internal',
-                           'PROMOTE_PATH_REWRITE': 'company-dev=company-prod'})
-        with mock.patch.object(mirror, 'copy') as copied, mock.patch('builtins.print'), \
-                mock.patch.object(mirror, 'raw_digest', return_value=image['transfer']):
-            mirror.promote(record)
-        self.assertEqual(copied.call_args.args[:2], (f"docker://dev.example.internal/company-dev/alpine@{image['transfer']}",
-                                                     f"docker://prod.example.internal/company-prod/alpine:{image['tag']}"))
-
-    def test_a_bundle_over_the_cap_is_posted_as_parts_with_the_whole_checksum(self):
-        name = outbox_with(self.root / 'out', b'0123456789', 4)
-        seen = []
-
-        def post(*args):
-            path = Path(args[args.index('--upload-file') + 1])
-            seen.append((path.name, path.read_bytes(), [args[i + 1] for i, a in enumerate(args) if a == '--header']))
-            return b'200'
-
-        with mock.patch.object(mirror, 'run', side_effect=post), mock.patch('builtins.print'):
-            mirror.send('nifi', target='http://nifi.example.internal:9099/contentListener')
-        self.assertEqual([(n, data) for n, data, _ in seen],
-                         [(f'{name}.part-001', b'0123'), (f'{name}.part-002', b'4567'), (f'{name}.part-003', b'89')])
-        for _, data, headers in seen:
-            self.assertIn(f'X-Sha256: {hashlib.sha256(data).hexdigest()}', headers)
-            self.assertIn(f'X-Bundle-Sha256: {hashlib.sha256(b"0123456789").hexdigest()}', headers)
-            self.assertIn(f'X-Bundle-Name: {name}', headers)
-            self.assertIn('X-Bundle-Parts: 3', headers)
-        self.assertEqual(list((self.root / 'out').iterdir()), [])
-
-    def test_import_joins_the_parts_waits_for_a_missing_one_and_deletes_them_all(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream = '7' * 32
-        stem = f'mirror-{stream}-000000000001'
-        pack(self.stage, self.root / f'{stem}.tar', image=image, stream=stream)
-        whole = (self.root / f'{stem}.tar').read_bytes()
-        size = -(-len(whole) // 3)
-        chunks = [whole[i:i + size] for i in range(0, len(whole), size)]
-        files[('registry-mirror-bundles', stem, f'{stem}.tar.sha256')] = \
-            f'{hashlib.sha256(whole).hexdigest()}  {stem}.tar  {len(chunks)}\n'.encode()
-        for number, chunk in enumerate(chunks[:-1], 1):
-            files[('registry-mirror-bundles', stem, f'{stem}.tar.part-{number:03d}')] = chunk
-        os.environ.update({'IMPORT_DELETE_BUNDLES': 'true', 'PACKAGE_TOKEN': 'maintainer-token'})
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch.object(mirror, 'store_delete', return_value=1) as deleted, mock.patch('builtins.print') as said:
-            mirror.import_registry(f'{stem}.tar')
-            self.assertIn(mock.call(f'waiting for {stem}.tar.part-00{len(chunks)} (1 of {len(chunks)} parts)'),
-                          said.call_args_list)
-            files[('registry-mirror-bundles', stem, f'{stem}.tar.part-00{len(chunks)}')] = chunks[-1]
-            mirror.import_registry(f'{stem}.tar')
-        self.assertIn(mock.call(f'read {len(chunks)} parts of {stem}.tar in order, one on disk at a time'),
-                      said.call_args_list)
-        self.assertEqual(list((self.root / 'import/downloads').iterdir()), [])  # no part or joined bundle left
-        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 1)
-        self.assertEqual(deleted.call_args.args[2],
-                         [f'{stem}.tar.part-{n:03d}' for n in range(1, len(chunks) + 1)] + [f'{stem}.tar.sha256'])
-
-    def test_parts_join_to_the_same_tar(self):
-        fixture(self.stage)
-        (self.stage / 'images.json').write_text('{}')
-        whole = io.BytesIO()
-        mirror.write_tar(self.stage, whole)
-        out = self.root / 'parts'
-        out.mkdir()
-        sink = mirror.PartSink(out, 'mirror-s.tar', 4096)
-        mirror.write_tar(self.stage, sink)
-        sink.flush_part()
-        parts = sorted(out.iterdir())
-        self.assertEqual([p.name for p in parts], [f'mirror-s.tar.part-{n:03d}' for n in range(1, len(parts) + 1)])
-        self.assertEqual(b''.join(p.read_bytes() for p in parts), whole.getvalue())
-        self.assertTrue(all(p.stat().st_size <= 4096 for p in parts))
-        self.assertEqual(sink.digest.hexdigest(), hashlib.sha256(whole.getvalue()).hexdigest())
-
-    def test_a_corrupted_part_is_refused_before_anything_is_pushed(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stem = f"mirror-{'6' * 32}-000000000001"
-        pack(self.stage, self.root / f'{stem}.tar', image=image, stream='6' * 32)
-        whole = (self.root / f'{stem}.tar').read_bytes()
-        half = len(whole) // 2
-        files[('registry-mirror-bundles', stem, f'{stem}.tar.sha256')] = f'{hashlib.sha256(whole).hexdigest()}  {stem}.tar  2\n'.encode()
-        files[('registry-mirror-bundles', stem, f'{stem}.tar.part-001')] = whole[:half]
-        tampered = bytearray(whole[half:])
-        tampered[-2000] ^= 1  # inside the tar padding: unpacking succeeds, the checksum does not
-        files[('registry-mirror-bundles', stem, f'{stem}.tar.part-002')] = bytes(tampered)
-        with mock.patch.object(mirror, 'copy') as copied, mock.patch('builtins.print'), \
-                self.assertRaisesRegex(mirror.MirrorError, 'joined parts do not match the bundle checksum'):
-            mirror.import_registry(f'{stem}.tar')
-        copied.assert_not_called()
-
-    def test_closing_a_part_reader_mid_part_removes_the_download(self):
-        def fetch(name, path):
-            path.write_bytes(b'x' * 100)
-            return True
-        with mirror.PartReader(fetch, ['a', 'b'], self.root) as reader:
-            reader.read(10)
-            self.assertTrue((self.root / 'part.download').exists())
-        self.assertFalse((self.root / 'part.download').exists())
-
-    def test_a_later_bundle_waits_for_an_earlier_one_until_the_grace_runs_out(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream = '9' * 32
-        stems = {n: f'mirror-{stream}-{n:012d}' for n in (1, 2, 3, 4)}
-        for n, stem in stems.items():
-            pack(self.stage, self.root / f'{stem}.tar', sequence=n, full=n == 1, image=image, stream=stream)
-        def arrive(n):
-            for name in (f'{stems[n]}.tar', f'{stems[n]}.tar.sha256'):
-                files[('registry-mirror-bundles', stems[n], name)] = (self.root / name).read_bytes()
-        arrive(1)
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch('builtins.print'):
-            mirror.import_registry(f'{stems[1]}.tar')
-            arrive(3)  # 3 overtakes 2 on the link
-            with mock.patch.object(mirror, 'store_age', return_value=0.5), \
-                    self.assertRaisesRegex(mirror.GapWaiting, 'imports when the earlier bundle arrives'):
-                mirror.import_registry(f'{stems[3]}.tar')
-            arrive(4)
-            with mock.patch.object(mirror, 'store_age', return_value=0.4), self.assertRaises(mirror.GapWaiting):
-                mirror.import_registry(f'{stems[4]}.tar')
-            arrive(2)  # the straggler: one trigger imports 2, 3 and 4 in order
-            mirror.import_registry(f'{stems[2]}.tar')
-        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 4)
-        self.assertEqual(mirror.main(['--catalog', str(self.root / 'none.txt'), 'import', '--registry']), 0)
-
-    def test_a_gap_older_than_the_grace_fails_with_the_resend_instruction(self):
-        files = self.store()
-        image, _ = fixture(self.stage)
-        stream = '8' * 32
-        for n in (1, 3):
-            stem = f'mirror-{stream}-{n:012d}'
-            pack(self.stage, self.root / f'{stem}.tar', sequence=n, full=n == 1, image=image, stream=stream)
-            for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
-                files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
-        os.environ['IMPORT_GAP_GRACE'] = '2'
-        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch('builtins.print'), mock.patch.object(mirror, 'store_age', return_value=2.5):
-            mirror.import_registry(f'mirror-{stream}-000000000001.tar')
-            with self.assertRaisesRegex(mirror.SequenceGap, r'RESEND_SEQUENCE=2\.\..*waited for 2\.5 h; IMPORT_GAP_GRACE is 2 h'):
-                mirror.import_registry(f'mirror-{stream}-000000000003.tar')
-            with mock.patch('sys.stderr'):
-                self.assertEqual(mirror.main(['import', '--registry', '--name', f'mirror-{stream}-000000000003.tar']), 1)
-            with mock.patch.object(mirror, 'store_age', return_value=0.1), mock.patch('sys.stderr'):
-                self.assertEqual(mirror.main(['import', '--registry', '--name', f'mirror-{stream}-000000000003.tar']), 3)
 
 
-def pack_metadata(stage, destination):
-    """Re-pack a stage whose images.json a test edited, with a fresh checksum."""
-    with tarfile.open(destination, 'w') as archive:
-        for path in sorted(stage.rglob('*')):
-            if path.is_file():
-                archive.add(path, arcname=str(path.relative_to(stage)), recursive=False)
-    destination.with_name(destination.name + '.sha256').write_text(f'{mirror.sha256(destination)}  {destination.name}\n')
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

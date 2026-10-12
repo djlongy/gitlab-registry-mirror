@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Mirror reviewed container images into a registry and carry them across a one-way link in verified bundles."""
+"""Mirror reviewed container images into a registry, export them as tar files, send the tars across a
+one-way link and import them into a registry on the far side."""
 
 import argparse
-import fcntl
 import hashlib
 import hmac
-import io
 import json
 import os
 import re
 import shutil
 import ssl
-import struct
 import subprocess
 import sys
 import tarfile
@@ -19,10 +17,9 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
-from contextlib import contextmanager, nullcontext
+import xml.etree.ElementTree as ElementTree
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -31,29 +28,20 @@ DIGEST = r"sha256:[0-9a-f]{64}"
 HOST = r"(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::[0-9]+)?|[a-z0-9-]+:[0-9]+"  # a dot, a port or localhost
 SOURCE = re.compile(rf"(?P<host>{HOST})/(?P<repo>[a-z0-9._/-]+):(?P<tag>{TAG})")
 TARGET = re.compile(r"[a-z0-9][a-z0-9_-]*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)+")
+REFERENCE = re.compile(rf"(?:(?P<host>{HOST})/)?(?P<repo>[a-z0-9._/-]+?)(?::(?P<tag>{TAG}))?")
 IMAGE_CONFIGS = ("application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json")
 IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributable\.)?v1\.tar(?:\+gzip|\+zstd)?"
                          r"|application/vnd\.docker\.image\.rootfs\.(?:foreign\.)?diff\.tar(?:\.gzip)?")
 MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
-LEDGER, BUNDLES, RECEIPTS = "registry-mirror-ledger", "registry-mirror-bundles", "registry-mirror-receipt"
-BLOB_MEMORY = 20000  # layers and configs the ledger remembers for MIRROR_BLOB_DELTA
-OUTBOX_FILE = re.compile(r"mirror-[0-9a-f]{32}-[0-9]{12}\.tar(?:\.part-[0-9]{3}|\.sha256|\.send\.json)?(?:\.tmp)?")
-BUNDLE_NAME = re.compile(r"(mirror-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256|\.part-[0-9]{3})?")
-INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
+LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "registry-mirror-ledger", "v2", "ledger.json"
+EXPORT_INDEX = "export.json"
 
 
 class MirrorError(Exception):
     pass
-
-
-class SequenceGap(MirrorError):
-    pass
-
-
-class GapWaiting(MirrorError):
-    """A later bundle is stored and waits for an earlier one still on its way: exit 3, a CI warning."""
 
 
 def required_env(name):
@@ -68,11 +56,6 @@ def registry(side):
     if not re.fullmatch(r"[a-z0-9.-]+(?::[0-9]+)?", value):
         raise MirrorError(f"{side} must be a registry host[:port], without scheme or path")
     return value
-
-
-def state_path(name, default):
-    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
-    return Path(os.environ.get(name) or base / default)
 
 
 def sha256(path):
@@ -91,17 +74,6 @@ def write_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-
-
-@contextmanager
-def locked(work):
-    work.mkdir(parents=True, exist_ok=True)
-    with (work / ".lock").open("a") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise MirrorError(f"another mirror process holds {work}") from error
-        yield
 
 
 def parse_image(source, target):
@@ -131,34 +103,10 @@ def catalog(path):
     return images
 
 
-def flag(name):
-    """A true/false setting. Anything else is an error, so a typo cannot read as off."""
-    value = os.environ.get(name, "").strip()
-    if value.lower() not in ("", "true", "false"):
-        raise MirrorError(f"{name} must be true or false, not {value!r}")
-    return value.lower() == "true"
-
-
-def settings(*entries):
-    """Print each setting a command reads, and what leaving it unset means. A variable that never
-    reaches the job, such as one scoped to another CI environment, shows here instead of silently
-    changing behaviour."""
-    environment = os.environ.get("CI_ENVIRONMENT_NAME")
-    where = f" in this job (environment {environment})" if environment else ""
-    for name, unset, secret in entries:
-        value = os.environ.get(name, "").strip()
-        if value:
-            if "://" in value:  # a URL may carry credentials, as NIFI_URL can
-                parts = urllib.parse.urlsplit(value)
-                value = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()
-            print(f"setting: {name}={'(set)' if secret else value}")
-        else:
-            print(f"setting: {name} is not set{where}: {unset}")
-
-
 def say(message):
     if os.environ.get("MIRROR_VERBOSE") == "true":
-        print(message, file=sys.stderr, flush=True)
+        # A URL may carry credentials, as --nifi-url can: never print them.
+        print(re.sub(r"://[^/@\s]+@", "://", message), file=sys.stderr, flush=True)
 
 
 def run(*args):
@@ -181,9 +129,19 @@ def raw_digest(reference, side):
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
+def present_digest(reference, side):
+    """The digest a tag points at, or None when the registry has no such tag."""
+    try:
+        return raw_digest(reference, side)
+    except MirrorError as error:
+        if re.search(r"manifest unknown|name unknown|not found", str(error), re.I):
+            return None
+        raise  # a login, TLS or network fault is not proof the tag is absent
+
+
 def side_of(reference):
-    """Which registry's settings read a catalog source: TARGET_REGISTRY or SOURCE_REGISTRY when
-    its host is that registry, else None (defaults: TLS verified, no login)."""
+    """Which registry's settings read a reference: TARGET_REGISTRY or SOURCE_REGISTRY when its host is
+    that registry, else None (defaults: TLS verified, no login)."""
     host = reference.split("://", 1)[-1].split("/", 1)[0]
     for side in ("TARGET_REGISTRY", "SOURCE_REGISTRY"):
         if host and host == os.environ.get(side, "").strip().rstrip("/"):
@@ -213,260 +171,102 @@ def copy(source, destination, source_side=None, destination_side=None):
     run(*args, source, destination)
 
 
-def ledger_enabled():
-    return os.environ.get("MIRROR_LEDGER") == "true"
-
-
-def packages():
-    """The project's generic package API and the header that authenticates to it.
-
-    PACKAGE_TOKEN (a personal, project or group access token) wins; in CI the job
-    token reads and writes the job's own project, which is all sync and import need.
-    """
-    api = (os.environ.get("GITLAB_API_URL") or os.environ.get("CI_API_V4_URL") or "").rstrip("/")
-    project = os.environ.get("PACKAGE_PROJECT") or os.environ.get("CI_PROJECT_ID") or ""
-    token = os.environ.get("PACKAGE_TOKEN")
-    header = ("PRIVATE-TOKEN", token) if token else ("JOB-TOKEN", os.environ.get("CI_JOB_TOKEN", ""))
-    if not api or not project or not header[1]:
-        raise MirrorError("the package registry needs GITLAB_API_URL, PACKAGE_PROJECT and PACKAGE_TOKEN "
-                          "(a CI job supplies all three)")
-    return f"{api}/projects/{urllib.parse.quote(project, safe='')}/packages/generic", header
-
-
-def package_request(method, package, version, name, data=None):
-    base, (key, value) = packages()
-    url = f"{base}/{package}/{version}/{urllib.parse.quote(name)}"
-    say(f"+ {method} {url}")
+def tls_context(ca=None, verify=True):
     context = ssl.create_default_context()
-    # A private CA, added to the system roots: CA_BUNDLE, or the one a runner with tls-ca-file hands every job.
-    for bundle in {os.environ.get("CA_BUNDLE"), os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
-        context.load_verify_locations(cafile=bundle)
-    request = urllib.request.Request(url, data=data, method=method, headers={key: value})
-    return urllib.request.urlopen(request, timeout=600, context=context)
-
-
-def package_api(method, url, key, value):
-    say(f"+ {method} {url}")
-    context = ssl.create_default_context()
-    for bundle in {os.environ.get("CA_BUNDLE"), os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
-        context.load_verify_locations(cafile=bundle)
-    request = urllib.request.Request(url, method=method, headers={key: value})
-    with urllib.request.urlopen(request, timeout=600, context=context) as response:
-        return response.read()
-
-
-def package_get(package, version, name, destination=None):
-    """A generic package file's bytes, or written to destination; None when GitLab has none."""
-    try:
-        with package_request("GET", package, version, name) as response:
-            if destination is None:
-                return response.read()
-            with open(destination, "wb") as stream:
-                shutil.copyfileobj(response, stream)
-            return destination
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-        raise MirrorError(f"GET {package}/{version}/{name}: HTTP {error.code}") from error
-    except urllib.error.URLError as error:
-        raise MirrorError(f"GET {package}/{version}/{name}: {error.reason}") from error
-
-
-def package_put(package, version, name, data):
-    try:
-        package_request("PUT", package, version, name, data).close()
-    except urllib.error.HTTPError as error:
-        raise MirrorError(f"PUT {package}/{version}/{name}: HTTP {error.code}") from error
-    except urllib.error.URLError as error:
-        raise MirrorError(f"PUT {package}/{version}/{name}: {error.reason}") from error
-
-
-def load_state(state_file):
-    """Sender state: the ledger's head when MIRROR_LEDGER=true, else the runner's sent.json."""
-    if ledger_enabled():
-        raw = package_get(LEDGER, "head", "state.json")
-        return json.loads(raw) if raw else None
-    return json.loads(state_file.read_text()) if state_file.exists() else None
-
-
-def save_state(state_file, state, remote=True):
-    """Write sent.json and, with remote, the ledger's head. GitLab serves the newest upload of a name."""
-    write_json(state_file, state)
-    if remote and ledger_enabled():
-        package_put(LEDGER, "head", "state.json", state_file.read_bytes())
-
-
-def s3_enabled():
-    return os.environ.get("IMPORT_STORE", "gitlab") == "s3"
-
-
-def s3_request(method, key, data=None, length=None, meta=None):
-    """One path-style request to an S3-compatible store, signed with AWS Signature Version 4.
-    A file-like data needs its length, or urllib would send it chunked, which S3 refuses. meta becomes
-    x-amz-meta-* headers, signed as S3 requires of every x-amz-* header."""
-    endpoint = os.environ.get("S3_ENDPOINT", "").rstrip("/")
-    bucket = os.environ.get("S3_BUCKET", "")
-    access, secret = os.environ.get("AWS_ACCESS_KEY_ID", ""), os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    if not (endpoint and bucket and access and secret):
-        raise MirrorError("S3 needs S3_ENDPOINT, S3_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
-    region = os.environ.get("S3_REGION") or "us-east-1"
-    prefix = os.environ.get("S3_PREFIX", "").strip("/")
-    url = f"{endpoint}/{urllib.parse.quote(bucket)}/{urllib.parse.quote((prefix + '/' if prefix else '') + key)}"
-    parts = urllib.parse.urlsplit(url)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    headers = {"host": parts.netloc, "x-amz-content-sha256": "UNSIGNED-PAYLOAD", "x-amz-date": stamp,
-               **{f"x-amz-meta-{name.lower()}": value for name, value in (meta or {}).items()}}
-    signed = ";".join(sorted(headers))
-    canonical = "\n".join([method, parts.path, "", *(f"{name}:{headers[name]}" for name in sorted(headers)),
-                           "", signed, "UNSIGNED-PAYLOAD"])
-    scope = f"{stamp[:8]}/{region}/s3/aws4_request"
-    signing = ("AWS4" + secret).encode()
-    for part in (stamp[:8], region, "s3", "aws4_request"):
-        signing = hmac.new(signing, part.encode(), hashlib.sha256).digest()
-    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
-    headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, "
-                                f"Signature={hmac.new(signing, to_sign.encode(), hashlib.sha256).hexdigest()}")
-    del headers["host"]  # urllib sends the same value
-    if length is not None:
-        headers["Content-Length"] = str(length)
-    context = ssl.create_default_context()
-    if os.environ.get("S3_TLS_VERIFY") == "false":
+    if not verify:
         context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
-    elif os.environ.get("S3_CA_BUNDLE"):  # a self-signed or private CA, added to the system roots
-        context.load_verify_locations(cafile=os.environ["S3_CA_BUNDLE"])
+    for bundle in {ca, os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
+        context.load_verify_locations(cafile=bundle)
         # Python 3.13+ also demands RFC 5280 extensions an appliance's own CA often lacks (key usage);
         # trust still comes only from this CA.
         context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    return context
+
+
+# The ledger: what sync put in TARGET_REGISTRY and what send delivered. In a GitLab CI job it is a file
+# in the project's generic package registry, so nothing persists on the runner; elsewhere a local file.
+
+def ledger_location(path):
+    """Where the ledger lives: MIRROR_LEDGER (a file, "gitlab", or the https URL of the pipeline's ledger
+    file, read only), else the package registry in a CI job, else .mirror-ledger.json beside the catalog."""
+    setting = os.environ.get("MIRROR_LEDGER", "").strip()
+    if setting in ("gitlab", "true") or (not setting and os.environ.get("CI_JOB_TOKEN")):
+        return "gitlab"
+    if re.match(r"https?://", setting):
+        return setting
+    if setting and setting != "false":
+        return Path(setting)
+    return path.resolve().parent / ".mirror-ledger.json"
+
+
+def package_request(method, data=None, url=None):
+    """The ledger file in the project's generic packages, or at url. PACKAGE_TOKEN (a personal, project
+    or group access token) wins; in CI the job token reads and writes the job's own project."""
+    api = (os.environ.get("GITLAB_API_URL") or os.environ.get("CI_API_V4_URL") or "").rstrip("/")
+    project = os.environ.get("PACKAGE_PROJECT") or os.environ.get("CI_PROJECT_ID") or ""
+    token = os.environ.get("PACKAGE_TOKEN")
+    key, value = ("PRIVATE-TOKEN", token) if token else ("JOB-TOKEN", os.environ.get("CI_JOB_TOKEN", ""))
+    if not value or not (url or (api and project)):
+        raise MirrorError("the ledger in the package registry needs PACKAGE_TOKEN, and GITLAB_API_URL and "
+                          "PACKAGE_PROJECT or its URL (a CI job supplies all of them)")
+    url = url or (f"{api}/projects/{urllib.parse.quote(project, safe='')}/packages/generic/"
+                  f"{LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}")
     say(f"+ {method} {url}")
-    return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers),
-                                  timeout=600, context=context)
-
-
-def store_get(package, version, name, destination=None):
-    """A high-side file from IMPORT_STORE: the bucket's <package>/<version>/<name>, or the generic package."""
-    if not s3_enabled():
-        return package_get(package, version, name, destination)
+    request = urllib.request.Request(url, data=data, method=method, headers={key: value})
     try:
-        with s3_request("GET", f"{package}/{version}/{name}") as response:
-            if destination is None:
-                return response.read()
-            with open(destination, "wb") as stream:
-                shutil.copyfileobj(response, stream)
-            return destination
+        with urllib.request.urlopen(request, timeout=600, context=tls_context(os.environ.get("CA_BUNDLE"))) as response:
+            return response.read()
     except urllib.error.HTTPError as error:
-        if error.code == 404:
+        if method == "GET" and error.code == 404:
             return None
-        raise MirrorError(f"S3 GET {package}/{version}/{name}: HTTP {error.code}") from error
+        raise MirrorError(f"{method} {url}: HTTP {error.code}") from error
     except urllib.error.URLError as error:
-        raise MirrorError(f"S3 GET {package}/{version}/{name}: {error.reason}") from error
+        raise MirrorError(f"{method} {url}: {error.reason}") from error
 
 
-def store_put(package, version, name, data):
-    if not s3_enabled():
-        return package_put(package, version, name, data)
-    try:
-        s3_request("PUT", f"{package}/{version}/{name}", data).close()
-    except urllib.error.URLError as error:
-        raise MirrorError(f"S3 PUT {package}/{version}/{name}: {getattr(error, 'code', error.reason)}") from error
+def load_ledger(location, low, create=True):
+    """The ledger for registry low (any registry when low is empty). None when there is none and create
+    is false."""
+    if location == "gitlab":
+        raw, shown = package_request("GET"), f"package {LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}"
+    elif isinstance(location, str):  # the pipeline's ledger by URL: read only, so it must exist
+        raw, shown = package_request("GET", url=location), location
+        if raw is None:
+            raise MirrorError(f"no ledger at {location}")
+    else:
+        raw, shown = (location.read_bytes() if location.exists() else None), str(location)
+    if raw is None:
+        if not create:
+            return None
+        print(f"ledger: none at {shown}, starting a new one", file=sys.stderr)
+        return {"registry": low, "synced": {}, "sent": {}, "platforms": {}}
+    ledger = json.loads(raw)
+    for part in ("synced", "sent", "platforms"):
+        ledger.setdefault(part, {})
+    if low and ledger.get("registry") != low:
+        raise MirrorError(f"the ledger at {shown} belongs to {ledger.get('registry')}, not {low}; "
+                          "set MIRROR_LEDGER to another file")
+    print(f"ledger: {shown}", file=sys.stderr)
+    return ledger
 
 
-def store_exists(package, version, name):
-    """Whether the store holds a file, without downloading it."""
-    try:
-        if s3_enabled():
-            s3_request("HEAD", f"{package}/{version}/{name}").close()
-        else:
-            package_request("HEAD", package, version, name).close()
-        return True
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return False
-        raise MirrorError(f"HEAD {package}/{version}/{name}: HTTP {error.code}") from error
-    except urllib.error.URLError as error:
-        raise MirrorError(f"HEAD {package}/{version}/{name}: {error.reason}") from error
-
-
-def store_age(package, version, name):
-    """Hours since a bundle reached the store, from GitLab's package created_at or S3's Last-Modified."""
-    try:
-        if s3_enabled():
-            with s3_request("HEAD", f"{package}/{version}/{name}") as response:
-                stored = parsedate_to_datetime(response.headers["Last-Modified"])
-        else:
-            base, (key, value) = packages()
-            query = urllib.parse.urlencode({"package_type": "generic", "package_name": package,
-                                            "package_version": version})
-            found = [p for p in json.loads(package_api("GET", f"{base.rsplit('/generic', 1)[0]}?{query}", key, value))
-                     if p["name"] == package and p["version"] == version]
-            if not found:
-                return None
-            stored = datetime.fromisoformat(found[0]["created_at"].replace("Z", "+00:00"))
-    except (urllib.error.URLError, KeyError, ValueError) as error:
-        say(f"cannot tell how long {version} has waited: {error}")
-        return None
-    return (datetime.now(timezone.utc) - stored).total_seconds() / 3600
-
-
-def gap_grace():
-    """IMPORT_GAP_GRACE: hours a later bundle may wait for an earlier one before import fails."""
-    text = os.environ.get("IMPORT_GAP_GRACE", "").strip() or "6"
-    try:
-        return float(text)
-    except ValueError:
-        raise MirrorError(f"IMPORT_GAP_GRACE must be a number of hours, not {text!r}") from None
-
-
-def store_delete(package, version, names):
-    """Remove an imported bundle: its objects in the bucket, or its generic package version.
-    Returns how many generic packages were deleted; S3 does not report a missing object."""
-    try:
-        if s3_enabled():
-            for name in names:
-                s3_request("DELETE", f"{package}/{version}/{name}").close()
-            return len(names)
-        base, (key, value) = packages()
-        query = urllib.parse.urlencode({"package_type": "generic", "package_name": package,
-                                        "package_version": version, "per_page": 100})
-        listing = base.rsplit("/generic", 1)[0]
-        deleted = 0
-        for found in json.loads(package_api("GET", f"{listing}?{query}", key, value)):
-            if found["name"] == package and found["version"] == version:
-                package_api("DELETE", f"{listing}/{found['id']}", key, value)
-                deleted += 1
-        return deleted
-    except urllib.error.URLError as error:
-        raise MirrorError(f"delete {package}/{version}: {getattr(error, 'code', error.reason)}") from error
-
-
-def load_receipt(receipt_file):
-    """The high side's last import: the store's copy when MIRROR_LEDGER=true, else received.json."""
-    if ledger_enabled():
-        raw = store_get(RECEIPTS, "head", "received.json")
-        return json.loads(raw) if raw else {}
-    return json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
-
-
-def save_receipt(receipt_file, receipt):
-    write_json(receipt_file, receipt)
-    if ledger_enabled():
-        store_put(RECEIPTS, "head", "received.json", receipt_file.read_bytes())
-
-
-def ledger_records(last):
-    """Every recorded bundle, oldest first: one GET per sequence. Past a few thousand bundles,
-    list the packages API instead."""
-    records = []
-    for sequence in range(1, last + 1):
-        raw = package_get(LEDGER, f"{sequence:012d}", "images.json")
-        if raw:  # an interrupted run reserves a sequence and records nothing
-            records.append(json.loads(raw))
-    return records
+def save_ledger(location, ledger):
+    if isinstance(location, str) and location != "gitlab":
+        # A ledger read by URL belongs to the pipeline: a manual run never changes it.
+        say(f"ledger: {location} is read only; not updated")
+        return False
+    elif location == "gitlab":  # GitLab serves the newest upload of a file name
+        package_request("PUT", json.dumps(ledger, indent=2, sort_keys=True).encode())
+    else:
+        location.parent.mkdir(parents=True, exist_ok=True)
+        write_json(location, ledger)
+    return True
 
 
 def normalise(source):
     """Expand a short name the way docker pull does: alpine:3 is docker.io/library/alpine:3.
-    Only for references mirror.py reads elsewhere (FROM lines) and for the hint in add; the
-    catalog holds every source in full."""
+    Only for references mirror.py reads elsewhere (FROM lines, list files); the catalog holds every
+    source in full."""
     first, _, rest = source.partition("/")
     if not rest or not ("." in first or ":" in first or first == "localhost"):
         source = "docker.io/" + source
@@ -520,23 +320,14 @@ def image_child(child, fetch, depth):
     return kind in MANIFESTS or (kind is None and bool(child.get("platform")))
 
 
-def rewrite(path, setting):
-    """A repository path under the first matching old=new prefix rule in setting (comma-separated;
-    the longest old prefix wins, matched on whole path segments)."""
-    rules = []
-    for rule in filter(None, (part.strip() for part in os.environ.get(setting, "").split(","))):
-        old, separator, new = rule.partition("=")
-        old, new = old.strip().strip("/"), new.strip().strip("/")
-        if not separator or not old or not new:
-            raise MirrorError(f"{setting}: expected old=new prefix pairs, not {rule!r}")
-        rules.append((old, new))
-    for old, new in sorted(rules, key=lambda rule: -len(rule[0])):
-        if path == old or path.startswith(old + "/"):
-            moved = new + path[len(old):]
-            if not TARGET.fullmatch(moved):
-                raise MirrorError(f"{setting}: {path} becomes {moved}, not a valid repository path")
-            return moved
-    return path
+def rebase(path, base):
+    """path with its first segment replaced by base: team/prom/prometheus, new-org -> new-org/prom/prometheus."""
+    if not base:
+        return path
+    moved = base.strip("/") + "/" + path.split("/", 1)[1]
+    if not TARGET.fullmatch(moved):
+        raise MirrorError(f"--rewrite-base-path {base}: {path} becomes {moved}, not a valid repository path")
+    return moved
 
 
 def resolve_entry(source, target):
@@ -638,32 +429,6 @@ def add_list(path, folder, prefix=None):
         raise MirrorError(f"{len(failed)} line(s) not added:\n  " + "\n  ".join(failed))
 
 
-def verify_image(directory, digest):
-    """Check a skopeo dir: copy: every manifest, config and layer against its digest."""
-    def check(descriptor, name):
-        expected = descriptor.get("digest") if isinstance(descriptor, dict) else None
-        if not isinstance(expected, str) or not re.fullmatch(DIGEST, expected):
-            raise MirrorError("invalid image digest")
-        path = directory / name.format(expected[7:])
-        if (not path.is_file() or path.stat().st_size != descriptor.get("size", path.stat().st_size)
-                or sha256(path) != expected[7:]):
-            raise MirrorError(f"missing or corrupt image file: {expected}")
-        return path
-
-    def manifest(descriptor, name):
-        data = json.loads(check(descriptor, name).read_bytes())
-        if not isinstance(data, dict) or data.get("schemaVersion") != 2:
-            raise MirrorError("unsupported image manifest schema")
-        if "manifests" in data:
-            for child in data["manifests"]:
-                manifest(child, "{}.manifest.json")
-        else:
-            for blob in [data["config"], *data["layers"]]:
-                check(blob, "{}")
-
-    manifest({"digest": digest}, "manifest.json")
-
-
 def platform_digest(reference, digest, side):
     """The digest to mirror: the whole image, or one platform's image when MIRROR_PLATFORM is set."""
     wanted = os.environ.get("MIRROR_PLATFORM", "").strip()
@@ -702,23 +467,8 @@ def platform_digest(reference, digest, side):
     return matches[0]
 
 
-def verify_platform(directory, image):
-    """A platform image must be a child of the approved index carried beside it."""
-    if image["transfer"] == image["digest"]:
-        return
-    path = directory / f"{image['digest'][7:]}.manifest.json"
-    if not path.is_file() or sha256(path) != image["digest"][7:]:
-        raise MirrorError(f"missing or corrupt approved index: {image['digest']}")
-    children = json.loads(path.read_bytes()).get("manifests", [])
-    listed = [child for child in children if child.get("digest") == image["transfer"]]
-    if not listed:
-        raise MirrorError(f"{image['transfer']} is not part of approved {image['digest']}")
-    if any(referrer(child) or child.get("mediaType") not in (*MANIFESTS, None) for child in listed):
-        raise MirrorError(f"{image['transfer']} in approved {image['digest']} is not an image")
-
-
 def publish_tags(tag, transfer, repository, side):
-    """The tags an image gets on both target registries: the source tag, unchanged.
+    """The tags an image gets in the target registry: the source tag, unchanged.
 
     latest names no release, and once it moves the registry may garbage-collect the untagged
     old image. A latest image is therefore also tagged with the version it reports.
@@ -733,9 +483,8 @@ def app_version(reference, side):
     """The version an image reports about itself, for images published as latest.
 
     Bitnami's Docker Hub images ship only latest; every other tag is a signature or
-    metadata artifact. Same order of preference as quay-diode-poc's pack-inventory.
-    An image that reports no version gives "". A failed lookup raises, so a run
-    never reports success while the version tag is missing.
+    metadata artifact. An image that reports no version gives "". A failed lookup raises,
+    so a run never reports success while the version tag is missing.
     """
     wanted = os.environ.get("MIRROR_PLATFORM", "").strip()
     os_name, _, arch = wanted.partition("/")
@@ -755,212 +504,104 @@ def app_version(reference, side):
     return next((v for v in found if v and re.fullmatch(TAG, v)), "")
 
 
-def attributes_of(path, kind, extra=None):
-    """What travels with one file: the headers NiFi ListenHTTP keeps as attributes, packaged with the file
-    in a .ffv3, or S3 user metadata. extra: a part's X-Bundle-Name, X-Bundle-Sha256 and X-Bundle-Parts."""
-    return {"X-Sha256": sha256(path), "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar",
-            "X-Artifact-Action": "mirror", "X-Bundle-Kind": kind, **(extra or {})}
+def pin(image):
+    """What the ledger records per catalog tag: the approved digest and the platform choice."""
+    return f"{image['digest']} {os.environ.get('MIRROR_PLATFORM', '').strip()}".strip()
 
 
-def post_file(path, attributes, url):
-    """POST one file to NiFi ListenHTTP with its attributes as headers."""
-    parts = urllib.parse.urlsplit(url)
-    shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
-    file_size = path.stat().st_size
-    # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break a case-sensitive
-    # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
-    # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
-    # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
-    headers = ["Expect:", f"Filename: {path.name}", "Content-Type: application/octet-stream",
-               *(f"{name}: {value}" for name, value in attributes.items())]
-    status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
-                 "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
-                 "--output", "/dev/null", "--write-out", "%{http_code}",
-                 *[item for header in headers for item in ("--header", header)], "--upload-file", str(path), url)
-    print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes, "
-          f"X-Sha256 {attributes['X-Sha256']})")
-
-
-def flowfile_v3(attributes, size):
-    """The header NiFi's flowfile-stream-v3 packaging writes before the content, which UnpackContent reads:
-    magic, attribute count, each name and value, then the content length."""
-    def field(number):  # under 65535 in two bytes, otherwise 0xFFFF and four more
-        return struct.pack(">H", number) if number < 0xFFFF else b"\xff\xff" + struct.pack(">I", number)
-
-    def text(value):
-        data = value.encode()
-        return field(len(data)) + data
-    return (b"NiFiFF3" + field(len(attributes)) + b"".join(text(k) + text(v) for k, v in attributes.items())
-            + struct.pack(">Q", size))
-
-
-class Joined(io.RawIOBase):
-    """Several readable streams read as one."""
-
-    def __init__(self, *streams):
-        self.streams = list(streams)
-
-    def readable(self):
-        return True
-
-    def readinto(self, buffer):
-        while self.streams:
-            count = self.streams[0].readinto(buffer)
-            if count:
-                return count
-            self.streams.pop(0)
-        return 0
-
-
-def drop(path, attributes, target):
-    """Leave one file for the low NiFi to collect as <file>.ffv3, already packaged as its PackageFlowFile
-    would, so that NiFi only lists, fetches and moves it into the link. target is a directory (an NFS
-    share NiFi reads with ListFile) or "s3" (the S3_* bucket, read with ListS3; the attributes also go in
-    the object's user metadata, which FetchS3Object makes attributes on the low side)."""
-    name, size = path.name + ".ffv3", path.stat().st_size
-    header = flowfile_v3({"filename": path.name, **attributes}, size)
-    with path.open("rb") as content:
-        if target == "s3":
-            try:
-                s3_request("PUT", name, Joined(io.BytesIO(header), content), len(header) + size, attributes).close()
-            except urllib.error.URLError as error:
-                raise MirrorError(f"S3 PUT {name}: {getattr(error, 'code', error.reason)}") from error
-            shown = f"s3 {os.environ.get('S3_BUCKET')}/{os.environ.get('S3_PREFIX', '').strip('/')}"
-        else:
-            directory = Path(target)
-            directory.mkdir(parents=True, exist_ok=True)
-            # Written under another name and renamed: NiFi lists only *.ffv3, so it never takes half a file.
-            partial = directory / (name + ".partial")
-            with partial.open("wb") as out:
-                out.write(header)
-                shutil.copyfileobj(content, out, 8 * 1024 * 1024)
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(partial, directory / name)
-            shown = str(directory)
-    print(f"dropped for NiFi: {name} -> {shown} ({size} bytes, X-Sha256 {attributes['X-Sha256']})")
-
-
-def sync(path, full=False, out=None, low_only=False):
-    """Mirror the catalog into TARGET_REGISTRY and write what changed as bundles in the outbox, recorded
-    in the ledger; mirror.py send delivers them. low_only: update the low registry and write nothing."""
+def sync(path, ledger_file):
+    """Copy every catalog image into TARGET_REGISTRY by digest. Safe to run any number of times: a tag
+    already at its digest is left alone. The ledger records what is there, for export."""
     low = registry("TARGET_REGISTRY")
-    settings(("MIRROR_BUNDLE_DIR", "bundles are written to the outbox in MIRROR_STATE_DIR", False),
-             ("MIRROR_BLOB_DELTA", "every bundle carries whole images", False),
-             ("MIRROR_LEDGER", "what was sent is kept only in MIRROR_STATE_DIR, which a CI job does not keep", False),
-             ("MIRROR_PLATFORM", "every platform of each image is sent", False),
-             ("MIRROR_BUNDLE_MAX_SIZE", "bundles are split at 4GiB", False))
     images = catalog(path)
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
-    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
-    paths(work_and_ledger=work, **({} if low_only else {"outbox": out or os.environ.get("MIRROR_BUNDLE_DIR") or work / "outbox"}))
-    with locked(work):
-        state_file = work / "sent.json"
-        state = load_state(state_file) or {
-            "stream": uuid.uuid4().hex, "sequence": 0, "sent": {}, "registry": low}
-        loaded = json.dumps(state, sort_keys=True)
-        if state.get("registry") != low:
-            raise MirrorError(f"{work} belongs to another low registry; set a separate MIRROR_STATE_DIR")
-        full = full or not state["sequence"] or state.get("pending", False)
-        changed, known, platforms = [], state.get("platforms", {}), {}
-        platform = os.environ.get("MIRROR_PLATFORM", "").strip()
-        # A tag a catalog entry pins, or pinned before its line was removed, is never a version tag.
-        pinned = state.setdefault("pinned", sorted(state["sent"]))
-        catalog_tags = {f"{i['target']}:{i['tag']}" for i in images} | set(pinned)
-        for image in images:
-            key = f"{image['target']}:{image['tag']}"
-            # The ledger records the platform too, so changing MIRROR_PLATFORM resends the image.
-            sent = f"{image['digest']} {platform}".strip()
-            # Pin the source by digest; source tag movement cannot change approved bytes.
-            source = transport_reference(image["source"])
-            # Remember each platform and tag choice so an unchanged image needs no source request.
-            lookup = f"{image['digest']} {platform} {image['tag']}"
-            # A full sync is a recovery, so it asks the source again.
-            cached = None if full else known.get(lookup)
-            if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
-                transfer, tags = cached
-            else:
-                transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
-                tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
-            if tags != ["latest"]:  # a latest image with no version yet is asked again next run
-                platforms[lookup] = [transfer, tags]
-            for tag in tags[1:]:
-                if f"{image['target']}:{tag}" in catalog_tags:
-                    print(f"warning: {key} reports version {tag}, which images.txt pins or once pinned; not tagging it",
-                          file=sys.stderr)
-            tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
-            # sent.json records the digest per catalog tag and, under aliases, the version tags sent with it.
-            aliases = state.get("aliases", {}).get(key, [])
-            if key not in pinned:
-                # Recorded before the first copy, so a run that fails after it still protects the tag.
-                pinned.append(key)
-                save_state(state_file, state, remote=False)
-            known_tags = [image["tag"], *aliases] if state["sent"].get(key) == sent else []
-            for number, tag in enumerate(tags):
-                destination = f"docker://{low}/{image['target']}:{tag}"
+    ledger = load_ledger(ledger_file, low)
+    loaded = json.dumps(ledger, sort_keys=True)
+    known, platforms = ledger.get("platforms", {}), {}
+    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
+    # A tag a catalog entry pins, or pinned before its line was removed, is never a version tag.
+    pinned = ledger.setdefault("pinned", [])
+    catalog_tags = {f"{i['target']}:{i['tag']}" for i in images} | set(pinned)
+    copied = 0
+    for image in images:
+        key = f"{image['target']}:{image['tag']}"
+        source = transport_reference(image["source"])  # by digest: a moved source tag changes nothing
+        # Remember each platform and version-tag choice, so an unchanged image needs no source request.
+        lookup = f"{image['digest']} {platform} {image['tag']}"
+        cached = known.get(lookup)
+        if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
+            transfer, tags = cached
+        else:
+            transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
+            tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
+        if tags != ["latest"]:  # a latest image with no version yet is asked again next run
+            platforms[lookup] = [transfer, tags]
+        for tag in tags[1:]:
+            if f"{image['target']}:{tag}" in catalog_tags:
+                print(f"warning: {key} reports version {tag}, which images.txt pins or once pinned; not tagging it",
+                      file=sys.stderr)
+        tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
+        if key not in pinned:
+            # Recorded before the first copy, so a run that fails after it still protects the tag.
+            pinned.append(key)
+            save_ledger(ledger_file, ledger)
+        for number, tag in enumerate(tags):
+            destination = f"docker://{low}/{image['target']}:{tag}"
+            try:
+                observed = raw_digest(destination, "TARGET_REGISTRY")
+            except MirrorError as error:  # missing, deleted or expired: copy it; a real fault fails the copy
                 observed = None
-                if tag in known_tags or side_of(source) == "TARGET_REGISTRY":  # an own image is already there
-                    try:
-                        observed = raw_digest(destination, "TARGET_REGISTRY")
-                    except MirrorError as error:
-                        # Missing, deleted or expired: copy it again; a real fault fails the copy below.
-                        say(f"low copy unreadable, recopying: {error}")
-                if observed == transfer:
-                    print(f"already in target registry: {low}/{image['target']}:{tag}@{transfer}")
-                    continue
-                if number:  # a version tag points at the image already in the target registry
-                    copy(f"docker://{low}/{image['target']}@{transfer}", destination, "TARGET_REGISTRY", "TARGET_REGISTRY")
-                else:
-                    copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "TARGET_REGISTRY")
-                if raw_digest(destination, "TARGET_REGISTRY") != transfer:
-                    raise MirrorError(f"low mirror digest mismatch: {image['target']}:{tag}")
-                print(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
-            if low_only:  # what reached TARGET_REGISTRY, for pending --synced
-                state.setdefault("synced", {})[key] = sent
-            names = f"{image['target']}:{', :'.join(tags)}"
-            due = full or state["sent"].get(key) != sent or aliases != tags[1:]
-            if due:
-                changed.append(image | {"transfer": transfer, "tags": tags})
-                print(f"send: {names} {transfer}")
+                say(f"not readable in target registry, copying: {error}")
+            if observed == transfer:
+                say(f"already in target registry: {low}/{image['target']}:{tag}@{transfer}")
+                continue
+            if number:  # a version tag points at the image already in the target registry
+                copy(f"docker://{low}/{image['target']}@{transfer}", destination, "TARGET_REGISTRY", "TARGET_REGISTRY")
             else:
-                say(f"unchanged: {names} {transfer}")
-        state["platforms"] = platforms
-        if changed and low_only:
-            # The ledger says what crossed to the high side, so it records only a bundle that was written.
-            save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
-            print(f"target registry updated; {len(changed)} image(s) not bundled (--low-only)")
-            return None
-        if not changed:
-            # A quiet day rewrites the ledger head only when the cached tag choices changed.
-            save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
-            print("nothing to send; low-side digests verified")
-            return None
-        return send_batches(work, outbox(work, out), state_file, state, low, changed, full, "full" if full else "delta")
+                copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "TARGET_REGISTRY")
+            if raw_digest(destination, "TARGET_REGISTRY") != transfer:
+                raise MirrorError(f"digest mismatch in target registry: {image['target']}:{tag}")
+            print(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
+            copied += 1
+        ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
+    ledger["platforms"] = platforms
+    if json.dumps(ledger, sort_keys=True) != loaded:
+        save_ledger(ledger_file, ledger)
+    print(f"synced {len(images)} image(s) into {low}: {copied} tag(s) copied, the rest already there")
 
 
-def bundle_cap():
-    """MIRROR_BUNDLE_MAX_SIZE in bytes: a plain number or with KiB, MiB, GiB or TiB."""
-    text = os.environ.get("MIRROR_BUNDLE_MAX_SIZE", "").strip() or "4GiB"
-    match = re.fullmatch(r"([0-9]+)\s*(KiB|MiB|GiB|TiB)?", text, re.IGNORECASE)
+def pending(path, ledger_file):
+    """Catalog sources not yet in TARGET_REGISTRY at their current digest: what sync copies next."""
+    # The verify job runs outside the mirror-low environment, so it may not see TARGET_REGISTRY.
+    ledger = load_ledger(ledger_file, os.environ.get("TARGET_REGISTRY", "").strip().rstrip("/"), create=False) or {}
+    synced = ledger.get("synced", {})
+    for image in catalog(path):
+        if (synced.get(f"{image['target']}:{image['tag']}") or {}).get("pin") != pin(image):
+            print(image["source"])
+
+
+def size(text):
+    """Bytes from a plain number or a number with KiB, MiB, GiB or TiB."""
+    match = re.fullmatch(r"([0-9]+)\s*(KiB|MiB|GiB|TiB)?", text.strip(), re.IGNORECASE)
     if not match or not int(match[1]):
-        raise MirrorError(f"MIRROR_BUNDLE_MAX_SIZE must be bytes or a number with KiB, MiB, GiB or TiB, not {text!r}")
+        raise MirrorError(f"--max-size must be bytes or a number with KiB, MiB, GiB or TiB, not {text!r}")
     return int(match[1]) * 1024 ** ["", "kib", "mib", "gib", "tib"].index((match[2] or "").lower())
 
 
 def image_bytes(reference, side):
     """The bytes skopeo copy --all moves for reference (by digest): each manifest, config and layer once."""
     seen, total = set(), 0
-    pending = [reference]
-    while pending:
-        current = pending.pop()
+    waiting = [reference]
+    while waiting:
+        current = waiting.pop()
         raw = run("skopeo", "inspect", "--raw", *options(side), current)
         manifest = json.loads(raw)
         total += len(raw)
         for child in manifest.get("manifests", []):
             if child["digest"] not in seen:
                 seen.add(child["digest"])
-                pending.append(current.rsplit("@", 1)[0] + "@" + child["digest"])
+                waiting.append(current.rsplit("@", 1)[0] + "@" + child["digest"])
         for blob in [manifest.get("config") or {}, *manifest.get("layers", [])]:
             if blob.get("digest") and blob["digest"] not in seen:
                 seen.add(blob["digest"])
@@ -968,810 +609,21 @@ def image_bytes(reference, side):
     return total
 
 
-def batches(images, low):
-    """Split images into bundles of at most MIRROR_BUNDLE_MAX_SIZE, in catalog order. A store,
-    NiFi or link limit then applies to one bundle, and the runner holds one bundle at a time.
-    An image larger than the cap travels alone."""
-    cap, groups, size = bundle_cap(), [[]], 0
+def groups(images, cap):
+    """Split images into tars of at most cap bytes, in order. An image larger than cap goes alone."""
+    if not cap:
+        return [images]
+    found, total = [[]], 0
     for image in images:
-        try:
-            need = image_bytes(f"docker://{low}/{image['target']}@{image['transfer']}", "TARGET_REGISTRY")
-        except MirrorError:  # a resend of an image the target registry lost: ask the source
-            upstream = transport_reference(image["source"]).rsplit("@", 1)[0]
-            need = image_bytes(f"docker://{upstream}@{image['transfer']}", side_of(upstream))
+        need = image_bytes(f"docker://{image['host']}/{image['repo']}@{image['digest']}", side_of(image["host"]))
         if need > cap:
-            print(f"{image['target']}:{image['tag']} is {need} bytes, over MIRROR_BUNDLE_MAX_SIZE ({cap}): "
-                  "it goes in a bundle of its own, sent in parts")
-        if groups[-1] and size + need > cap:
-            groups.append([])
-            size = 0
-        groups[-1].append(image)
-        size += need
-    if len(groups) > 1:
-        print(f"{len(images)} image(s) split into {len(groups)} bundles of at most {cap} bytes")
-    return groups
-
-
-def outbox(work, out=None):
-    """Where sync and resend write bundles for send: --out, MIRROR_BUNDLE_DIR, or outbox/ in the work
-    directory. Bundles an earlier run wrote and send has not delivered are refused, not mixed in."""
-    directory = Path(out or os.environ.get("MIRROR_BUNDLE_DIR") or work / "outbox")
-    directory.mkdir(parents=True, exist_ok=True)
-    waiting = sorted(p.name[:-len(".send.json")] for p in directory.glob("mirror-*.tar.send.json"))
-    if waiting:
-        raise MirrorError(f"{directory} holds bundles not sent yet ({', '.join(waiting)}): "
-                          "run mirror.py send first, or remove them")
-    for stale in directory.glob("mirror-*"):
-        # Without its .send.json a bundle was never finished (or sent): its sequence stays unsent in the
-        # ledger, so this run is full. Only this tool's own file names are touched.
-        if OUTBOX_FILE.fullmatch(stale.name):
-            print(f"removed {stale.name}: left by a run that did not finish writing it")
-            stale.unlink()
-    return directory
-
-
-def send_batches(work, out, state_file, state, low, changed, full, kind, bridges=None):
-    """write_bundle() each size-capped batch in turn. Only the first may be full or bridge a gap: the high
-    side accepts that one over a gap and the rest follow it in sequence."""
-    bundle = None
-    for number, batch in enumerate(batches(changed, low)):
-        bundle = write_bundle(work, out, state_file, state, low, batch, full and not number, kind,
-                              None if number else bridges)
-    return bundle
-
-
-def track_unsent(state, name, full, bridges):
-    """Add a written bundle to the ledger's unsent list. A full bundle stands in for every bundle before
-    it on the high side, a bridging resend for those from its first sequence on; anything else
-    (an older one, or the marker an older release's pending ledger left) stays until a full bundle."""
-    unsent = [] if full else state.get("unsent", [])
-    if bridges:
-        unsent = [b for b in unsent if not (match := BUNDLE_NAME.fullmatch(b)) or int(match[1][-12:]) < bridges]
-    state["unsent"] = [*unsent, name]
-    state["written"] = state["sequence"]
-
-
-def image_blobs(directory):
-    """The config and layer digests a staged dir: copy holds or lists, from its manifests."""
-    found = set()
-    for path in [directory / "manifest.json", *directory.glob("*.manifest.json")]:
-        data = json.loads(path.read_bytes())
-        for blob in [data.get("config") or {}, *data.get("layers", [])]:
-            if blob.get("digest"):
-                found.add(blob["digest"])
+            print(f"{image['host']}/{image['repo']}:{image['tag']} is {need} bytes, over --max-size: it goes in a tar of its own")
+        if found[-1] and total + need > cap:
+            found.append([])
+            total = 0
+        found[-1].append(image)
+        total += need
     return found
-
-
-def omit_known_blobs(stage, changed, state, metadata):
-    """MIRROR_BLOB_DELTA: leave out of a delta bundle every config and layer an earlier bundle carried,
-    and any second copy within this bundle. images.json records, per image, where import finds each
-    one: an image the high registry already holds (target@digest), or bundle:<dir> in this bundle."""
-    known, holders, omitted, saved = state.get("blobs", {}), {}, {}, 0
-    # Two catalog tags can pin one digest: they share one staged directory, handled once.
-    for name in dict.fromkeys(image["transfer"].replace(":", "-") for image in changed):
-        directory = stage / "images" / name
-        for blob in sorted(image_blobs(directory)):
-            path = directory / blob[7:]
-            hint = holders.get(blob) or known.get(blob)
-            hint = [hint] if isinstance(hint, str) else hint  # recorded before lists
-            if hint is None:
-                holders[blob] = [f"bundle:{name}"]
-                continue
-            if path.exists():
-                saved += path.stat().st_size
-                path.unlink()
-            omitted.setdefault(name, {})[blob] = hint
-    if omitted:
-        metadata.update(schema=2, omitted=omitted)
-        print(f"blob delta: left out {sum(len(b) for b in omitted.values())} blob(s), {saved} bytes, "
-              "that the high side already has or this bundle carries once")
-
-
-def remember_blobs(state, changed, carried):
-    """Record every blob of the bundle's images against the images that hold it on the high side once
-    imported, newest first and at most three: if retention there expires one, import tries the next."""
-    blobs = state.setdefault("blobs", {})
-    for image in changed:
-        carrier = f"{image['target']}@{image['transfer']}"
-        for blob in carried[image["transfer"]]:
-            # Moved to the end on every use, so the oldest entries go first once the map is full.
-            blobs[blob] = [carrier, *[c for c in blobs.pop(blob, []) if c != carrier]][:3]
-    # ponytail: a fixed cap keeps the ledger small; a dropped blob is only sent again.
-    for blob in list(blobs)[:max(0, len(blobs) - BLOB_MEMORY)]:
-        del blobs[blob]
-
-
-def write_bundle(work, out, state_file, state, low, changed, full, kind, bridges=None):
-    """Write the next bundle into the outbox and record it in the ledger. The ledger stays pending, so
-    the next sync is full, until mirror.py send has delivered it.
-
-    bridges: the first sequence a resend stands in for, so the high side accepts it over a gap.
-    """
-    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
-    # A ledger from before the unsent list that was pending: only a full bundle may clear it.
-    if "unsent" not in state and state.get("pending"):
-        state["unsent"] = ["an unsent bundle recorded by an older release"]
-    # An earlier run that reserved a sequence and never wrote its bundle: only a full bundle covers it.
-    if state["sequence"] > state.get("written", state["sequence"]):
-        state.setdefault("unsent", []).append(f"sequence {state['sequence']}, reserved and never written")
-    # Reserve a sequence before publishing. An interrupted run forces the next one full.
-    state.update(sequence=state["sequence"] + 1, pending=True)
-    save_state(state_file, state)
-    metadata = {"schema": 1, "stream": state["stream"], "sequence": state["sequence"], "full": full,
-                "images": changed, **({"from": bridges} if bridges else {})}
-    with tempfile.TemporaryDirectory(dir=work) as temporary:
-        stage = Path(temporary)
-        (stage / "images").mkdir()
-        for image in changed:
-            directory = stage / "images" / image["transfer"].replace(":", "-")
-            if not directory.exists():
-                # dir: keeps a Docker manifest list byte for byte; oci: would have to convert it.
-                try:
-                    copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "TARGET_REGISTRY")
-                except MirrorError:
-                    if kind != "resend":
-                        raise
-                    # The target registry lost it: a resend takes the same digest from the source.
-                    shutil.rmtree(directory, ignore_errors=True)
-                    upstream = transport_reference(image["source"]).rsplit("@", 1)[0]
-                    copy(f"docker://{upstream}@{image['transfer']}", f"dir:{directory}", side_of(upstream))
-                verify_image(directory, image["transfer"])
-            if image["transfer"] != image["digest"]:
-                # Carry the approved index so import can check the platform image is listed in it.
-                index = run("skopeo", "inspect", "--raw", *options(side_of(image["source"])),
-                            "docker://" + transport_reference(image["source"]))
-                (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
-                verify_platform(directory, image)
-        carried = {}
-        if flag("MIRROR_BLOB_DELTA"):
-            carried = {i["transfer"]: image_blobs(stage / "images" / i["transfer"].replace(":", "-")) for i in changed}
-            if kind == "delta":  # full and resend bundles carry every blob: they are how the high side recovers
-                omit_known_blobs(stage, changed, state, metadata)
-        write_json(stage / "images.json", metadata)
-        bundle = out / f"mirror-{state['stream']}-{state['sequence']:012d}.tar"
-        # Written as parts of at most the cap straight from the tar writer; one part is the bundle itself.
-        sink = PartSink(out, bundle.name, bundle_cap())
-        write_tar(stage, sink)
-        sink.flush_part()
-    parts, checksum, size = sink.number, sink.digest.hexdigest(), sink.size
-    if parts == 1:
-        os.replace(out / f"{bundle.name}.part-001", bundle)
-        parts = 0
-    else:
-        print(f"{bundle.name} is {size} bytes, over MIRROR_BUNDLE_MAX_SIZE ({bundle_cap()}): written as {parts} parts")
-    if ledger_enabled():
-        record_ledger(state, metadata, kind, bundle.name)
-    # The .sha256 is what import reads beside a hand-carried bundle; .send.json, written last, tells send
-    # the bundle is complete.
-    for suffix, text in ((".sha256", f"{checksum}  {bundle.name}" + (f"  {parts}" if parts else "") + "\n"),
-                         (".send.json", json.dumps({"kind": kind, "sha256": checksum, "parts": parts}) + "\n")):
-        temporary = out / (bundle.name + suffix + ".tmp")
-        temporary.write_text(text)
-        os.replace(temporary, out / (bundle.name + suffix))
-    if carried:
-        remember_blobs(state, changed, carried)
-    if kind != "resend":  # a resend repeats what the ledger already records
-        state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
-        aliases = state.setdefault("aliases", {})
-        for i in changed:
-            if i["tags"][1:]:
-                aliases[f"{i['target']}:{i['tag']}"] = i["tags"][1:]
-            else:
-                aliases.pop(f"{i['target']}:{i['tag']}", None)
-    track_unsent(state, bundle.name, full, bridges)
-    save_state(state_file, state)
-    print(f"bundle: {bundle.name} ({len(changed)} image(s), {size} bytes) written to {out}")
-    return bundle
-
-
-def send(method, out=None, target=None, form="ffv3"):
-    """Deliver every complete bundle in the outbox, oldest first, deleting each file once it is delivered.
-
-    method nifi: POST to target (NIFI_URL) with the attributes as headers. dir: write into target, as .ffv3
-    (for a low NiFi ListFile) or, with form tar, the plain files and .sha256 import --inbox reads (hand-carry).
-    s3: PUT .ffv3 objects into the S3_* bucket. A run that stops part-way leaves only the undelivered files,
-    so running send again finishes the job. Once the outbox is empty the ledger is no longer pending.
-    """
-    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
-    directory = Path(out or os.environ.get("MIRROR_BUNDLE_DIR") or work / "outbox")
-    if method in ("nifi", "dir") and not target:
-        raise MirrorError(f"send {method} needs " + ("--url or NIFI_URL" if method == "nifi" else "--path"))
-    if form == "tar" and method != "dir":
-        raise MirrorError("--format tar is for send dir (hand-carry); NiFi and S3 take .ffv3")
-    if method == "dir" and Path(target).resolve() == directory.resolve():
-        raise MirrorError("send dir --path must not be the outbox")
-    paths(outbox=directory, **({"delivered_to": target} if method == "dir" else {}))
-    sent = []
-    with locked(work):
-        for marker in sorted(directory.glob("mirror-*.tar.send.json")):
-            name = marker.name[:-len(".send.json")]
-            info = json.loads(marker.read_text())
-            parts = info["parts"]
-            if form == "tar" and parts:
-                raise MirrorError(f"{name} is in {parts} parts, which import --inbox cannot join: hand-carry needs "
-                                  "whole bundles, so raise MIRROR_BUNDLE_MAX_SIZE and resend")
-            files = [directory / f"{name}.part-{n:03d}" for n in range(1, parts + 1)] if parts else [directory / name]
-            extra = {"X-Bundle-Name": name, "X-Bundle-Sha256": info["sha256"], "X-Bundle-Parts": str(parts)} if parts else None
-            delivered = info.setdefault("delivered", [])
-            for path in files:
-                if path.name in delivered:  # by an earlier send that stopped part-way
-                    continue
-                if not path.exists():
-                    raise MirrorError(f"{path.name} is missing from the outbox and was never delivered; "
-                                      f"remove {marker.name} and resend that bundle")
-                if form == "tar":
-                    copy_file(path, Path(target))
-                    print(f"copied: {path.name} -> {target}")
-                elif method == "nifi":
-                    post_file(path, attributes_of(path, info["kind"], extra), target)
-                else:
-                    drop(path, attributes_of(path, info["kind"], extra), Path(target) if method == "dir" else "s3")
-                delivered.append(path.name)
-                temporary = marker.with_name(marker.name + ".tmp")
-                temporary.write_text(json.dumps(info) + "\n")
-                os.replace(temporary, marker)
-                path.unlink()
-            sidecar = directory / (name + ".sha256")
-            if form == "tar":  # published last: import --inbox takes a bundle only once its .sha256 is there
-                copy_file(sidecar, Path(target))
-            sidecar.unlink(missing_ok=True)
-            marker.unlink()
-            sent.append(name)
-            print(f"sent: {name} ({parts or 1} file(s), {method}{' tar' if form == 'tar' else ''})")
-        if not sent:
-            print(f"nothing to send in {directory}")
-            return 0
-        # The ledger stays pending while any bundle it recorded is unsent; the next sync is then full.
-        state_file = work / "sent.json"
-        state = load_state(state_file)
-        if state and "unsent" in state:  # an older release's pending ledger waits for a full bundle
-            state["unsent"] = [b for b in state["unsent"] if b not in sent]
-            # Also pending when a run reserved a sequence and stopped before writing its bundle.
-            state["pending"] = bool(state["unsent"]) or state["sequence"] > state.get("written", state["sequence"])
-            save_state(state_file, state)
-            if state["unsent"]:
-                print(f"still unsent: {', '.join(state['unsent'])}; the next sync is full")
-    return len(sent)
-
-
-def copy_file(path, directory):
-    """Copy under a .partial name, then rename, so a reader of the directory never sees half a file."""
-    directory.mkdir(parents=True, exist_ok=True)
-    partial = directory / (path.name + ".partial")
-    shutil.copyfile(path, partial)
-    os.replace(partial, directory / path.name)
-
-
-def record_ledger(state, metadata, kind, name):
-    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    record = metadata | {"created": created, "kind": kind, "bundle": name}
-    package_put(LEDGER, f"{state['sequence']:012d}", "images.json", json.dumps(record, indent=2, sort_keys=True).encode())
-
-
-def write_tar(stage, stream):
-    """The bundle's tar, in a fixed order, so writing it twice gives the same bytes."""
-    with tarfile.open(fileobj=stream, mode="w") as archive:
-        for item in sorted(stage.rglob("*")):
-            if item.is_file():
-                archive.add(item, arcname=str(item.relative_to(stage)), recursive=False)
-
-
-class TarSink:
-    """A write-only file that keeps only the size and sha256 of what passes through."""
-
-    def __init__(self):
-        self.size, self.digest = 0, hashlib.sha256()
-
-    def write(self, data):
-        self.size += len(data)
-        self.digest.update(data)
-        return len(data)
-
-    def tell(self):
-        return self.size
-
-
-class PartSink(TarSink):
-    """Writes the tar into part files of at most cap bytes, keeping the size and sha256 of the whole."""
-
-    def __init__(self, directory, name, cap):
-        super().__init__()
-        self.directory, self.name, self.cap = directory, name, cap
-        self.number, self.current, self.filled = 0, None, 0
-
-    def write(self, data):
-        view = memoryview(data)
-        while view:
-            if self.current is None:
-                self.number += 1
-                self.current = (self.directory / f"{self.name}.part-{self.number:03d}").open("wb")
-                self.filled = 0
-            taken = view[:self.cap - self.filled]
-            self.current.write(taken)
-            self.filled += len(taken)
-            view = view[len(taken):]
-            if self.filled == self.cap:
-                self.flush_part()
-        return super().write(data)
-
-    def flush_part(self):
-        if self.current is not None:
-            self.current.close()
-            self.current = None
-
-
-def sequence_range(text, last):
-    """N, N.. or N..M as an inclusive range; an open end means the newest bundle."""
-    match = re.fullmatch(r"([0-9]+)(\.\.([0-9]*))?", text or "")
-    if not match:
-        raise MirrorError(f"--sequence {text!r}: expected N, N.. or N..M")
-    first = int(match[1])
-    final = int(match[3]) if match[3] else (last if match[2] else first)
-    if not 1 <= first <= final:
-        raise MirrorError(f"--sequence {text!r}: empty range")
-    return first, final
-
-
-def resend(since=None, sequences=None, image=None, out=None):
-    """Resend recorded images as the next bundle: by date, by sequence or by target."""
-    if not ledger_enabled():
-        raise MirrorError("resend reads the ledger; set MIRROR_LEDGER=true")
-    if since and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", since):
-        raise MirrorError(f"--since {since!r}: expected YYYY-MM-DD")
-    if not (since or sequences or image):
-        raise MirrorError("resend needs --since, --sequence or --image")
-    low = registry("TARGET_REGISTRY")
-    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
-    with locked(work):
-        state_file = work / "sent.json"
-        state = load_state(state_file)
-        if not state or not state["sequence"]:
-            raise MirrorError("the ledger records no bundle yet; run sync first")
-        if state.get("registry") != low:
-            raise MirrorError("the ledger belongs to another low registry")
-        first, final = sequence_range(sequences, state["sequence"]) if sequences else (1, state["sequence"])
-        latest, wanted, matched = {}, set(), []
-        for record in ledger_records(state["sequence"]):
-            in_range = (first <= record["sequence"] <= final
-                        and (not since or record["created"][:10] >= since))
-            if in_range:
-                matched.append(record["sequence"])
-            for item in record["images"]:
-                key = f"{item['target']}:{item['tag']}"
-                latest[key] = item
-                if in_range and (not image or image in (item["target"], key)):
-                    wanted.add(key)
-        if not wanted:
-            print("nothing recorded matches; no bundle written")
-            return None
-        # The newest record of each tag: an older digest would roll a moved tag back on the high side.
-        chosen = [latest[key] for key in sorted(wanted)]
-        for item in chosen:
-            print(f"resend: {item['target']}:{', :'.join(item['tags'])} {item['transfer']}")
-        # Everything recorded from the first match to the newest bundle stands in for those bundles.
-        bridges = matched[0] if not image and final >= state["sequence"] else None
-        return send_batches(work, outbox(work, out), state_file, state, low, chosen, False, "resend", bridges)
-
-
-BUNDLE_ENTRY = re.compile(r"images\.json|images/sha256-[0-9a-f]{64}/(?:version|manifest\.json|signature-[0-9]+|"
-                          r"[0-9a-f]{64}(?:\.manifest\.json)?)")
-
-
-class PartReader(io.RawIOBase):
-    """The parts of a bundle read as one stream, hashed as they pass. Each part is fetched only when
-    the reader reaches it and deleted once read, so the job holds one part, not the joined bundle."""
-
-    def __init__(self, fetch, names, scratch):
-        super().__init__()
-        self.fetch, self.names, self.scratch = fetch, list(names), scratch
-        self.digest, self.current, self.number = hashlib.sha256(), None, 0
-
-    def readable(self):
-        return True
-
-    def readinto(self, buffer):
-        while True:
-            if self.current is None:
-                if self.number == len(self.names):
-                    return 0
-                path = self.scratch / "part.download"
-                if not self.fetch(self.names[self.number], path):
-                    raise MirrorError(f"{self.names[self.number]} disappeared from the store during import")
-                self.current, self.number = path.open("rb"), self.number + 1
-            count = self.current.readinto(buffer)
-            if count:
-                self.digest.update(memoryview(buffer)[:count])
-                return count
-            self.current.close()
-            (self.scratch / "part.download").unlink()
-            self.current = None
-
-    def close(self):
-        if self.current is not None:  # an extract that failed part way leaves a part open
-            self.current.close()
-            (self.scratch / "part.download").unlink(missing_ok=True)
-            self.current = None
-        super().close()
-
-
-def extract_stream(stream, directory):
-    """Unpack a bundle read front to back (no seeking), with the same entry rules as extract."""
-    seen = set()
-    with tarfile.open(fileobj=stream, mode="r|") as archive:
-        for member in archive:
-            if not member.isfile() or not BUNDLE_ENTRY.fullmatch(member.name) or member.name in seen:
-                raise MirrorError(f"unsafe or duplicate bundle entry: {member.name}")
-            seen.add(member.name)
-            if member.size > shutil.disk_usage(directory).free:
-                raise MirrorError("insufficient space to unpack bundle")
-            target = directory / member.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.extractfile(member) as source, target.open("wb") as dest:
-                shutil.copyfileobj(source, dest)
-    while stream.read(1 << 20):  # tar padding after the end marker still counts toward the checksum
-        pass
-
-
-def extract(bundle, directory):
-    allowed = re.compile(r"images\.json|images/sha256-[0-9a-f]{64}/(?:version|manifest\.json|signature-[0-9]+|[0-9a-f]{64}(?:\.manifest\.json)?)")
-    with tarfile.open(bundle) as archive:
-        seen = set()
-        members = archive.getmembers()
-        if sum(m.size for m in members) > shutil.disk_usage(directory).free:
-            raise MirrorError("insufficient space to unpack bundle")
-        for member in members:
-            if not member.isfile() or not allowed.fullmatch(member.name) or member.name in seen:
-                raise MirrorError(f"unsafe or duplicate bundle entry: {member.name}")
-            seen.add(member.name)
-        for member in members:
-            target = directory / member.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.extractfile(member) as source, target.open("wb") as dest:
-                shutil.copyfileobj(source, dest)
-
-
-def validate_manifest(manifest):
-    if (not isinstance(manifest, dict) or manifest.get("schema") not in (1, 2)
-            or (manifest.get("schema") == 2) != ("omitted" in manifest)
-            or not isinstance(manifest.get("stream"), str)
-            or not re.fullmatch(r"[0-9a-f]{32}", manifest["stream"])
-            or type(manifest.get("sequence")) is not int or manifest["sequence"] < 1
-            or type(manifest.get("full")) is not bool
-            or not isinstance(manifest.get("images"), list) or not manifest["images"]
-            or ("from" in manifest and (type(manifest["from"]) is not int
-                                        or not 1 <= manifest["from"] < manifest["sequence"]))):
-        raise MirrorError("invalid bundle metadata")
-    directories = {image.get("transfer", "").replace(":", "-") for image in manifest["images"] if isinstance(image, dict)}
-    hint = re.compile(rf"bundle:sha256-[0-9a-f]{{64}}|{TARGET.pattern}@{DIGEST}")
-    omitted = manifest.get("omitted", {})
-    if not isinstance(omitted, dict):
-        raise MirrorError("invalid omitted-blob metadata")
-    for name, blobs in omitted.items():
-        if (name not in directories or not isinstance(blobs, dict) or not blobs
-                or not all(re.fullmatch(DIGEST, b) and isinstance(h, str) and hint.fullmatch(h)
-                           and (not h.startswith("bundle:") or h[7:] in directories)
-                for b, hints in blobs.items() for h in (hints if isinstance(hints, list) and hints else [None]))):
-            raise MirrorError("invalid omitted-blob metadata")
-    seen = set()
-    for image in manifest["images"]:
-        fields = ('source', 'target', 'tag', 'digest', 'transfer')
-        if isinstance(image, dict) and "tags" not in image:
-            image["tags"] = [image.get("tag")]  # a sender from before version tags: the catalog tag alone
-        tags = image.get("tags") if isinstance(image, dict) else None
-        if (not isinstance(image, dict) or set(image) != {*fields, "tags"}
-                or not all(isinstance(image[k], str) for k in fields) or not re.fullmatch(DIGEST, image["transfer"])
-                or not isinstance(tags, list) or not all(isinstance(t, str) and re.fullmatch(TAG, t) for t in tags)
-                or tags[:1] != [image["tag"]] or len(set(tags)) != len(tags)
-                or len(tags) > (2 if image["tag"] == "latest" else 1)):
-            raise MirrorError("invalid image entry")
-        if parse_image(image["source"], image["target"]) | {k: image[k] for k in ("transfer", "tags")} != image:
-            raise MirrorError("image metadata does not match pinned source")
-        key = f"{image['target']}:{image['tag']}"
-        if key in seen:
-            raise MirrorError("duplicate target tag in bundle")
-        seen.add(key)
-
-
-def verify_images(manifest, stage):
-    for image in manifest["images"]:
-        verify_image(stage / "images" / image["transfer"].replace(":", "-"), image["transfer"])
-        verify_platform(stage / "images" / image["transfer"].replace(":", "-"), image)
-
-
-def restore_blobs(stage, manifest, high, work):
-    """Put back each blob a MIRROR_BLOB_DELTA bundle left out: from another image in the bundle, or from an
-    image an earlier bundle brought, read out of the high registry, trying each named image in turn.
-    verify_image then checks every file."""
-    fetched, unreadable = {}, {}
-
-    def holder(hint):
-        if hint.startswith("bundle:"):
-            return stage / "images" / hint[7:]
-        if hint not in fetched and hint not in unreadable:
-            target, digest = hint.split("@", 1)
-            target = rewrite(target, "IMPORT_PATH_REWRITE")
-            directory = stage / "held" / f"{len(fetched) + len(unreadable)}"
-            directory.parent.mkdir(exist_ok=True)  # skopeo creates the dir: directory, not its parent
-            try:
-                copy(f"docker://{high}/{target}@{digest}", f"dir:{directory}", "TARGET_REGISTRY")
-                fetched[hint] = directory
-            except MirrorError as error:
-                unreadable[hint] = f"{target}@{digest}: {error}"
-        return fetched.get(hint)
-
-    for name, blobs in manifest.get("omitted", {}).items():
-        for blob, hints in sorted(blobs.items()):
-            source = next((d / blob[7:] for d in map(holder, hints) if d and (d / blob[7:]).is_file()), None)
-            if source is None:
-                why = "; ".join(unreadable.get(h, f"{h} does not hold it") for h in hints)
-                raise MirrorError(f"{blob} was left out as already on the high side, but none of its images has it "
-                                  f"({why}); on the low side, Run pipeline with RESEND_ALL=true to send whole images")
-            shutil.copyfile(source, stage / "images" / name / blob[7:])
-    if manifest.get("omitted"):
-        print(f"blob delta: restored {sum(len(b) for b in manifest['omitted'].values())} blob(s), "
-              f"reading {len(fetched)} image(s) from {high}")
-
-
-def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None, unpack=None):
-    """Verify a bundle and push its images. unpack(stage) streams a bundle that came in parts into
-    stage and returns its sha256; the checksum is then compared before anything is pushed."""
-    high = registry("TARGET_REGISTRY")
-    work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
-    sidecar = bundle.with_name(bundle.name + ".sha256")
-    fields = sidecar.read_text().split()[:2] if sidecar.exists() else []
-    if unpack is None:
-        digest = sha256(bundle)
-        if fields != [digest, bundle.name]:
-            raise MirrorError(f"{bundle.name}: missing or mismatched checksum")
-    with locked(work), tempfile.TemporaryDirectory(dir=work) as temporary:
-        stage = Path(temporary)
-        if unpack is None:
-            extract(bundle, stage)
-        else:
-            digest = unpack(stage)
-            if fields != [digest, bundle.name]:
-                raise MirrorError(f"{bundle.name}: the joined parts do not match the bundle checksum")
-        manifest = json.loads((stage / "images.json").read_text())
-        validate_manifest(manifest)
-        if "omitted" not in manifest:
-            verify_images(manifest, stage)
-        receipt_file = work / "received.json"
-        receipt = load_receipt(receipt_file)
-        if receipt and receipt.get("registry") != high:
-            raise MirrorError(f"{work} belongs to another high registry; set a separate IMPORT_STATE_DIR")
-        if receipt and receipt["stream"] != manifest["stream"]:
-            if not adopt_stream or not manifest["full"]:
-                raise MirrorError("different sender stream; review a full bundle and use --adopt-stream")
-            receipt = {}
-        previous = receipt.get("sequence", 0)
-        if manifest["sequence"] == previous and digest == receipt.get("digest"):
-            print(f"already imported: {bundle.name}")
-            return
-        if manifest["sequence"] <= previous:
-            if superseded_ok and manifest["sequence"] < previous:
-                print(f"superseded: {bundle.name}")
-                return
-            raise MirrorError("stale or conflicting bundle; refusing rollback")
-        # A resend from the low side stands in for every bundle from manifest["from"] on.
-        if (manifest["sequence"] != previous + 1 and not manifest["full"]
-                and manifest.get("from", previous + 2) > previous + 1):
-            missing = (f"{previous + 1}" if manifest["sequence"] == previous + 2
-                       else f"{previous + 1} to {manifest['sequence'] - 1}")
-            raise SequenceGap(f"missing earlier bundle {missing} (imported up to {previous}, received "
-                              f"{manifest['sequence']}); on the low side, Run pipeline with "
-                              f"RESEND_SEQUENCE={previous + 1}.. (mirror.py resend --sequence {previous + 1}..)")
-        if "omitted" in manifest:
-            # Only once the sequence is accepted: the images it names come from earlier bundles.
-            restore_blobs(stage, manifest, high, work)
-            verify_images(manifest, stage)
-        pushed = []
-        for image in manifest["images"]:
-            target = rewrite(image["target"], "IMPORT_PATH_REWRITE")
-            moved = f" (sent as {image['target']}, IMPORT_PATH_REWRITE)" if target != image["target"] else ""
-            for tag in image["tags"]:
-                destination = f"docker://{high}/{target}:{tag}"
-                copy(f"dir:{stage / 'images' / image['transfer'].replace(':', '-')}", destination,
-                     destination_side="TARGET_REGISTRY")
-                if raw_digest(destination, "TARGET_REGISTRY") != image["transfer"]:
-                    raise MirrorError(f"high mirror digest mismatch: {target}:{tag}")
-                print(f"pushed to target registry: {high}/{target}:{tag}@{image['transfer']}{moved}")
-                pushed.append({"target": target, "tag": tag, "digest": image["transfer"]})
-        if record:
-            record.write_text(json.dumps(json.loads(record.read_text()) + pushed, indent=2) + "\n")
-        save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
-                                    "digest": digest, "registry": high})
-    print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")
-
-
-def import_inbox(inbox, adopt_stream=False, record=None):
-    def consume(bundle):
-        import_one(bundle, adopt_stream, superseded_ok=True, record=record)
-        done = inbox / "done"
-        done.mkdir(exist_ok=True)
-        os.replace(bundle.with_name(bundle.name + ".sha256"), done / (bundle.name + ".sha256"))
-        os.replace(bundle, done / bundle.name)
-
-    waiting = []
-    for bundle in sorted(inbox.glob("mirror-*.tar")):
-        if not bundle.with_name(bundle.name + ".sha256").exists():
-            print(f"waiting for checksum: {bundle.name}")
-            continue
-        try:
-            consume(bundle)
-        except SequenceGap:
-            waiting.append(bundle)
-    # A later full bundle can bridge a gap without the operator deleting old inbox files.
-    for bundle in waiting:
-        consume(bundle)
-
-
-def import_registry(name=None, adopt_stream=False, record=None):
-    """Import bundles NiFi uploaded to IMPORT_STORE (the generic package registry or S3), oldest first.
-
-    name is the file a trigger announces. The receipt names the next sequence, so bundles
-    whose trigger never arrived are fetched too. A bundle missing either file waits.
-    """
-    cleanup = flag("IMPORT_DELETE_BUNDLES")
-    settings(("IMPORT_STORE", "bundles are read from this project's package registry (gitlab)", False),
-             ("MIRROR_LEDGER", "the receipt is kept only in IMPORT_STATE_DIR, which a CI job does not keep", False),
-             ("IMPORT_DELETE_BUNDLES", "imported bundles stay in the store", False),
-             ("PACKAGE_TOKEN", "the job token is used; GitLab refuses it a package delete", True),
-             ("IMPORT_PATH_REWRITE", "images land at the path the low side sent", False),
-             ("IMPORT_GAP_GRACE", "a later bundle waits 6 h for an earlier one before import fails", False))
-    if cleanup and not s3_enabled() and not os.environ.get("PACKAGE_TOKEN"):
-        # Checked before importing: a job token reads packages but GitLab refuses it a delete (HTTP 403).
-        raise MirrorError("IMPORT_DELETE_BUNDLES with the package registry needs PACKAGE_TOKEN "
-                          "(a project access token, role Maintainer, scope api)")
-    work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
-    downloads = work / "downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
-
-    removed = set()
-
-    def remove(stem, names=None):
-        if stem in removed:
-            return
-        removed.add(stem)
-        if not cleanup:
-            print(f"kept in the store: {stem} (IMPORT_DELETE_BUNDLES is not true)")
-            return
-        if names is None:  # a leftover: its checksum file says whether it came in parts
-            sidecar = store_get(BUNDLES, stem, f"{stem}.tar.sha256")
-            if sidecar is None:  # S3 reports success for a missing object, so ask first
-                print(f"nothing to delete in the store: {stem}")
-                return
-            fields = sidecar.decode().split()
-            count = int(fields[2]) if len(fields) == 3 and fields[2].isdigit() else 0
-            names = [f"{stem}.tar.part-{n:03d}" for n in range(1, count + 1)] or [f"{stem}.tar"]
-        if store_delete(BUNDLES, stem, [*names, f"{stem}.tar.sha256"]):
-            print(f"deleted from the store: {stem}")
-        else:
-            print(f"nothing to delete in the store: {stem}")
-
-    def consume(stem, quiet=False):
-        bundle = downloads / f"{stem}.tar"
-        sidecar = bundle.with_name(bundle.name + ".sha256")
-        if not store_get(BUNDLES, stem, sidecar.name, sidecar):
-            if not quiet:
-                print(f"waiting for {sidecar.name}")
-            return False
-        # NiFi writes "<sha256>  <bundle>.tar" and, for a bundle sent in parts, the number of parts.
-        fields = sidecar.read_text().split()
-        count = int(fields[2]) if len(fields) == 3 and fields[2].isdigit() else 0
-        names = [f"{bundle.name}.part-{n:03d}" for n in range(1, count + 1)] or [bundle.name]
-        unpack = None
-        if count:
-            missing = [name for name in names if not store_exists(BUNDLES, stem, name)]
-            if missing:
-                print(f"waiting for {', '.join(missing)} ({len(missing)} of {count} parts)")
-                return False
-
-            def unpack(stage):
-                with PartReader(lambda name, path: store_get(BUNDLES, stem, name, path), names, downloads) as reader:
-                    extract_stream(io.BufferedReader(reader, 8 * 1024 * 1024), stage)
-                print(f"read {count} parts of {bundle.name} in order, one on disk at a time")
-                return reader.digest.hexdigest()
-        elif not store_get(BUNDLES, stem, bundle.name, bundle):
-            if not quiet:
-                print(f"waiting for {bundle.name}")
-            return False
-        import_one(bundle, adopt_stream, superseded_ok=True, record=record, unpack=unpack)
-        for path in (bundle, sidecar):
-            path.unlink(missing_ok=True)
-        remove(stem, names)  # its images are in the target registry and the receipt has moved past it
-        return True
-
-    match = BUNDLE_NAME.fullmatch(name or "")
-    if name and not match:
-        raise MirrorError(f"{name!r} is not a bundle name")
-    receipt = load_receipt(work / "received.json")
-    # Catch up from the receipt, or on a first import from the start of the announced stream.
-    stream = receipt.get("stream") or (match[1].split("-")[1] if match else None)
-    if stream:
-        sequence = receipt.get("sequence", 0) + 1
-        while consume(f"mirror-{stream}-{sequence:012d}", quiet=True):
-            sequence += 1
-    if match:
-        current = load_receipt(work / "received.json")
-        stem_stream, stem_sequence = match[1].split("-")[1], int(match[1].split("-")[2])
-        if current.get("stream") == stem_stream and stem_sequence <= current.get("sequence", 0):
-            # Imported already, by an earlier trigger or the catch-up above; its files may be gone.
-            done = "already imported" if stem_sequence == current.get("sequence") else "superseded"
-            print(f"{done}: {match[1]}.tar")
-            if cleanup:  # left behind by a run that imported it without cleanup
-                remove(match[1])
-            else:
-                print(f"not checking the store for {match[1]}: IMPORT_DELETE_BUNDLES is not true")
-        else:
-            try:
-                consume(match[1])
-            except SequenceGap as gap:
-                # Bundles cross the link in any order. A later one waits in the store and the catch-up
-                # above imports it when the earlier one arrives; only a long wait means one was lost.
-                waited, grace = store_age(BUNDLES, match[1], f"{match[1]}.tar"), gap_grace()
-                if waited is None or waited >= grace:
-                    age = "for an unknown time" if waited is None else f"for {waited:.1f} h"
-                    raise SequenceGap(f"{gap} [{match[1]}.tar has waited {age}; IMPORT_GAP_GRACE is {grace:g} h]") \
-                        from None
-                raise GapWaiting(f"{match[1]}.tar is stored and imports when the earlier bundle arrives "
-                                 f"(waited {waited:.1f} h of IMPORT_GAP_GRACE {grace:g} h). If it never "
-                                 f"arrives: {gap}") from None
-
-
-def promote(record):
-    """Copy the images an import recorded from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod), by digest.
-
-    The digest is checked in dev before the copy and in prod after it, so prod holds the bytes
-    that were imported and approved, whatever the dev tags point at by now.
-    """
-    dev, prod = registry("SOURCE_REGISTRY"), registry("TARGET_REGISTRY")
-    settings(("PROMOTE_PATH_REWRITE", "images keep their dev path in prod", False))
-    if dev == prod:
-        raise MirrorError("SOURCE_REGISTRY and TARGET_REGISTRY are the same registry; nothing to promote")
-    images = {}
-    for entry in json.loads(record.read_text()):
-        if (not isinstance(entry, dict) or not TARGET.fullmatch(str(entry.get("target")))
-                or not re.fullmatch(TAG, str(entry.get("tag"))) or not re.fullmatch(DIGEST, str(entry.get("digest")))):
-            raise MirrorError(f"{record}: invalid entry {entry!r}")
-        images[f"{entry['target']}:{entry['tag']}"] = entry  # a later bundle's digest for the same tag wins
-    if not images:
-        print(f"nothing to promote: {record} lists no images")
-        return
-    for key, entry in images.items():
-        source = f"docker://{dev}/{entry['target']}@{entry['digest']}"
-        if raw_digest(source, "SOURCE_REGISTRY") != entry["digest"]:
-            raise MirrorError(f"digest mismatch in SOURCE_REGISTRY: {dev}/{entry['target']}@{entry['digest']}")
-        key = f"{rewrite(entry['target'], 'PROMOTE_PATH_REWRITE')}:{entry['tag']}"
-        destination = f"docker://{prod}/{key}"
-        copy(source, destination, "SOURCE_REGISTRY", "TARGET_REGISTRY")
-        if raw_digest(destination, "TARGET_REGISTRY") != entry["digest"]:
-            raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the copy: {prod}/{key}")
-        print(f"promoted: {dev}/{entry['target']}@{entry['digest']} -> {prod}/{key}")
-    print(f"promoted {len(images)} image tag(s) from {dev} to {prod}, digests verified")
-
-
-EXPORT_INDEX = "export.json"
-REFERENCE = re.compile(rf"(?:(?P<host>{HOST})/)?(?P<repo>[a-z0-9._/-]+?)(?::(?P<tag>{TAG}))?")
-
-
-@contextmanager
-def scratch(directory):
-    """TMPDIR for the skopeo calls inside the block only; the setting before it comes back after."""
-    before = os.environ.get("TMPDIR")
-    os.environ["TMPDIR"] = str(directory)
-    try:
-        yield
-    finally:
-        if before is None:
-            os.environ.pop("TMPDIR", None)
-        else:
-            os.environ["TMPDIR"] = before
-
-
-def paths(**where):
-    """Print every directory a command will write to, so nothing lands anywhere unannounced."""
-    for name, value in where.items():
-        print(f"{name.replace('_', ' ')}: {Path(value).resolve()}")
 
 
 def export_tags(entry):
@@ -1801,159 +653,285 @@ def share_blobs(layout, seen):
             os.replace(link, path)
 
 
-def export(path, entries, out=None, tar=None, listing=None, tmp=None, staging=None):
-    """Copy images into one tar (and its .sha256) for hand-carry, one dir: copy per image, bytes and digests
-    unchanged. The images are first copied into a working directory in staging (default the current
-    directory), which is removed once the tar is written, or on failure. out instead keeps an unpacked export.
+@contextmanager
+def staging_dir(near, override=None):
+    """A fresh working directory, removed afterwards whatever happens. It is made in override
+    (--staging-dir or MIRROR_STAGING_DIR), else beside near, so it is on the disk that needs the space.
+    skopeo's own scratch (TMPDIR) goes in it too, never the system /tmp."""
+    parent = Path(override or os.environ.get("MIRROR_STAGING_DIR") or near)
+    parent.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix=".mirror-staging-", dir=parent))
+    before = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = str(directory)
+    print(f"staging: {directory} (removed when done)")
+    try:
+        yield directory
+    finally:
+        if before is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = before
+        shutil.rmtree(directory, ignore_errors=True)
 
-    Reads registries only: run sync first. Nothing is recorded, so an export never touches the ledger.
-    dir: keeps a Docker manifest list as it is, where an OCI layout would have to convert it. A layer
-    shared by several images is hardlinked, so it is stored once. load pushes the export on the far side.
-    """
+
+def wanted_images(path, ledger_file, entries, listing, everything):
+    """What export copies: the named references, else every catalog image (all), else every catalog
+    image sync has put in TARGET_REGISTRY and send has not delivered at that digest."""
     entries = list(entries)
     if listing:
         entries += [line.split("#", 1)[0].strip() for line in Path(listing).read_text().splitlines()]
         entries = [entry for entry in entries if entry]
     if entries:
-        wanted = [found for entry in entries for found in export_tags(entry)]
-    else:
-        low = registry("TARGET_REGISTRY")
-        wanted = [(low, image["target"], image["tag"]) for image in catalog(path)]
-    if not wanted:
-        raise MirrorError("nothing to export")
-    if not (out or tar):
-        raise MirrorError("say where the export goes: --tar FILE, or --out DIR to keep it unpacked")
-    if out and (tar or staging):
-        raise MirrorError("--out keeps an unpacked export in that directory; it takes no --tar or --staging")
-    working = not out  # a directory only for building the tar, removed afterwards
-    tar = Path(tar) if tar else None
-    layout = Path(out) if out else Path(staging or ".") / f"{tar.name}.export"
-    if layout.exists() and any(layout.iterdir()):
-        raise MirrorError(f"{layout} is not empty; choose an empty directory")
-    if tar and any(tar.with_name(tar.name + suffix).exists() for suffix in ("", ".sha256", ".tmp", ".sha256.tmp")):
-        raise MirrorError(f"{tar}, its .sha256 or a .tmp of either already exists; choose another name")
-    # skopeo's scratch: --tmp, else --state-dir, else beside the working directory; never the system TMPDIR.
-    tmp = Path(tmp or os.environ.get("MIRROR_SCRATCH") or layout.parent)
-    try:
-        layout.mkdir(parents=True, exist_ok=True)
-        tmp.mkdir(parents=True, exist_ok=True)
-        paths(**({"export_tar": tar} if tar else {}),
-              **({"working_directory_removed_after": layout} if working else {"export_directory": layout}),
-              skopeo_scratch=tmp)
-        images, seen = [], {}
-        for number, (host, repository, tag) in enumerate(dict.fromkeys(wanted), 1):
-            side = side_of(host)
-            digest = raw_digest(f"docker://{host}/{repository}:{tag}", side)
-            name = f"{number:06d}"
-            with scratch(tmp):
-                copy(f"docker://{host}/{repository}@{digest}", f"dir:{layout / name}", side)
-            if "sha256:" + sha256(layout / name / "manifest.json") != digest:
-                raise MirrorError(f"digest changed in export: {host}/{repository}:{tag}")
-            share_blobs(layout, seen)
-            images.append({"dir": name, "source": f"{host}/{repository}:{tag}", "target": repository, "tag": tag,
-                           "digest": digest})
-            print(f"exported: {host}/{repository}:{tag}@{digest}")
-        write_json(layout / EXPORT_INDEX, {"created": datetime.now(timezone.utc).isoformat(), "images": images})
-        if tar:
-            tar.parent.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(tar.with_name(tar.name + ".tmp"), "w") as stream:  # layers are compressed already
-                stream.add(layout, arcname=".")
-            os.replace(tar.with_name(tar.name + ".tmp"), tar)
-            sidecar = tar.with_name(tar.name + ".sha256")
-            sidecar.with_name(sidecar.name + ".tmp").write_text(f"{sha256(tar)}  {tar.name}\n")
-            os.replace(sidecar.with_name(sidecar.name + ".tmp"), sidecar)
-    finally:
-        if tar:
-            for partial in (tar.with_name(tar.name + ".tmp"), tar.with_name(tar.name + ".sha256.tmp")):
-                partial.unlink(missing_ok=True)
-        if working:
-            shutil.rmtree(layout, ignore_errors=True)
-    if tar:
-        print(f"wrote {tar} and {tar.name}.sha256 ({len(images)} image tag(s))")
-    else:
-        print(f"exported {len(images)} image tag(s) to {layout}")
+        return [found for entry in entries for found in export_tags(entry)]
+    low = registry("TARGET_REGISTRY")
+    ledger = load_ledger(ledger_file, low)
+    synced, sent = ledger["synced"], ledger["sent"]
+    found = []
+    for image in catalog(path):
+        record = synced.get(f"{image['target']}:{image['tag']}")
+        if not record or record.get("pin") != pin(image):
+            how = ("the pipeline has not synced it at this digest; name it to export it anyway"
+                   if isinstance(ledger_file, str) else "run sync first")
+            print(f"not synced yet, {how}: {image['target']}:{image['tag']}")
+            continue
+        if everything or sent.get(f"{image['target']}:{image['tag']}") != record["digest"]:
+            found += [(low, image["target"], tag) for tag in record["tags"]]
+    return found
 
 
-def carry(path, target, full=False, staging=None):
-    """sync --low-only, then export what has not been carried yet as one tar into target, for NiFi.
+def export(path, ledger_file, entries=(), listing=None, everything=False, output=None, max_size=None,
+           staging=None, base=None):
+    """Copy images out of a registry into tar files, each with a .sha256 beside it. Bytes and digests are
+    unchanged: every image is a skopeo dir: copy, which keeps a Docker manifest list as it is.
 
-    The tar is built in target/.staging and renamed into target, then its .sha256: a lister of target
-    never sees half a file. The ledger records an image as carried only once both are in place, so a
-    run that fails anywhere carries it again next time. full: every catalog image.
+    Reads registries only and changes nothing: send records what was delivered. Returns the tars written.
     """
-    target = Path(target)
-    if not target.is_dir():  # a share that is not mounted must not turn into a local directory
-        raise MirrorError(f"{target} does not exist; mount or create it first")
-    staging = Path(staging or target / ".staging")
-    staging.mkdir(parents=True, exist_ok=True)
-    paths(work_and_ledger=state_path("MIRROR_STATE_DIR", "registry-mirror"), staging=staging, delivered_to=target)
-    if os.stat(staging).st_dev != os.stat(target).st_dev:
-        raise MirrorError(f"{staging} is on another filesystem than {target}, so the move would not be atomic")
-    sync(path, low_only=True)
-    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
-    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
-    state_file = work / "sent.json"
-    state = load_state(state_file) or {}
-    carried = state.get("carried", {})
-    due = [image for image in catalog(path)
-           if full or carried.get(f"{image['target']}:{image['tag']}") != f"{image['digest']} {platform}".strip()]
-    if not due:
-        print("nothing new to carry")
-        return None
-    name = f"mirror-export-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{os.environ.get('CI_PIPELINE_ID', 'local')}"
-    tar, published = staging / f"{name}.tar", []
-    if any((target / f"{name}.tar{suffix}").exists() for suffix in ("", ".sha256")):
-        raise MirrorError(f"{target / name}.tar already exists; run carry again in a second")
+    wanted = wanted_images(path, ledger_file, entries, listing, everything)
+    if not wanted:
+        print("nothing new to export")
+        return []
+    output = Path(output or datetime.now(timezone.utc).strftime("mirror-export-%Y%m%dT%H%M%SZ.tar"))
+    if output.suffix != ".tar":
+        raise MirrorError(f"{output}: the output must end in .tar")
+    images = []
+    for host, repository, tag in dict.fromkeys(wanted):
+        digest = raw_digest(f"docker://{host}/{repository}:{tag}", side_of(host))
+        images.append({"host": host, "repo": repository, "tag": tag, "digest": digest})
+    batches = groups(images, size(max_size) if max_size else None)
+    names = [output] if len(batches) == 1 else [
+        output.with_name(f"{output.stem}-{n:03d}-of-{len(batches):03d}.tar") for n in range(1, len(batches) + 1)]
+    for name in names:
+        if name.exists() or name.with_name(name.name + ".sha256").exists():
+            raise MirrorError(f"{name} or its .sha256 already exists; choose another --output")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    for name, batch in zip(names, batches):
+        write_export(name, batch, staging, base)
+    return names
+
+
+def write_export(tar, images, staging, base):
+    """One tar: export.json plus one numbered dir: copy per image. The tar is built in staging and moved
+    into place, then its .sha256, so a reader of the output directory never sees half a file."""
+    with staging_dir(tar.parent, staging) as work:
+        layout = work / "export"
+        layout.mkdir()
+        entries, seen = [], {}
+        for number, image in enumerate(images, 1):
+            name = f"{number:06d}"
+            copy(f"docker://{image['host']}/{image['repo']}@{image['digest']}", f"dir:{layout / name}",
+                 side_of(image["host"]))
+            if "sha256:" + sha256(layout / name / "manifest.json") != image["digest"]:
+                raise MirrorError(f"digest changed during export: {image['host']}/{image['repo']}:{image['tag']}")
+            share_blobs(layout, seen)
+            target = rebase(image["repo"], base)
+            entries.append({"dir": name, "source": f"{image['host']}/{image['repo']}:{image['tag']}",
+                            "target": target, "tag": image["tag"], "digest": image["digest"]})
+            print(f"exported: {image['host']}/{image['repo']}:{image['tag']}@{image['digest']}"
+                  + (f" as {target}" if target != image["repo"] else ""))
+        write_json(layout / EXPORT_INDEX, {"created": datetime.now(timezone.utc).isoformat(), "images": entries})
+        built = work / tar.name
+        with tarfile.open(built, "w") as stream:  # uncompressed: layers are compressed already
+            stream.add(layout, arcname=".")
+        checksum = sha256(built)
+        sidecar = work / (tar.name + ".sha256")
+        sidecar.write_text(f"{checksum}  {tar.name}\n")
+        shutil.move(built, tar.with_name(tar.name + ".partial"))
+        os.replace(tar.with_name(tar.name + ".partial"), tar)
+        shutil.move(sidecar, tar.with_name(sidecar.name + ".partial"))
+        os.replace(tar.with_name(sidecar.name + ".partial"), tar.with_name(sidecar.name))
+    print(f"wrote {tar} and {tar.name}.sha256 ({len(entries)} image tag(s), {tar.stat().st_size} bytes)")
+
+
+def checked(tar):
+    """tar's sha256, after checking it against the .sha256 beside it."""
+    sidecar = tar.with_name(tar.name + ".sha256")
+    if not sidecar.exists():
+        raise MirrorError(f"{sidecar.name} is missing; it must travel with {tar.name}")
+    digest = sha256(tar)
+    if (sidecar.read_text().split() or [""])[0] != digest:
+        raise MirrorError(f"{tar.name} does not match {sidecar.name}")
+    return digest
+
+
+def read_index(tar):
+    """export.json from a tar, without unpacking the images."""
+    with tarfile.open(tar, "r:") as stream:
+        for member in stream:
+            if member.name.lstrip("./") == EXPORT_INDEX and member.isfile():
+                index = json.loads(stream.extractfile(member).read())
+                if not isinstance(index, dict) or not isinstance(index.get("images"), list):
+                    raise MirrorError(f"{tar.name}: invalid {EXPORT_INDEX}")
+                return index
+    raise MirrorError(f"{tar.name} holds no {EXPORT_INDEX}; is it a mirror.py export?")
+
+
+def s3_settings(bucket=None):
+    """The bucket send and import use: --s3-bucket or S3_BUCKET, at S3_ENDPOINT with the AWS_* keys."""
+    settings = {"endpoint": os.environ.get("S3_ENDPOINT", "").rstrip("/"), "bucket": bucket or os.environ.get("S3_BUCKET", ""),
+                "access": os.environ.get("AWS_ACCESS_KEY_ID", ""), "secret": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                "region": os.environ.get("S3_REGION") or "us-east-1", "prefix": os.environ.get("S3_PREFIX", "").strip("/")}
+    if not all(settings[k] for k in ("endpoint", "bucket", "access", "secret")):
+        raise MirrorError("S3 needs S3_ENDPOINT, a bucket (--s3-bucket or S3_BUCKET), AWS_ACCESS_KEY_ID and "
+                          "AWS_SECRET_ACCESS_KEY")
+    return settings
+
+
+def s3_request(s3, method, key="", data=None, length=None, query=None):
+    """One path-style request to an S3-compatible store, signed with AWS Signature Version 4. A file-like
+    data needs its length, or urllib would send it chunked, which S3 refuses."""
+    path = f"/{urllib.parse.quote(s3['bucket'])}" + (f"/{urllib.parse.quote(key)}" if key else "")
+    canonical_query = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
+                               for k, v in sorted((query or {}).items()))
+    url = s3["endpoint"] + path + (f"?{canonical_query}" if canonical_query else "")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    headers = {"host": urllib.parse.urlsplit(url).netloc, "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+               "x-amz-date": stamp}
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join([method, urllib.parse.urlsplit(url).path, canonical_query,
+                           *(f"{name}:{headers[name]}" for name in sorted(headers)), "", signed, "UNSIGNED-PAYLOAD"])
+    scope = f"{stamp[:8]}/{s3['region']}/s3/aws4_request"
+    signing = ("AWS4" + s3["secret"]).encode()
+    for part in (stamp[:8], s3["region"], "s3", "aws4_request"):
+        signing = hmac.new(signing, part.encode(), hashlib.sha256).digest()
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={s3['access']}/{scope}, SignedHeaders={signed}, "
+                                f"Signature={hmac.new(signing, to_sign.encode(), hashlib.sha256).hexdigest()}")
+    del headers["host"]  # urllib sends the same value
+    if length is not None:
+        headers["Content-Length"] = str(length)
+    context = tls_context(os.environ.get("S3_CA_BUNDLE"), os.environ.get("S3_TLS_VERIFY") != "false")
+    say(f"+ {method} {url}")
     try:
-        export(path, [f"{image['target']}:{image['tag']}" for image in due], tar=tar, staging=staging)
-        for built in (tar, tar.with_name(tar.name + ".sha256")):  # the .sha256 last
-            os.replace(built, target / built.name)
-            published.append(target / built.name)
-    finally:
-        for leftover in staging.glob(f"{name}.tar*"):
-            if leftover.is_dir():
-                shutil.rmtree(leftover, ignore_errors=True)
+        return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers),
+                                      timeout=3600, context=context)
+    except urllib.error.HTTPError as error:
+        raise MirrorError(f"S3 {method} {s3['bucket']}/{key}: HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"S3 {method} {s3['bucket']}/{key}: {error.reason}") from error
+
+
+def s3_key(s3, name):
+    return f"{s3['prefix']}/{name}" if s3["prefix"] else name
+
+
+def s3_list(s3):
+    """Every key in the bucket under S3_PREFIX."""
+    keys, token = [], None
+    while True:
+        query = {"list-type": "2", **({"prefix": s3["prefix"] + "/"} if s3["prefix"] else {}),
+                 **({"continuation-token": token} if token else {})}
+        with s3_request(s3, "GET", query=query) as response:
+            root = ElementTree.fromstring(response.read())
+        space = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+        keys += [item.findtext(f"{space}Key") for item in root.iter(f"{space}Contents")]
+        token = root.findtext(f"{space}NextContinuationToken")
+        if root.findtext(f"{space}IsTruncated") != "true" or not token:
+            return keys
+
+
+def post_file(path, checksum, url):
+    """POST one file to a NiFi ListenHTTP, streamed, with its name and sha256 as headers."""
+    parts = urllib.parse.urlsplit(url)
+    shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
+    file_size = path.stat().st_size
+    # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break a case-sensitive
+    # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
+    # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
+    # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
+    headers = ["Expect:", f"Filename: {path.name}", "Content-Type: application/octet-stream",
+               f"X-Sha256: {checksum}", "X-Artifact-Type: container-images", "X-Artifact-Format: tar"]
+    status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
+                 "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
+                 "--output", "/dev/null", "--write-out", "%{http_code}",
+                 *[item for header in headers for item in ("--header", header)], "--upload-file", str(path), url)
+    print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes)")
+
+
+def copy_file(path, directory):
+    """Copy under a .partial name, then rename, so a reader of the directory never sees half a file."""
+    partial = directory / (path.name + ".partial")
+    shutil.copyfile(path, partial)
+    os.replace(partial, directory / path.name)
+
+
+def send(tars, ledger_file, nifi_url=None, s3_bucket=None, directory=None):
+    """Deliver each tar, then its .sha256, to one place: a NiFi ListenHTTP, an S3 bucket or a directory
+    (an NFS share, a USB stick). Once a tar is delivered its images count as sent in the ledger."""
+    if sum(bool(where) for where in (nifi_url, s3_bucket, directory)) != 1:
+        raise MirrorError("send needs exactly one of --nifi-url, --s3-bucket or --path")
+    s3 = s3_settings(s3_bucket) if s3_bucket else None
+    if directory and not Path(directory).is_dir():  # a share that is not mounted must not turn into a local directory
+        raise MirrorError(f"{directory} does not exist; mount or create it first")
+    digests = {Path(tar): checked(Path(tar)) for tar in tars}  # every tar is checked before the first is sent
+    for tar, digest in digests.items():
+        sidecar = tar.with_name(tar.name + ".sha256")
+        for path in (tar, sidecar):  # the .sha256 last: a tar is complete once its checksum is there
+            if nifi_url:
+                post_file(path, digest if path is tar else sha256(sidecar), nifi_url)
+            elif s3:
+                with path.open("rb") as stream:
+                    s3_request(s3, "PUT", s3_key(s3, path.name), stream, path.stat().st_size).close()
+                print(f"uploaded: {path.name} -> s3 {s3['bucket']}/{s3_key(s3, path.name)}")
             else:
-                leftover.unlink(missing_ok=True)
-        if len(published) == 1:  # a tar without its .sha256 would never be loaded: take it back
-            published[0].unlink()
-    with locked(work):
-        state = load_state(state_file) or state
-        state.setdefault("carried", {}).update(
-            {f"{image['target']}:{image['tag']}": f"{image['digest']} {platform}".strip() for image in due})
-        save_state(state_file, state)
-    print(f"carried: {target / tar.name} ({len(due)} image tag(s))")
-    return target / tar.name
+                copy_file(path, Path(directory))
+                print(f"copied: {path.name} -> {directory}")
+        record_sent(tar, ledger_file)
+        print(f"sent: {tar.name}")
 
 
-def load(source, force=False, scratch=None):
-    """Push an export (its directory, or the .tar with its .sha256 beside it) into TARGET_REGISTRY."""
+def record_sent(tar, ledger_file):
+    """Mark the images of a delivered tar as sent, when the ledger belongs to the registry they came from."""
+    index = read_index(tar)
+    low = os.environ.get("TARGET_REGISTRY", "").strip().rstrip("/")
+    ledger = load_ledger(ledger_file, low, create=False) if low else None
+    if ledger is None:
+        print(f"not recorded: no ledger for {low or 'TARGET_REGISTRY (unset)'}")
+        return
+    hosts = [image.get("source", "").split("/", 1)[0] for image in index["images"]]
+    sent = {image["source"].split("/", 1)[1]: image["digest"] for image, host in zip(index["images"], hosts) if host == low}
+    if sent:
+        ledger["sent"].update(sent)
+        if save_ledger(ledger_file, ledger):
+            print(f"ledger: {len(sent)} image tag(s) recorded as sent")
+        else:
+            print("ledger: read only, the pipeline's ledger is unchanged")
+
+
+def import_tar(tar, staging=None, force=False, base=None, record=None):
+    """Push every image in an export tar into TARGET_REGISTRY, tags and digests unchanged. Every image is
+    checked before the first push, so a refusal pushes nothing. A tag already at its digest is skipped."""
     high = registry("TARGET_REGISTRY")
-    source = Path(source)
-    if not source.is_dir():
-        sidecar = source.with_name(source.name + ".sha256")
-        if not sidecar.exists():
-            raise MirrorError(f"{sidecar.name} is missing; it must travel with {source.name}")
-        if (sidecar.read_text().split() or [""])[0] != sha256(source):
-            raise MirrorError(f"{source.name} does not match {sidecar.name}")
-    # A tar unpacks beside it, or into --state-dir: never the home directory.
-    scratch = Path(scratch or os.environ.get("IMPORT_STATE_DIR") or source.parent)
-    scratch.mkdir(parents=True, exist_ok=True)
-    if not source.is_dir():
-        paths(unpack_into=scratch)
-    with nullcontext() if source.is_dir() else tempfile.TemporaryDirectory(dir=scratch) as temporary:
-        layout = source
-        if not source.is_dir():
-            layout = Path(temporary)
-            if not hasattr(tarfile, "data_filter"):
-                raise MirrorError("load needs Python 3.12, or 3.8.17 to 3.11.4 or later, for safe tar extraction")
-            with tarfile.open(source, "r:") as stream:  # uncompressed only: the tar's size bounds what unpacks
-                stream.extractall(layout, filter="data")
+    checked(tar)
+    if not hasattr(tarfile, "data_filter"):
+        raise MirrorError("import needs Python 3.12, or 3.8.17 to 3.11.4 or later, for safe tar extraction")
+    with staging_dir(tar.parent, staging) as layout:
+        with tarfile.open(tar, "r:") as stream:  # uncompressed only: the tar's size bounds what unpacks
+            stream.extractall(layout, filter="data")
         index = json.loads((layout / EXPORT_INDEX).read_text())
         if not isinstance(index, dict) or not isinstance(index.get("images"), list):
             raise MirrorError(f"invalid {EXPORT_INDEX}")
         plan = []
-        for image in index["images"]:  # every image is checked before the first push: a refusal pushes nothing
+        for image in index["images"]:
             if (not isinstance(image, dict) or not re.fullmatch(r"[0-9]{6}", str(image.get("dir")))
                     or not TARGET.fullmatch(str(image.get("target"))) or not re.fullmatch(TAG, str(image.get("tag")))
                     or not re.fullmatch(DIGEST, str(image.get("digest")))):
@@ -1961,37 +939,97 @@ def load(source, force=False, scratch=None):
             directory = layout / image["dir"]
             if "sha256:" + sha256(directory / "manifest.json") != image["digest"]:
                 raise MirrorError(f"{image['target']}:{image['tag']} does not match its recorded digest")
-            destination = f"docker://{high}/{image['target']}:{image['tag']}"
-            try:
-                present = raw_digest(destination, "TARGET_REGISTRY")
-            except MirrorError as error:
-                if not re.search(r"manifest unknown|name unknown", str(error), re.I):
-                    raise  # a login, TLS or network fault is not proof the tag is absent
-                present = None
+            target = rebase(image["target"], base)
+            destination = f"docker://{high}/{target}:{image['tag']}"
+            present = present_digest(destination, "TARGET_REGISTRY")
             if present and present != image["digest"] and not force:
-                raise MirrorError(f"{high}/{image['target']}:{image['tag']} is {present}, the export has "
-                                  f"{image['digest']}; a tag does not move without load --force")
-            plan.append((image, directory, destination, present))
-        for image, directory, destination, present in plan:
+                raise MirrorError(f"{high}/{target}:{image['tag']} is {present}, the tar has {image['digest']}; "
+                                  "a tag does not move without --force")
+            plan.append((image, directory, target, destination, present))
+        for image, directory, target, destination, present in plan:
             if present == image["digest"]:
-                print(f"already loaded: {high}/{image['target']}:{image['tag']}@{present}")
+                print(f"already there: {high}/{target}:{image['tag']}@{present}")
+            else:
+                copy(f"dir:{directory}", destination, None, "TARGET_REGISTRY")
+                if raw_digest(destination, "TARGET_REGISTRY") != image["digest"]:
+                    raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the push: {target}:{image['tag']}")
+                print(f"imported: {high}/{target}:{image['tag']}@{image['digest']}")
+            if record:
+                entries = json.loads(record.read_text()) if record.exists() else []
+                record.write_text(json.dumps(entries + [{"target": target, "tag": image["tag"],
+                                                         "digest": image["digest"]}], indent=2) + "\n")
+    print(f"{tar.name}: {len(plan)} image tag(s) in {high}, digests verified")
+
+
+def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, record=None, keep=False):
+    """Import tar files, every tar in a directory, or every tar in an S3 bucket. A directory or a bucket is
+    an inbox: each tar it held is removed once imported, unless keep. A tar named on its own is kept."""
+    done = 0
+    for source in map(Path, sources):
+        if source.is_dir():
+            for tar in sorted(source.glob("*.tar")):
+                if not tar.with_name(tar.name + ".sha256").exists():
+                    print(f"waiting for {tar.name}.sha256; skipped")
+                    continue
+                import_tar(tar, staging, force, base, record)
+                done += 1
+                if not keep:
+                    tar.unlink()  # the tar first: a .sha256 left alone is never listed
+                    tar.with_name(tar.name + ".sha256").unlink()
+                    print(f"removed from {source}: {tar.name}")
+        else:
+            import_tar(source, staging, force, base, record)
+            done += 1
+    if s3_bucket:
+        s3 = s3_settings(s3_bucket)
+        keys = set(s3_list(s3))
+        for key in sorted(k for k in keys if k.endswith(".tar")):
+            if key + ".sha256" not in keys:
+                print(f"waiting for {key}.sha256; skipped")
                 continue
-            copy(f"dir:{directory}", destination, None, "TARGET_REGISTRY")
-            if raw_digest(destination, "TARGET_REGISTRY") != image["digest"]:
-                raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the push: {image['target']}:{image['tag']}")
-            print(f"loaded: {high}/{image['target']}:{image['tag']}@{image['digest']}")
-    print(f"loaded {len(index['images'])} image tag(s) into {high}, digests verified")
+            with staging_dir(".", staging) as download:
+                tar = download / key.rsplit("/", 1)[-1]
+                for name, local in ((key, tar), (key + ".sha256", tar.with_name(tar.name + ".sha256"))):
+                    with s3_request(s3, "GET", name) as response, local.open("wb") as stream:
+                        shutil.copyfileobj(response, stream, 8 * 1024 * 1024)
+                import_tar(tar, download, force, base, record)
+            done += 1
+            if not keep:
+                for name in (key, key + ".sha256"):
+                    s3_request(s3, "DELETE", name).close()
+                print(f"removed from s3 {s3['bucket']}: {key}")
+    print(f"imported {done} tar(s)" if done else "nothing to import")
 
 
-def pending(path, synced=False, targets=False, carried=False):
-    """Catalog entries the ledger has not sent at their current digest and platform: what sync sends next.
-    synced: not yet in TARGET_REGISTRY instead, for a pipeline that runs sync --low-only (MIRROR_SEND=none)."""
-    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
-    state = load_state(state_path("MIRROR_STATE_DIR", "registry-mirror") / "sent.json")
-    sent = (state or {}).get("carried" if carried else "synced" if synced else "sent", {})
-    for image in catalog(path):
-        if sent.get(f"{image['target']}:{image['tag']}") != f"{image['digest']} {platform}".strip():
-            print(f"{image['target']}:{image['tag']}" if targets else image["source"])
+def promote(record, base=None):
+    """Copy the images an import recorded from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod), by digest.
+
+    The digest is checked in dev before the copy and in prod after it, so prod holds the bytes
+    that were imported and approved, whatever the dev tags point at by now.
+    """
+    dev, prod = registry("SOURCE_REGISTRY"), registry("TARGET_REGISTRY")
+    if dev == prod:
+        raise MirrorError("SOURCE_REGISTRY and TARGET_REGISTRY are the same registry; nothing to promote")
+    images = {}
+    for entry in json.loads(record.read_text()):
+        if (not isinstance(entry, dict) or not TARGET.fullmatch(str(entry.get("target")))
+                or not re.fullmatch(TAG, str(entry.get("tag"))) or not re.fullmatch(DIGEST, str(entry.get("digest")))):
+            raise MirrorError(f"{record}: invalid entry {entry!r}")
+        images[f"{entry['target']}:{entry['tag']}"] = entry  # a later import's digest for the same tag wins
+    if not images:
+        print(f"nothing to promote: {record} lists no images")
+        return
+    for entry in images.values():
+        source = f"docker://{dev}/{entry['target']}@{entry['digest']}"
+        if raw_digest(source, "SOURCE_REGISTRY") != entry["digest"]:
+            raise MirrorError(f"digest mismatch in SOURCE_REGISTRY: {dev}/{entry['target']}@{entry['digest']}")
+        key = f"{rebase(entry['target'], base)}:{entry['tag']}"
+        destination = f"docker://{prod}/{key}"
+        copy(source, destination, "SOURCE_REGISTRY", "TARGET_REGISTRY")
+        if raw_digest(destination, "TARGET_REGISTRY") != entry["digest"]:
+            raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the copy: {prod}/{key}")
+        print(f"promoted: {dev}/{entry['target']}@{entry['digest']} -> {prod}/{key}")
+    print(f"promoted {len(images)} image tag(s) from {dev} to {prod}, digests verified")
 
 
 def references(files):
@@ -2016,16 +1054,12 @@ def references(files):
 
 
 def covers(path, files):
-    """Fail when a referenced image is neither in the catalog nor ever sent, by source or target name."""
-    images = catalog(path)
-    if ledger_enabled():
-        state = load_state(Path(os.devnull))
-        images += [i for r in ledger_records(state["sequence"] if state else 0) for i in r["images"]]
+    """Fail when a referenced image is not in the catalog, by source or target name."""
     names, targets, digests = set(), set(), set()
-    for image in images:
+    for image in catalog(path):
         names.add(image["source"].split("@")[0])
-        targets.update(f"{image['target']}:{tag}" for tag in image.get("tags", [image["tag"]]))
-        digests.update({image["digest"], image.get("transfer", image["digest"])})
+        targets.add(f"{image['target']}:{image['tag']}")
+        digests.add(image["digest"])
     missing = 0
     for reference, where in references(files):
         if "$" in reference:
@@ -2044,7 +1078,7 @@ def covers(path, files):
     print("every image is in the mirror catalog")
 
 
-# Hard cutover from the product-named variables; each maps to exactly one new name.
+# Variables an older release read. Each set one fails with what replaces it, so nothing changes silently.
 RENAMED = {
     "LOW_QUAY_HOST": "TARGET_REGISTRY", "HIGH_QUAY_HOST": "TARGET_REGISTRY",
     "LOW_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME", "HIGH_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME",
@@ -2052,25 +1086,26 @@ RENAMED = {
     "LOW_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY", "HIGH_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY",
     "UPSTREAM_REGISTRY": "SOURCE_REGISTRY", "UPSTREAM_USERNAME": "SOURCE_REGISTRY_USERNAME",
     "UPSTREAM_PASSWORD": "SOURCE_REGISTRY_PASSWORD", "UPSTREAM_TLS_VERIFY": "SOURCE_REGISTRY_TLS_VERIFY",
-    "EXPORT_SINCE": "RESEND_SINCE", "EXPORT_SEQUENCE": "RESEND_SEQUENCE", "EXPORT_IMAGE": "RESEND_IMAGE",
-    "MIRROR_FULL": "RESEND_ALL", "MIRROR_DROP": "mirror.py send dir --path DIR or send s3",
+    "MIRROR_SEND": "NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH (whichever is set says where the pipeline sends)",
+    "MIRROR_BUNDLE_MAX_SIZE": "MIRROR_MAX_SIZE (export --max-size)",
+    "MIRROR_STAGING_PATH": "MIRROR_STAGING_DIR", "MIRROR_STATE_DIR": "MIRROR_STAGING_DIR",
+    "IMPORT_STATE_DIR": "MIRROR_STAGING_DIR", "MIRROR_SCRATCH": "MIRROR_STAGING_DIR",
+    "IMPORT_PATH_REWRITE": "MIRROR_REWRITE_BASE_PATH (the new first path segment only)",
+    "PROMOTE_PATH_REWRITE": "MIRROR_REWRITE_BASE_PATH (the new first path segment only)",
+    "RESEND_ALL": "EXPORT_ALL", "RESEND_SINCE": "EXPORT_IMAGES (export names the images to send again)",
+    "RESEND_SEQUENCE": "EXPORT_IMAGES (export names the images to send again)",
+    "RESEND_IMAGE": "EXPORT_IMAGES (export names the images to send again)",
+    "MIRROR_BUNDLE_DIR": "export --output", "MIRROR_BLOB_DELTA": "nothing: tars carry whole images",
+    "IMPORT_STORE": "import DIR or import --s3-bucket", "IMPORT_INBOX_DIR": "import DIR",
+    "IMPORT_GAP_GRACE": "nothing: import is idempotent and has no sequence",
+    "IMPORT_DELETE_BUNDLES": "nothing: import removes what it imported from a directory or bucket (--keep)",
 }
 
 
-def send_arguments(where, path, bucket):
-    """[method] [outbox]: the method may be left out when --path (dir) or --bucket (s3) says which."""
-    where = list(where)
-    method = where.pop(0) if where and where[0] in ("nifi", "dir", "s3") else \
-        "dir" if path else "s3" if bucket else "nifi"
-    if len(where) > 1:
-        raise MirrorError(f"send takes [method] [outbox], not {' '.join(where)}")
-    return method, (where[0] if where else None)
-
-
 def check_renamed():
-    stale = sorted(f"{old} is now {new}" for old, new in RENAMED.items() if os.environ.get(old))
+    stale = sorted(f"{old} is replaced by {new}" for old, new in RENAMED.items() if os.environ.get(old, "").strip())
     if stale:
-        raise MirrorError("renamed variables are set; rename them: " + "; ".join(stale))
+        raise MirrorError("unset these variables from an older release: " + "; ".join(stale))
 
 
 def login():
@@ -2092,29 +1127,18 @@ def login():
 
 
 EXAMPLES = """
-Low side (pull from the source, save to your registry, send bundles):
-  TARGET_REGISTRY=registry.low.example.com mirror.py login
-  mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
-  mirror.py add-list lists/ --prefix team   # every image in lists/*.txt
-  mirror.py sync --out outbox         # mirror into TARGET_REGISTRY, write changed images as bundles
-  mirror.py send nifi --url https://nifi.low:9443/contentListener outbox   # or NIFI_URL
-  mirror.py send dir --path /mnt/transfer outbox        # .ffv3 files for a low NiFi ListFile
-  mirror.py send s3 --bucket transfer --prefix mirror outbox   # .ffv3 objects for ListS3 (S3_* env)
-  mirror.py send dir --path /media/usb --format tar outbox     # hand-carry to import --inbox
-  mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
-  mirror.py --state-dir /share/mirror sync --low-only   # update TARGET_REGISTRY only; work files on /share
-  mirror.py carry --path /mnt/transfer --staging /mnt/transfer/.staging   # new images as one tar for NiFi
-  mirror.py export --tar /share/carry.tar team/app:v1.2.3   # one image to hand-carry, built in . (removed after)
-  mirror.py export --tar /share/carry.tar --staging /share/tmp --list carry.txt   # a batch, any registry
+Low side:
+  export TARGET_REGISTRY=registry.low.example.com
+  mirror.py sync                                    # copy images.txt into TARGET_REGISTRY
+  mirror.py export                                  # what sync added and send has not delivered, as one tar
+  mirror.py send mirror-export-*.tar --path /mnt/transfer       # or --nifi-url URL, or --s3-bucket NAME
 
-High side (receive bundles, push to your registry, promote dev to prod):
-  TARGET_REGISTRY=registry.high.example.com mirror.py login
-  mirror.py import --registry --name mirror-<stream>-000000000008.tar --record imported.json
-  mirror.py import --inbox /transfer/in
-  mirror.py load /media/usb/export.tar --scratch /share/unpack   # an export: tags and digests unchanged
-  SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com mirror.py promote imported.json
+High side:
+  export TARGET_REGISTRY=registry.high.example.com
+  mirror.py import /mnt/diode/received              # every tar there, removed once imported
+  mirror.py import --s3-bucket received             # every tar in the bucket, removed once imported
+  mirror.py import /media/usb/carry.tar             # one tar, kept
 
-sync, send, carry, export and load print the directories they write to before they start.
 Run "mirror.py <command> -h" for each command's options and examples.
 """
 
@@ -2123,184 +1147,131 @@ def main(argv=None):
     raw = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(description=__doc__, epilog=EXAMPLES, formatter_class=raw)
     parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt", help="image catalog (default images.txt)")
-    parser.add_argument("--state-dir", type=Path,
-                        help="work, staging and outbox directory, e.g. on a large disk (or MIRROR_STATE_DIR, "
-                             "IMPORT_STATE_DIR; default ~/.local/state)")
+    parser.add_argument("--ledger", help="ledger file, or the https URL of the pipeline's ledger to read without "
+                                         "changing it (or MIRROR_LEDGER; default the package registry in CI, "
+                                         "else .mirror-ledger.json beside the catalog)")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="print every skopeo and curl command and each image decision (or MIRROR_VERBOSE=true)")
+                        help="print every skopeo and curl command (or MIRROR_VERBOSE=true)")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
 
     def command(name, summary, examples):
         return commands.add_parser(name, help=summary, description=summary, epilog="examples:\n" + examples,
                                    formatter_class=raw)
 
+    def staging_flag(sub):
+        sub.add_argument("--staging-dir", type=Path,
+                         help="where the working copy goes, for a bigger disk (or MIRROR_STAGING_DIR; default beside "
+                              "the tar). Always removed afterwards")
+
+    def base_flag(sub):
+        sub.add_argument("--rewrite-base-path", metavar="ORG", default=os.environ.get("MIRROR_REWRITE_BASE_PATH"),
+                         help="replace the first path segment of every image: team/app -> ORG/app "
+                              "(or MIRROR_REWRITE_BASE_PATH)")
+
+    command("sync", "copy every catalog image into TARGET_REGISTRY; safe to run again",
+            "  mirror.py sync")
+    export_command = command(
+        "export", "copy images from a registry into a tar, with a .sha256 beside it",
+        "  mirror.py export                                  # what is new since the last send\n"
+        "  mirror.py export --all                            # every catalog image\n"
+        "  mirror.py export team/prometheus:v3.13.4 team/grafana   # in TARGET_REGISTRY: a tag, every tag\n"
+        "  mirror.py export registry.low.example.com/team/app:v1.2.3\n"
+        "  mirror.py export --list carry.txt -o /share/carry.tar   # one reference per line\n"
+        "  mirror.py export --max-size 4GiB                  # several tars, none over 4 GiB unless one image is\n"
+        "  mirror.py export --rewrite-base-path new-org-dev  # team/app lands as new-org-dev/app")
+    export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag")
+    export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
+    export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
+    export_command.add_argument("-o", "--output", type=Path, help="the tar to write (default mirror-export-<UTC time>.tar here)")
+    export_command.add_argument("--max-size", default=os.environ.get("MIRROR_MAX_SIZE"),
+                                help="split into tars of at most this size, e.g. 4GiB (or MIRROR_MAX_SIZE; default one tar)")
+    staging_flag(export_command)
+    base_flag(export_command)
+    send_command = command(
+        "send", "deliver tars and their .sha256 files to NiFi, an S3 bucket or a directory",
+        "  mirror.py send mirror-export-*.tar --path /mnt/transfer     # an NFS share or a USB stick\n"
+        "  mirror.py send mirror-export-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
+        "  mirror.py send mirror-export-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys")
+    send_command.add_argument("tars", nargs="+", type=Path, help="tar files export wrote")
+    where = send_command.add_mutually_exclusive_group(required=True)
+    where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
+    where.add_argument("--s3-bucket", help="a bucket at S3_ENDPOINT (S3_PREFIX optional)")
+    where.add_argument("--path", help="a directory; it must exist")
+    import_command = command(
+        "import", "push the images in export tars into TARGET_REGISTRY, tags and digests unchanged",
+        "  mirror.py import /mnt/diode/received          # every tar there; each removed once imported\n"
+        "  mirror.py import --s3-bucket received         # every tar in the bucket; each removed once imported\n"
+        "  mirror.py import /media/usb/carry.tar         # one tar, checked against carry.tar.sha256, kept\n"
+        "  mirror.py import /mnt/diode/received --rewrite-base-path new-org-dev")
+    import_command.add_argument("sources", nargs="*", type=Path, help="tar files or directories of them")
+    import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
+    import_command.add_argument("--keep", action="store_true", help="leave imported tars in the directory or bucket")
+    import_command.add_argument("--force", action="store_true", help="move a tag that already points at another digest")
+    import_command.add_argument("--record", type=Path, help="append the image tags and digests pushed, for promote")
+    staging_flag(import_command)
+    base_flag(import_command)
+
     command("login", "log in to TARGET_REGISTRY, and SOURCE_REGISTRY when it has credentials",
             "  TARGET_REGISTRY=registry.example.com TARGET_REGISTRY_USERNAME=robot \\\n"
-            "    TARGET_REGISTRY_PASSWORD=... mirror.py login\n"
-            "  SOURCE_REGISTRY=docker.io SOURCE_REGISTRY_USERNAME=me SOURCE_REGISTRY_PASSWORD=... mirror.py login")
-    command("targets", "validate and list the image catalog", "  mirror.py targets")
-    add = command("add", "resolve a tag to its digest and append a catalog entry",
+            "    TARGET_REGISTRY_PASSWORD=... mirror.py login")
+    add = command("add", "resolve a tag to its digest and add a catalog entry",
                   "  mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus\n"
-                  "  mirror.py add quay.io/prometheus/node-exporter:v1.9.1 team/node-exporter\n"
                   "  mirror.py add docker.io/bitnamicharts/redis:22.0.7 charts/redis   # an OCI Helm chart")
     add.add_argument("source", help="registry/repository:tag in full, e.g. docker.io/library/alpine:3.20")
     add.add_argument("target", help="repository path in TARGET_REGISTRY, any depth, e.g. team/prometheus")
-    sync_command = command("sync", "mirror the catalog into TARGET_REGISTRY and write what changed as bundles",
-                           "  mirror.py sync --out outbox   # then mirror.py send ... outbox\n"
-                           "  mirror.py sync --all          # every approved image (recovery, RESEND_ALL=true in CI)\n"
-                           "  mirror.py sync --low-only     # update TARGET_REGISTRY only, record nothing as sent")
-    sync_command.add_argument("--all", action="store_true", help="bundle every approved image, not only changes")
-    sync_command.add_argument("--out", help="outbox directory (default MIRROR_BUNDLE_DIR, else outbox/ in MIRROR_STATE_DIR)")
-    sync_command.add_argument("--low-only", action="store_true", help="mirror into TARGET_REGISTRY without writing a bundle")
-    sync_command.add_argument("--blob-delta", action="store_true",
-                              help="leave out blobs the high side already has (or MIRROR_BLOB_DELTA=true)")
-    send_command = command("send", "deliver the bundles sync or resend wrote, then remove them from the outbox",
-                           "  mirror.py send nifi outbox                        # POST to NIFI_URL\n"
-                           "  mirror.py send nifi --url https://nifi:9443/contentListener outbox\n"
-                           "  mirror.py send dir --path /mnt/transfer outbox    # .ffv3 for a low NiFi ListFile\n"
-                           "  mirror.py send --path /mnt/transfer outbox        # the same: --path means dir\n"
-                           "  mirror.py send s3 --bucket transfer outbox        # .ffv3 objects; S3_ENDPOINT, AWS_* keys\n"
-                           "  mirror.py send dir --path /media/usb --format tar outbox   # hand-carry")
-    send_command.add_argument("where", nargs="*", metavar="[method] [outbox]",
-                              help="method nifi, dir or s3; left out, --path means dir, --bucket s3, else nifi. "
-                                   "outbox: default MIRROR_BUNDLE_DIR, else outbox/ in MIRROR_STATE_DIR")
-    send_command.add_argument("--url", default=os.environ.get("NIFI_URL"), help="nifi: ListenHTTP URL (default NIFI_URL)")
-    send_command.add_argument("--path", help="dir: the directory to write into")
-    send_command.add_argument("--format", choices=("ffv3", "tar"), default="ffv3",
-                              help="dir: ffv3 for NiFi (default), tar for import --inbox")
-    for flag, variable in (("--endpoint", "S3_ENDPOINT"), ("--bucket", "S3_BUCKET"), ("--prefix", "S3_PREFIX"),
-                           ("--region", "S3_REGION")):
-        send_command.add_argument(flag, help=f"s3: default {variable}")
-    resend_command = command("resend", "resend recorded images as the next bundle (MIRROR_LEDGER=true)",
-                             "  mirror.py resend --sequence 7..        # bundles 7 to the newest (RESEND_SEQUENCE)\n"
-                             "  mirror.py resend --sequence 7..9\n"
-                             "  mirror.py resend --since 2026-10-01    # (RESEND_SINCE)\n"
-                             "  mirror.py resend --image team/prometheus:v3.13.4   # (RESEND_IMAGE)")
-    resend_command.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
-    resend_command.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
-    resend_command.add_argument("--image", help="one target, repo or repo:tag")
-    resend_command.add_argument("--out", help="outbox directory, as for sync")
     add_list_command = command(
         "add-list", "add every image named in a folder of .txt files, keeping images.txt sorted",
-        "  mirror.py add-list lists/                 # docker.io/prom/prometheus:v3.13.4 -> prom/prometheus\n"
-        "  mirror.py add-list lists/ --prefix team   # -> team/prom/prometheus\n"
-        "  lists/*.txt hold one image per line, # comments allowed. A line without a registry host\n"
-        "  is read as docker pull reads it (alpine -> docker.io/library/alpine); without a tag, :latest.")
+        "  mirror.py add-list lists/ --prefix team   # docker.io/prom/prometheus:v3.13.4 -> team/prom/prometheus\n"
+        "  A line without a registry host is read as docker pull reads it; without a tag, :latest.")
     add_list_command.add_argument("folder", type=Path, help="a directory of *.txt files")
     add_list_command.add_argument("--prefix", help="repository path the targets go under, e.g. team")
-    pending_command = command("pending", "list catalog sources the ledger has not sent yet, one per line",
-                              "  mirror.py pending\n  mirror.py pending --synced   # not yet in TARGET_REGISTRY (sync --low-only)")
-    pending_command.add_argument("--synced", action="store_true", help="what sync --low-only has not yet copied")
-    pending_command.add_argument("--targets", action="store_true", help="print repo:tag in TARGET_REGISTRY, for export --list")
-    pending_command.add_argument("--carried", action="store_true", help="what carry has not yet exported")
-    check = command("covers", "fail when a Containerfile or manifest uses an image the mirror lacks",
+    command("targets", "validate and list the image catalog", "  mirror.py targets")
+    command("pending", "list catalog sources sync has not copied yet, one per line", "  mirror.py pending")
+    check = command("covers", "fail when a Containerfile or manifest uses an image the catalog lacks",
                     "  mirror.py covers Containerfile\n  helm template chart/ | mirror.py covers -")
     check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
-    high = command("import", "verify bundles and push their images to TARGET_REGISTRY",
-                   "  mirror.py import mirror-<stream>-000000000001.tar        # one bundle file\n"
-                   "  mirror.py import --inbox /transfer/in                  # every bundle in a directory\n"
-                   "  mirror.py import --registry --name mirror-<stream>-000000000008.tar\n"
-                   "      # from IMPORT_STORE (gitlab or s3), catching up on any missed bundle")
-    selection = high.add_mutually_exclusive_group(required=True)
-    selection.add_argument("bundle", nargs="?", type=Path, help="a bundle .tar, its .sha256 beside it")
-    selection.add_argument("--inbox", type=Path, help="a directory of bundles; imported ones move to done/")
-    selection.add_argument("--registry", action="store_true",
-                           help="fetch bundles from IMPORT_STORE: the generic package registry or S3")
-    high.add_argument("--name", help="with --registry: the bundle file a trigger announced (BUNDLE)")
-    high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
-    high.add_argument("--record", type=Path, help="write the image tags and digests this run pushed, for promote")
-    export_command = command(
-        "export", "copy images from a registry into one directory or tar to hand-carry (no sync, no ledger)",
-        "  mirror.py export --tar /share/carry.tar                   # every catalog image; built in ., removed after\n"
-        "  mirror.py export --tar /share/carry.tar --staging /share/tmp team/prometheus:v3.13.4 team/grafana\n"
-        "                                                            # a tag, every tag; built in /share/tmp\n"
-        "  mirror.py export --tar /share/carry.tar quay.low.example.com/team/app:v1.2.3   # any registry\n"
-        "  mirror.py export --tar /share/carry.tar --list carry.txt  # a batch: one reference per line\n"
-        "  mirror.py export --out /share/export team/app:v1.2.3      # no tar: keep the export unpacked")
-    export_command.add_argument("images", nargs="*",
-                                help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag. Default the catalog")
-    export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
-    export_command.add_argument("--tar", type=Path, help="the tar to write, with a .sha256 beside it")
-    export_command.add_argument("--staging", type=Path,
-                                help="where the tar is built; the working directory is removed after (default .)")
-    export_command.add_argument("--out", type=Path, help="instead of --tar: an empty directory, kept unpacked")
-    export_command.add_argument("--tmp", type=Path, help="skopeo's scratch (default --state-dir, else --staging, else beside --out)")
-    carry_command = command("carry", "sync --low-only, then export what is new as one tar into a directory NiFi lists",
-                            "  mirror.py carry --path /mnt/transfer         # the tar appears whole, its .sha256 last\n"
-                            "  mirror.py carry --path /mnt/transfer --all   # every catalog image")
-    carry_command.add_argument("--path", required=True, type=Path, help="the directory NiFi lists (tar built in .staging)")
-    carry_command.add_argument("--all", action="store_true", help="carry every catalog image, not only new ones")
-    carry_command.add_argument("--staging", type=Path,
-                               help="where the tar is built, same filesystem as --path (default --path/.staging)")
-    load_command = command("load", "push an export into TARGET_REGISTRY, tags and digests unchanged",
-                           "  mirror.py load /media/usb/export.tar   # checked against export.tar.sha256\n"
-                           "  mirror.py load /share/export           # the layout directory itself")
-    load_command.add_argument("source", type=Path, help="an export directory, or its .tar")
-    load_command.add_argument("--force", action="store_true", help="move a tag that already points at another digest")
-    load_command.add_argument("--scratch", type=Path, help="where a tar unpacks (default --state-dir, else beside the tar)")
     promote_command = command("promote", "copy recorded images from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod) by digest",
                               "  SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com \\\n"
                               "    mirror.py promote imported.json      # the file import --record wrote")
     promote_command.add_argument("record", type=Path, help="the file import --record wrote")
-    args, extra = parser.parse_known_args(argv)
-    if extra and (args.command != "send" or any(e.startswith("-") for e in extra)):
-        parser.error("unrecognized arguments: " + " ".join(extra))
-    if extra:  # send dir --path X outbox: the outbox after the options
-        args.where += extra
+    base_flag(promote_command)
+
+    args = parser.parse_args(argv)
     if args.verbose:
         os.environ["MIRROR_VERBOSE"] = "true"
-    if args.state_dir:  # a flag wins over the environment
-        os.environ["MIRROR_STATE_DIR"] = os.environ["IMPORT_STATE_DIR"] = str(args.state_dir)
-        os.environ["TMPDIR"] = os.environ["MIRROR_SCRATCH"] = str(args.state_dir)
+    if args.ledger:
+        os.environ["MIRROR_LEDGER"] = args.ledger
     try:
         check_renamed()
-        if args.command == "login":
+        ledger_file = ledger_location(args.catalog)
+        if args.command == "sync":
+            sync(args.catalog, ledger_file)
+        elif args.command == "export":
+            export(args.catalog, ledger_file, args.images, args.list, args.all, args.output, args.max_size,
+                   args.staging_dir, args.rewrite_base_path)
+        elif args.command == "send":
+            send(args.tars, ledger_file, args.nifi_url, args.s3_bucket, args.path)
+        elif args.command == "import":
+            if not args.sources and not args.s3_bucket:
+                raise MirrorError("import needs a tar, a directory or --s3-bucket")
+            import_all(args.sources, args.s3_bucket, args.staging_dir, args.force, args.rewrite_base_path,
+                       args.record, args.keep)
+        elif args.command == "login":
             login()
+        elif args.command == "add":
+            add_image(args.catalog, args.source, args.target)
+        elif args.command == "add-list":
+            add_list(args.catalog, args.folder, args.prefix)
         elif args.command == "targets":
             for image in catalog(args.catalog):
                 print(f"{image['source']} -> {image['target']}:{image['tag']}")
-        elif args.command == "add":
-            add_image(args.catalog, args.source, args.target)
-        elif args.command == "sync":
-            if args.blob_delta:
-                os.environ["MIRROR_BLOB_DELTA"] = "true"
-            sync(args.catalog, args.all, args.out, args.low_only)
-        elif args.command == "send":
-            for flag, variable in (("endpoint", "S3_ENDPOINT"), ("bucket", "S3_BUCKET"), ("prefix", "S3_PREFIX"),
-                                   ("region", "S3_REGION")):
-                if getattr(args, flag) is not None:  # a flag wins over its environment default
-                    os.environ[variable] = getattr(args, flag)
-            method, outbox_dir = send_arguments(args.where, args.path, args.bucket)
-            send(method, outbox_dir, args.url if method == "nifi" else args.path, args.format)
-        elif args.command == "resend":
-            resend(args.since, args.sequence, args.image, args.out)
-        elif args.command == "add-list":
-            add_list(args.catalog, args.folder, args.prefix)
         elif args.command == "pending":
-            pending(args.catalog, args.synced, args.targets, args.carried)
+            pending(args.catalog, ledger_file)
         elif args.command == "covers":
             covers(args.catalog, args.files)
-        elif args.command == "export":
-            export(args.catalog, args.images, args.out, args.tar, args.list, args.tmp, args.staging)
-        elif args.command == "carry":
-            carry(args.catalog, args.path, args.all, args.staging)
-        elif args.command == "load":
-            load(args.source, args.force, args.scratch)
-        elif args.command == "promote":
-            promote(args.record)
         else:
-            if args.record:
-                args.record.write_text("[]\n")  # this run's pushes only; nothing new leaves an empty list
-            if args.registry:
-                import_registry(args.name, args.adopt_stream, args.record)
-            elif args.inbox:
-                import_inbox(args.inbox, args.adopt_stream, args.record)
-            else:
-                import_one(args.bundle, args.adopt_stream, record=args.record)
+            promote(args.record, args.rewrite_base_path)
         return 0
-    except GapWaiting as waiting:
-        print(f"waiting: {waiting}", file=sys.stderr)
-        return 3
     except (MirrorError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

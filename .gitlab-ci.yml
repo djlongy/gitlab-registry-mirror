@@ -13,28 +13,22 @@ variables:
   SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
   GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
   GRYPE_FAIL_ON: 'critical'
-  # false skips sbom and scan, and sync no longer waits for them.
-  MIRROR_SCAN: 'true'
+  # true adds the Syft SBOM and Grype scan before sync; sync waits for them.
+  MIRROR_SCAN: 'false'
   # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
-  # Run pipeline with RESEND_ALL=true sends every approved image instead of only changes.
-  RESEND_ALL: 'false'
-  # Run pipeline with one of these set runs resend instead of sync: YYYY-MM-DD, N / N.. / N..M, repo[:tag].
-  RESEND_SINCE: ''
-  RESEND_SEQUENCE: ''
-  RESEND_IMAGE: ''
-  # How sync's bundles leave: none (sync TARGET_REGISTRY only, no bundles; carry images with
-  # mirror.py export), export (sync TARGET_REGISTRY, then export what this run added as one tar into
-  # MIRROR_SEND_PATH for NiFi to carry; load it on the high side), nifi (POST to NIFI_URL), dir (.ffv3 files in MIRROR_SEND_PATH, e.g. an NFS share
-  # mounted on the runner, for a low NiFi ListFile) or s3 (.ffv3 objects in S3_BUCKET at S3_ENDPOINT,
-  # S3_PREFIX optional, keys in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, for a low NiFi ListS3).
-  MIRROR_SEND: 'none'
-  # true: delta bundles leave out layers the high side already has (README, Blob delta).
-  MIRROR_BLOB_DELTA: 'false'
+  # Where the pipeline sends the tar of new images. Set one: NIFI_URL (a ListenHTTP), S3_BUCKET
+  # (at S3_ENDPOINT, keys in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, S3_PREFIX optional) or
+  # MIRROR_SEND_PATH (a directory mounted on the runner, e.g. an NFS share). None: sync only.
+  NIFI_URL: ''
+  S3_BUCKET: ''
   MIRROR_SEND_PATH: ''
-  # MIRROR_SEND=export: where the tar is built before it moves into MIRROR_SEND_PATH. Same filesystem.
-  # Empty: MIRROR_SEND_PATH/.staging. Every job prints the directories it writes to.
-  MIRROR_STAGING_PATH: ''
+  # Run pipeline with EXPORT_ALL=true sends every catalog image, not only what is new.
+  EXPORT_ALL: 'false'
+  # Split the export into tars of at most this size, e.g. 4GiB. Empty: one tar.
+  MIRROR_MAX_SIZE: ''
+  # A disk with room for the export while it is built. Empty: the job directory.
+  MIRROR_STAGING_DIR: ''
 
 verify:
   stage: verify
@@ -44,8 +38,8 @@ verify:
   script:
     - python3 mirror.py targets
     - python3 -m unittest discover -s tests -v
-    # What sync would send next; sbom and scan check exactly these. The job token reads the ledger.
-    - MIRROR_LEDGER=true python3 mirror.py pending $(case "$MIRROR_SEND" in none) echo --synced;; export) echo --carried;; esac) > pending.txt
+    # What sync copies next; sbom and scan check exactly these. The job token reads the ledger.
+    - python3 mirror.py pending > pending.txt
     - cat pending.txt
   artifacts:
     paths: [pending.txt]
@@ -67,7 +61,7 @@ verify:
   after_script:
     - rm -rf .grype-db
   rules:
-    - if: '$MIRROR_SCAN == "false"'
+    - if: '$MIRROR_SCAN != "true"'
       when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
@@ -130,9 +124,10 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A runner with python3, skopeo and curl. sync writes bundles to outbox/, send delivers and deletes them.
+# A runner with python3, skopeo and curl. sync copies the catalog into TARGET_REGISTRY; export and
+# send carry what is new as a tar when a destination is set. The ledger lives in the package registry.
 # Merge-request validation runs elsewhere, without registry credentials.
-sync: &mirror
+sync:
   stage: publish
   environment:
     name: mirror-low
@@ -144,30 +139,20 @@ sync: &mirror
       artifacts: false
     - job: scan
       artifacts: true
-      optional: true  # absent with MIRROR_SCAN=false
+      optional: true  # absent unless MIRROR_SCAN=true
   variables:
-    # Sender state lives in this project's package registry, and the work directory in the job's own
-    # checkout, removed afterwards: nothing persists on the runner.
-    MIRROR_LEDGER: 'true'
-    MIRROR_STATE_DIR: '$CI_PROJECT_DIR/.mirror-work'
     # A CI job has no XDG_RUNTIME_DIR, so skopeo's default auth file is not writable.
-    REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
+    REGISTRY_AUTH_FILE: '$CI_PROJECT_DIR/.registry-auth.json'
   script:
     - python3 mirror.py login
+    - python3 mirror.py sync
     - |
-      if [ "$MIRROR_SEND" = "none" ]; then
-        python3 mirror.py sync --low-only
-      elif [ "$MIRROR_SEND" = "export" ]; then
-        python3 mirror.py carry --path "${MIRROR_SEND_PATH:?MIRROR_SEND=export needs MIRROR_SEND_PATH}" \
-          ${MIRROR_STAGING_PATH:+--staging "$MIRROR_STAGING_PATH"} $([ "$RESEND_ALL" = "true" ] && echo --all)
-      elif [ "$RESEND_ALL" = "true" ]; then
-        python3 mirror.py sync --all --out outbox
+      set -- ${NIFI_URL:+--nifi-url "$NIFI_URL"} ${S3_BUCKET:+--s3-bucket "$S3_BUCKET"} ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
+      if [ "$#" -eq 0 ]; then
+        echo "no NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH: sync only"
       else
-        python3 mirror.py sync --out outbox
-      fi
-    - |
-      if [ "$MIRROR_SEND" != "none" ] && [ "$MIRROR_SEND" != "export" ]; then
-        python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
+        python3 mirror.py export -o "export/mirror-export-$CI_PIPELINE_ID.tar" $([ "$EXPORT_ALL" = "true" ] && echo --all)
+        if ls export/*.tar >/dev/null 2>&1; then python3 mirror.py send export/*.tar "$@"; fi
       fi
     # Keep each sent image's SBOM and scan report, by digest, for audit.
     - |
@@ -179,23 +164,14 @@ sync: &mirror
         echo "kept: registry-mirror-sbom/$version/$base"
       done
   after_script:
-    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.mirror-work" "$CI_PROJECT_DIR/outbox"
+    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/export"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
-    # The pre-rename name still runs the job, so mirror.py fails and names TARGET_REGISTRY.
-    - if: '$LOW_QUAY_HOST != null && $LOW_QUAY_HOST != ""'
     # A project without a target registry is the source repository, not a deployment: nothing to sync.
     - if: '$TARGET_REGISTRY == null'
       when: never
     - if: '$TARGET_REGISTRY == ""'
-      when: never
-    # One variable per rule: GitLab 18.9 evaluates `$A || $B` false when A is declared empty above.
-    - if: '$RESEND_SINCE != null && $RESEND_SINCE != ""'
-      when: never
-    - if: '$RESEND_SEQUENCE != null && $RESEND_SEQUENCE != ""'
-      when: never
-    - if: '$RESEND_IMAGE != null && $RESEND_IMAGE != ""'
       when: never
     - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
     - if: '$CI_PIPELINE_SOURCE == "push"'
@@ -203,27 +179,3 @@ sync: &mirror
         - images.txt
         - mirror.py
         - .gitlab-ci.yml
-
-# Run pipeline with RESEND_SINCE, RESEND_SEQUENCE or RESEND_IMAGE resends recorded images as the next bundle.
-resend:
-  <<: *mirror
-  needs:
-    - job: verify
-      artifacts: false
-  script:
-    - python3 mirror.py login
-    - python3 mirror.py resend --out outbox ${RESEND_SINCE:+--since "$RESEND_SINCE"} ${RESEND_SEQUENCE:+--sequence "$RESEND_SEQUENCE"} ${RESEND_IMAGE:+--image "$RESEND_IMAGE"}
-    - python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
-  rules:
-    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
-      when: never
-    # The pre-rename name still runs the job, so mirror.py fails and names TARGET_REGISTRY.
-    - if: '$LOW_QUAY_HOST != null && $LOW_QUAY_HOST != ""'
-    # A project without a target registry is the source repository, not a deployment: nothing to sync.
-    - if: '$TARGET_REGISTRY == null'
-      when: never
-    - if: '$TARGET_REGISTRY == ""'
-      when: never
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_SINCE != null && $RESEND_SINCE != ""'
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_SEQUENCE != null && $RESEND_SEQUENCE != ""'
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_IMAGE != null && $RESEND_IMAGE != ""'
