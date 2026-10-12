@@ -40,6 +40,65 @@ def place(stage, directory, root):
     return final
 
 
+class FakeGitLab:
+    """The generic packages API of project 7, holding the ledger package's uploads."""
+    PACKAGES = 'https://git.example/api/v4/projects/7/packages'
+
+    def __init__(self, test):
+        self.test, self.uploads, self.deny_delete = test, [], False
+
+    def urlopen(self, request, **_):
+        self.test.assertEqual(request.headers.get('Job-token'), 'job')
+        url, method = request.full_url.removeprefix(self.PACKAGES), request.get_method()
+        newest = [u for u in self.uploads if u['file_name'] == 'ledger.json'][-1:]
+        if url == '/generic/registry-mirror-ledger/v2/ledger.json' and method == 'PUT':
+            self.uploads.append({'id': max([u['id'] for u in self.uploads] + [9]) + 1, 'file_name': 'ledger.json',
+                                 'created_at': mirror.datetime.now(mirror.timezone.utc).isoformat(), 'body': request.data})
+            return io.BytesIO(b'')
+        if url == '/generic/registry-mirror-ledger/v2/ledger.json' and newest:
+            return io.BytesIO(newest[0]['body'])
+        if url.startswith('?package_type=generic'):
+            return io.BytesIO(json.dumps([{'id': 3, 'name': 'registry-mirror-ledger', 'version': 'v2'},
+                                          {'id': 4, 'name': 'registry-mirror-ledger-old', 'version': 'v2'}]).encode())
+        if url.startswith('/3/package_files?'):
+            return io.BytesIO(json.dumps([{k: v for k, v in u.items() if k != 'body'} for u in self.uploads]).encode())
+        if url.startswith('/4/'):
+            self.test.fail('another package is never touched')
+        if url.startswith('/3/package_files/') and method == 'DELETE' and not self.deny_delete:
+            self.uploads = [u for u in self.uploads if u['id'] != int(url.rsplit('/', 1)[1])]
+            return io.BytesIO(b'')
+        raise mirror.urllib.error.HTTPError(request.full_url, 404 if method == 'GET' else 403, 'No', {}, None)
+
+    def __enter__(self):
+        self.patches = [mock.patch.dict(os.environ, {'CI_JOB_TOKEN': 'job', 'CI_API_V4_URL': 'https://git.example/api/v4',
+                                                     'CI_PROJECT_ID': '7'}),
+                        mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=self.urlopen)]
+        for patch in self.patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *_):
+        for patch in reversed(self.patches):
+            patch.stop()
+
+
+# A self-signed certificate for CA_BUNDLE tests; no key is needed to trust it.
+SELF_SIGNED = '''-----BEGIN CERTIFICATE-----
+MIIB4DCCAYWgAwIBAgIUD9HQfIvwfVyrlCwO/Puj5u46j/UwCgYIKoZIzj0EAwIw
+JzElMCMGA1UEAwwcbWlycm9yLXRlc3QuZXhhbXBsZS5pbnRlcm5hbDAeFw0yNjEw
+MTIwODIwNTlaFw0zNjEwMDkwODIwNTlaMCcxJTAjBgNVBAMMHG1pcnJvci10ZXN0
+LmV4YW1wbGUuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASlNz0M
+oUmYLl6/y/E8oVNTARRw9Mv9/X6WFYbr8skaQ/Z0RQOTTuR1laMI83jBp35WHwtx
+d8CY5LcAW7xV7Slso4GOMIGLMB0GA1UdDgQWBBTZjIOle/IZo1NnERLb9Ki5fgcg
+CTAfBgNVHSMEGDAWgBTZjIOle/IZo1NnERLb9Ki5fgcgCTA4BgNVHREEMTAvggls
+b2NhbGhvc3SCHG1pcnJvci10ZXN0LmV4YW1wbGUuaW50ZXJuYWyHBH8AAAEwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEA+BSTlEeehCz2BGirXusH
+Vv66SrqCwzBM/jXHQ+SBHZYCIQCb5HxILz0rk5EbvAFlBOpOI3sNXKzQqCMjVWh5
+Y51Iyg==
+-----END CERTIFICATE-----
+'''
+
+
 class Registry:
     """A fake pair of registries: tags to digests, and the manifest bytes skopeo would copy."""
 
@@ -92,6 +151,8 @@ class MirrorTest(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {'TARGET_REGISTRY': LOW}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
+        mirror.ca_files.cache_clear()
+        self.addCleanup(mirror.ca_files.cache_clear)
         self.catalog = self.root / 'images.txt'
         self.ledger = self.root.resolve() / '.mirror-ledger.json'
         quiet = mock.patch('sys.stdout', new_callable=io.StringIO)
@@ -108,6 +169,36 @@ class MirrorTest(unittest.TestCase):
         app, db = registry.image('app'), registry.image('db')
         self.catalog.write_text(f'docker.io/team/app:1.0@{app} team/app\ndocker.io/team/db:2@{db} team/db\n')
         return app, db
+
+    def test_ca_bundle_is_trusted_by_skopeo_curl_and_python_on_top_of_the_system_roots(self):
+        self.assertEqual(mirror.options('TARGET_REGISTRY'), [])
+        bundle = self.root / 'certs' / 'ca-bundle.crt'
+        bundle.parent.mkdir()
+        bundle.write_text(SELF_SIGNED)
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, Path(__file__).resolve().parents[1])
+        os.environ['CA_BUNDLE'] = './certs/ca-bundle.crt'
+        mirror.ca_files.cache_clear()
+        _, directory, curl = mirror.ca_files()
+        curl = Path(curl[1])
+        self.assertEqual(mirror.options('TARGET_REGISTRY', 'dest-'), [f'--dest-cert-dir={directory}'])
+        self.assertEqual(mirror.options(None), [f'--cert-dir={directory}'])
+        self.assertEqual((directory / 'ca.crt').read_text(), SELF_SIGNED)
+        self.assertTrue(curl.read_text().endswith(SELF_SIGNED))
+        system = mirror.ssl.get_default_verify_paths().cafile
+        if system and Path(system).is_file():
+            self.assertIn(Path(system).read_text().strip()[:200], curl.read_text())
+        self.assertGreater(mirror.tls_context().cert_store_stats()['x509_ca'],
+                           mirror.ssl.create_default_context().cert_store_stats()['x509_ca'])
+        os.environ['TARGET_REGISTRY_TLS_VERIFY'] = 'false'
+        self.assertEqual(mirror.options('TARGET_REGISTRY'), ['--tls-verify=false'])
+        del os.environ['TARGET_REGISTRY_TLS_VERIFY']
+        os.environ['CA_BUNDLE'] = './certs/missing.crt'
+        mirror.ca_files.cache_clear()
+        with self.assertRaisesRegex(mirror.MirrorError, 'CA_BUNDLE ./certs/missing.crt is not a file'):
+            mirror.options('TARGET_REGISTRY')
+        self.assertEqual(self.cli('sync'), 1, 'a bad CA_BUNDLE stops every command before it starts')
+        self.assertFalse(self.ledger.exists())
 
     # Ledger
 
@@ -127,25 +218,29 @@ class MirrorTest(unittest.TestCase):
             mirror.load_ledger(self.ledger, 'other.example.internal')
 
     def test_the_ci_ledger_reads_and_writes_one_generic_package_file(self):
-        stored = {}
-
-        def urlopen(request, **_):
-            self.assertEqual(request.headers.get('Job-token'), 'job')
-            self.assertTrue(request.full_url.endswith('/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'))
-            if request.get_method() == 'PUT':
-                stored['body'] = request.data
-                return io.BytesIO(b'')
-            if 'body' not in stored:
-                raise mirror.urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
-            return io.BytesIO(stored['body'])
-
-        with mock.patch.dict(os.environ, {'CI_JOB_TOKEN': 'job', 'CI_API_V4_URL': 'https://git.example/api/v4',
-                                          'CI_PROJECT_ID': '7'}), \
-                mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
+        gitlab = FakeGitLab(self)
+        with gitlab:
             ledger = mirror.load_ledger('gitlab', LOW)
             ledger['sent']['team/app:1.0'] = 'sha256:' + 'a' * 64
             mirror.save_ledger('gitlab', ledger)
             self.assertEqual(mirror.load_ledger('gitlab', LOW)['sent'], ledger['sent'])
+
+    def test_saving_the_ci_ledger_prunes_uploads_past_the_window_but_keeps_the_newest_two(self):
+        gitlab = FakeGitLab(self)
+        gitlab.uploads = [{'id': n, 'file_name': 'ledger.json', 'created_at': f'2026-09-0{n}T00:00:00.000Z',
+                           'body': b'{}'} for n in range(1, 6)]
+        gitlab.uploads.append({'id': 9, 'file_name': 'other.json', 'created_at': '2026-09-01T00:00:00.000Z'})
+        with gitlab:
+            mirror.save_ledger('gitlab', {'registry': LOW})  # today: uploads 1 to 5 are all past 7 days
+        self.assertEqual([u['id'] for u in gitlab.uploads], [5, 9, 10])  # 10 and 5 are the newest two
+        with gitlab, mock.patch.dict(os.environ, {'MIRROR_LEDGER_KEEP_DAYS': '100000'}):
+            mirror.save_ledger('gitlab', {'registry': LOW})
+        self.assertEqual(len(gitlab.uploads), 4)
+        gitlab.deny_delete = True
+        with gitlab, mock.patch.object(sys, 'stderr', io.StringIO()) as stderr:
+            mirror.save_ledger('gitlab', {'registry': LOW})
+        self.assertIn('not pruned: DELETE', stderr.getvalue())
+        self.assertEqual(len(gitlab.uploads), 5)
 
     def test_a_ledger_url_gives_a_manual_export_the_pipelines_delta_and_is_never_written(self):
         url = 'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'

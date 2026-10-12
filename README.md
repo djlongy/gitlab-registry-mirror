@@ -18,12 +18,13 @@ Copies reviewed container images and OCI Helm charts into a registry, exports th
 | Optional | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account for `mirror.py login`; leave unset for a registry without auth |
 | Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD` | none | Login for one source registry, e.g. `docker.io` against rate limits. `promote` reads dev from it |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY`, `SOURCE_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
+| Optional | `CA_BUNDLE` | system roots | PEM file of extra CAs or self-signed certificates, e.g. `./certs/ca-bundle.crt`, trusted by every connection; skopeo then ignores `/etc/containers/certs.d` |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform, e.g. `linux/amd64` |
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` beside `images.txt` | Ledger file, `gitlab`, or the pipeline ledger's `https://` URL, read only, with `PACKAGE_TOKEN` (`read_api`) |
 | Optional | `MIRROR_STAGING_DIR` | beside the tar | Disk where `export` and `import` build their working copy |
 | Optional | `MIRROR_MAX_SIZE` | one tar | `export --max-size`, e.g. `4GiB` |
 | Optional | `MIRROR_REWRITE_BASE_PATH` | none | `--rewrite-base-path` for `export`, `import` and `promote` |
-| When S3 | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Path-style bucket for `send --s3-bucket` and `import --s3-bucket`; `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` optional |
+| When S3 | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Path-style bucket for `send --s3-bucket` and `import --s3-bucket`; `S3_PREFIX`, `S3_REGION`, `S3_TLS_VERIFY` optional |
 | Pipeline | `NIFI_URL`, `S3_BUCKET` or `MIRROR_SEND_PATH` | none | Where the low pipeline sends; none set means sync only |
 | Pipeline | `EXPORT_ALL` | `false` | Run pipeline with `true` to send every catalog image again |
 | Pipeline | `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `critical`, any runner | `true` adds the Syft and Grype gate before `sync`; runner tag |
@@ -55,7 +56,7 @@ python3 mirror.py import /mnt/diode/received              # or --s3-bucket NAME,
 ## Behaviour
 
 - `sync` is idempotent: a tag already at its digest is left alone, a missing one is copied again. A `latest` image also gets the version tag it reports, unless the catalog pins that tag.
-- The ledger records what `sync` put in `TARGET_REGISTRY` and what `send` delivered. `export` with no names takes catalog images synced and not yet sent, so a failed `send` repeats them next time. A missing local ledger starts a new one.
+- The ledger records what `sync` put in `TARGET_REGISTRY` and what `send` delivered. `export` with no names takes catalog images synced and not yet sent, so a failed `send` repeats them next time. A missing local ledger starts a new one. GitLab keeps every upload of the CI ledger: each save deletes uploads older than `MIRROR_LEDGER_KEEP_DAYS` (default `7`) and always keeps the newest two. To roll back, delete the newer uploads under **Deploy > Package registry**.
 - `export` writes `NAME.tar` and `NAME.tar.sha256`, uncompressed, one `skopeo dir:` copy per image with shared layers stored once. With `--max-size` it writes `NAME-001-of-00N.tar` and so on; an image over the cap goes in a tar of its own.
 - `send` checks every tar against its `.sha256` first, then delivers each tar and, last, its `.sha256`. A directory sees `.partial` until a file is complete. NiFi gets an HTTP/1.1 POST with `Filename` and `X-Sha256` headers.
 - `import` checks the `.sha256`, refuses to move an existing tag to another digest without `--force`, skips tags already at their digest and verifies each digest after the push. A directory or bucket is an inbox: each tar is removed once imported (`--keep` leaves it), a tar without its `.sha256` waits. A tar named on its own is kept.
