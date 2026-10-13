@@ -68,7 +68,7 @@ python3 mirror.py import /mnt/diode/received              # or --s3-bucket NAME,
 ## Out of scope
 
 - Signing or approving across the link: the `.sha256` catches corruption, not tampering.
-- Configuring the diode or the bucket. For NiFi: `nifi/container-images-processors/` holds processors that export from and push to a registry with no skopeo, and `nifi/CONTAINER-IMAGES-HIGH-BY-HAND.md` builds a high-side flow around `mirror.py import`.
+- Configuring the diode or the bucket. For NiFi: the NiFi processors that export from and push to a registry with no skopeo are in github.com/djlongy/nifi-container-registry-processors, and `nifi/CONTAINER-IMAGES-HIGH-BY-HAND.md` builds a high-side flow around `mirror.py import`.
 - Removing old tags from either registry.
 
 ## Expected result
