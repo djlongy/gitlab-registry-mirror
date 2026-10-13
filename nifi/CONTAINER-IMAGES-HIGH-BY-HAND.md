@@ -229,7 +229,7 @@ reassembled, decrypted files) to the group's **From diode** port.
 
 ## Push straight from NiFi
 
-With the `nifi-container-images` NAR installed (`nifi/container-images-processors/README.md`), NiFi can push the
+With the `nifi-container-registry-nar` installed (releases at github.com/djlongy/nifi-container-registry-processors), NiFi can push the
 images itself, with no inbox, no skopeo and no `mirror.py import`: replace **Package for import**, **Name package**
 and **Write import inbox** with one **PushContainerImages** fed by `verified` from **Tar matches X-Sha256**
 (Registry URL, Username, Password, and an SSL Context Service for an internal CA). Connect its `failure` to

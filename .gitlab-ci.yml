@@ -9,11 +9,6 @@ workflow:
 stages: [verify, publish]
 variables:
   PYTHON_IMAGE: 'docker.io/python@sha256:cd7c412d000912f29075a1b8803e43cb2f38bb67f104019df526df5ceaf30569'
-  # Builds the NiFi processors NAR when nifi/container-images-processors/ changes: any image with Java 21.
-  # One without mvn downloads Maven MAVEN_VERSION and checks it against MAVEN_SHA512.
-  MAVEN_IMAGE: 'docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237'
-  MAVEN_VERSION: '3.9.11'
-  MAVEN_SHA512: 'bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978'
   # Debug variants carry a busybox shell; the binaries are /syft and /grype.
   SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
   GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
@@ -40,25 +35,6 @@ variables:
   # PEM file of extra CAs (or self-signed certificates) for a runner that does not already trust them.
   # Every connection (registries, GitLab, S3, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
   CA_BUNDLE: ''
-
-nifi-nar:
-  stage: verify
-  image: $MAVEN_IMAGE
-  tags: [$MIRROR_JOB_TAG]
-  dependencies: []
-  rules:
-    - changes: [nifi/container-images-processors/**/*]
-  script:
-    - |
-      if ! command -v mvn >/dev/null; then
-        curl -fsSL -o /tmp/maven.tgz "https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz"
-        echo "$MAVEN_SHA512  /tmp/maven.tgz" | sha512sum -c -
-        tar -xzf /tmp/maven.tgz -C /tmp && export PATH="/tmp/apache-maven-$MAVEN_VERSION/bin:$PATH"
-      fi
-    - cd nifi/container-images-processors && mvn -B -ntp package
-  artifacts:
-    paths: [nifi/container-images-processors/nifi-container-images-nar/target/*.nar]
-    expire_in: 30 days
 
 verify:
   stage: verify
