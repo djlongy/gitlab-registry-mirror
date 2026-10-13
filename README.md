@@ -23,7 +23,7 @@ Copies reviewed container images and OCI Helm charts into a registry, exports th
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` beside `images.txt` | Ledger file, `gitlab`, or the pipeline ledger's `https://` URL, read only, with `PACKAGE_TOKEN` (`read_api`) |
 | Optional | `MIRROR_STAGING_DIR` | beside the tar | Disk where `export` and `import` build their working copy |
 | Optional | `MIRROR_MAX_SIZE` | one tar | `export --max-size`, e.g. `4GiB` |
-| Optional | `MIRROR_REWRITE_BASE_PATH` | none | `--rewrite-base-path` for `export`, `import` and `promote` |
+| Optional | `MIRROR_REWRITE_BASE_PATH`, `MIRROR_STRIP_BASE_PATH` | none, `false` | `--rewrite-base-path` or `--strip-base-path` for `export`, `import` and `promote` |
 | When S3 | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Path-style bucket for `send --s3-bucket` and `import --s3-bucket`; `S3_PREFIX`, `S3_REGION`, `S3_TLS_VERIFY` optional |
 | Pipeline | `NIFI_URL`, `S3_BUCKET` or `MIRROR_SEND_PATH` | none | Where the low pipeline sends; none set means sync only. `MIRROR_SEND_FLOWFILE=true` sends one `.ffv3` to S3 or the directory |
 | Pipeline | `EXPORT_ALL` | `false` | Run pipeline with `true` to send every catalog image again |
@@ -44,7 +44,7 @@ export TARGET_REGISTRY=registry.high.example.internal
 python3 mirror.py import /mnt/diode/received              # or --s3-bucket NAME, or one tar
 ```
 
-`export` also takes images by name: `team/app:v1` (in `TARGET_REGISTRY`), `registry.example.internal/team/app:v1`, `team/app` (every tag) or `--list carry.txt`. `--all` exports the whole catalog. `--rewrite-base-path new-org-dev` lands `team/prom/prometheus` as `new-org-dev/prom/prometheus`; it works on `export` or `import`.
+`export` also takes images by name: `team/app:v1` (in `TARGET_REGISTRY`), `registry.example.internal/team/app:v1`, `team/app` (every tag) or `--list carry.txt`. `--all` exports the whole catalog. `--rewrite-base-path new-org-dev` lands `team/prom/prometheus` as `new-org-dev/prom/prometheus`, and `--strip-base-path` lands it as `prom/prometheus`; either works on `export` or `import`, and an empty value changes nothing. `send --flowfile` delivers one NiFi `.ffv3` per tar; `import --no-checksum` takes a tar whose `.sha256` was not copied.
 
 ## Preconditions
 
@@ -68,7 +68,7 @@ python3 mirror.py import /mnt/diode/received              # or --s3-bucket NAME,
 ## Out of scope
 
 - Signing or approving across the link: the `.sha256` catches corruption, not tampering.
-- Configuring the diode or the bucket. The high-side NiFi flow is built by hand from `nifi/CONTAINER-IMAGES-HIGH-BY-HAND.md`.
+- Configuring the diode or the bucket. For NiFi: `nifi/container-images-processors/` holds processors that export from and push to a registry with no skopeo, and `nifi/CONTAINER-IMAGES-HIGH-BY-HAND.md` builds a high-side flow around `mirror.py import`.
 - Removing old tags from either registry.
 
 ## Expected result

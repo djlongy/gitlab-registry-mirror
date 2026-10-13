@@ -406,12 +406,24 @@ def image_child(child, fetch, depth):
     return kind in MANIFESTS or (kind is None and bool(child.get("platform")))
 
 
+STRIP = object()  # rebase: remove the first segment instead of replacing it
+REPOSITORY = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*")
+
+
 def rebase(path, base):
-    """path with its first segment replaced by base: team/prom/prometheus, new-org -> new-org/prom/prometheus."""
+    """path with its first segment replaced by base (team/prom/prometheus, new-org -> new-org/prom/prometheus),
+    or removed when base is STRIP (-> prom/prometheus)."""
     if not base:
         return path
-    moved = base.strip("/") + "/" + path.split("/", 1)[1]
-    if not TARGET.fullmatch(moved):
+    if base is STRIP:
+        if "/" not in path:
+            raise MirrorError(f"--strip-base-path: {path} has no base path to remove")
+        moved = path.split("/", 1)[1]
+        if not REPOSITORY.fullmatch(moved):
+            raise MirrorError(f"--strip-base-path: {path} becomes {moved}, not a valid repository path")
+        return moved
+    moved = base.strip("/") + "/" + path.split("/", 1)[-1]
+    if not REPOSITORY.fullmatch(moved):
         raise MirrorError(f"--rewrite-base-path {base}: {path} becomes {moved}, not a valid repository path")
     return moved
 
@@ -1129,7 +1141,7 @@ def import_tar(tar, staging=None, force=False, base=None, record=None, no_checks
         plan = []
         for image in index["images"]:
             if (not isinstance(image, dict) or not re.fullmatch(r"[0-9]{6}", str(image.get("dir")))
-                    or not TARGET.fullmatch(str(image.get("target"))) or not re.fullmatch(TAG, str(image.get("tag")))
+                    or not REPOSITORY.fullmatch(str(image.get("target"))) or not re.fullmatch(TAG, str(image.get("tag")))
                     or not re.fullmatch(DIGEST, str(image.get("digest")))):
                 raise MirrorError(f"invalid entry in {EXPORT_INDEX}: {image!r}")
             directory = layout / image["dir"]
@@ -1252,7 +1264,7 @@ def promote(record, base=None):
         raise MirrorError("SOURCE_REGISTRY and TARGET_REGISTRY are the same registry; nothing to promote")
     images = {}
     for entry in json.loads(record.read_text()):
-        if (not isinstance(entry, dict) or not TARGET.fullmatch(str(entry.get("target")))
+        if (not isinstance(entry, dict) or not REPOSITORY.fullmatch(str(entry.get("target")))
                 or not re.fullmatch(TAG, str(entry.get("tag"))) or not re.fullmatch(DIGEST, str(entry.get("digest")))):
             raise MirrorError(f"{record}: invalid entry {entry!r}")
         images[f"{entry['target']}:{entry['tag']}"] = entry  # a later import's digest for the same tag wins
@@ -1374,12 +1386,13 @@ Low side:
   mirror.py sync                                    # copy images.txt into TARGET_REGISTRY
   mirror.py export                                  # what sync added and send has not delivered, as one tar
   mirror.py send container-images-*.tar --path /mnt/transfer       # or --nifi-url URL, or --s3-bucket NAME
+  mirror.py send container-images-*.tar --path /mnt/transfer --flowfile   # one .ffv3 with the NiFi attributes
 
 High side:
   export TARGET_REGISTRY=registry.high.example.com
   mirror.py import /mnt/diode/received              # every tar there, removed once imported
   mirror.py import --s3-bucket received             # every tar in the bucket, removed once imported
-  mirror.py import /media/usb/carry.tar             # one tar, kept
+  mirror.py import /media/usb/carry.tar             # one tar, kept (--no-checksum without its .sha256)
 
 Run "mirror.py <command> -h" for each command's options and examples.
 """
@@ -1406,9 +1419,14 @@ def main(argv=None):
                               "the tar). Always removed afterwards")
 
     def base_flag(sub):
-        sub.add_argument("--rewrite-base-path", metavar="ORG", default=os.environ.get("MIRROR_REWRITE_BASE_PATH"),
-                         help="replace the first path segment of every image: team/app -> ORG/app "
-                              "(or MIRROR_REWRITE_BASE_PATH)")
+        group = sub.add_mutually_exclusive_group()
+        group.add_argument("--rewrite-base-path", metavar="ORG", default=os.environ.get("MIRROR_REWRITE_BASE_PATH"),
+                           help="replace the first path segment of every image: team/app -> ORG/app "
+                                "(or MIRROR_REWRITE_BASE_PATH)")
+        group.add_argument("--strip-base-path", action="store_true",
+                           default=os.environ.get("MIRROR_STRIP_BASE_PATH", "").lower() == "true",
+                           help="remove the first path segment of every image: team/prom/prometheus -> "
+                                "prom/prometheus (or MIRROR_STRIP_BASE_PATH=true)")
 
     command("sync", "copy every catalog image into TARGET_REGISTRY; safe to run again",
             "  mirror.py sync")
@@ -1420,7 +1438,8 @@ def main(argv=None):
         "  mirror.py export registry.low.example.com/team/app:v1.2.3\n"
         "  mirror.py export --list carry.txt -o /share/carry.tar   # one reference per line\n"
         "  mirror.py export --max-size 4GiB                  # several tars, none over 4 GiB unless one image is\n"
-        "  mirror.py export --rewrite-base-path new-org-dev  # team/app lands as new-org-dev/app")
+        "  mirror.py export --rewrite-base-path new-org-dev  # team/app lands as new-org-dev/app\n"
+        "  mirror.py export --strip-base-path                # team/prom/prometheus lands as prom/prometheus")
     export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag")
     export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
     export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
@@ -1433,7 +1452,8 @@ def main(argv=None):
         "send", "deliver tars and their .sha256 files to NiFi, an S3 bucket or a directory",
         "  mirror.py send container-images-*.tar --path /mnt/transfer     # an NFS share or a USB stick\n"
         "  mirror.py send container-images-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
-        "  mirror.py send container-images-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys")
+        "  mirror.py send container-images-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys\n"
+        "  mirror.py send container-images-*.tar --path /mnt/transfer --flowfile   # one NAME.tar.ffv3 per tar")
     send_command.add_argument("tars", nargs="+", type=Path, help="tar files export wrote")
     where = send_command.add_mutually_exclusive_group(required=True)
     where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
@@ -1448,7 +1468,10 @@ def main(argv=None):
         "  mirror.py import /mnt/diode/received          # every tar there; each removed once imported\n"
         "  mirror.py import --s3-bucket received         # every tar in the bucket; each removed once imported\n"
         "  mirror.py import /media/usb/carry.tar         # one tar, checked against carry.tar.sha256, kept\n"
-        "  mirror.py import /mnt/diode/received --rewrite-base-path new-org-dev")
+        "  mirror.py import /mnt/diode/received --rewrite-base-path new-org-dev\n"
+        "  mirror.py import /mnt/diode/received --strip-base-path   # team/app lands as app\n"
+        "  mirror.py import /media/usb/carry.tar --no-checksum      # the .sha256 was not copied\n"
+        "  mirror.py import /mnt/diode/received/container-images-1.tar.ffv3   # a NiFi FlowFile v3 package")
     import_command.add_argument("sources", nargs="*", type=Path, help="tar files or directories of them")
     import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
     import_command.add_argument("--keep", action="store_true", help="leave imported tars in the directory or bucket")
@@ -1490,6 +1513,11 @@ def main(argv=None):
         os.environ["MIRROR_VERBOSE"] = "true"
     if args.ledger:
         os.environ["MIRROR_LEDGER"] = args.ledger
+    base = getattr(args, "rewrite_base_path", None)
+    if getattr(args, "strip_base_path", False):
+        if base:
+            parser.error("--strip-base-path and --rewrite-base-path (or MIRROR_REWRITE_BASE_PATH) are both set")
+        base = STRIP
     try:
         check_renamed()
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
@@ -1498,13 +1526,13 @@ def main(argv=None):
             sync(args.catalog, ledger_file)
         elif args.command == "export":
             export(args.catalog, ledger_file, args.images, args.list, args.all, args.output, args.max_size,
-                   args.staging_dir, args.rewrite_base_path)
+                   args.staging_dir, base)
         elif args.command == "send":
             send(args.tars, ledger_file, args.nifi_url, args.s3_bucket, args.path, args.flowfile)
         elif args.command == "import":
             if not args.sources and not args.s3_bucket:
                 raise MirrorError("import needs a tar, a directory or --s3-bucket")
-            import_all(args.sources, args.s3_bucket, args.staging_dir, args.force, args.rewrite_base_path,
+            import_all(args.sources, args.s3_bucket, args.staging_dir, args.force, base,
                        args.record, args.keep, args.no_checksum)
         elif args.command == "login":
             login()
@@ -1520,7 +1548,7 @@ def main(argv=None):
         elif args.command == "covers":
             covers(args.catalog, args.files)
         else:
-            promote(args.record, args.rewrite_base_path)
+            promote(args.record, base)
         return 0
     except (MirrorError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f"error: {error}", file=sys.stderr)
