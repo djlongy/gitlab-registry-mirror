@@ -344,6 +344,30 @@ class MirrorTest(unittest.TestCase):
             self.assertIn('--max-time', args)
             self.assertEqual(self.out.getvalue().count('posted to NiFi: container-images-request.json'), 1)
 
+    def test_webhook_carries_registry_count_and_no_ci_headers_outside_ci(self):
+        with Registry(self) as registry:
+            self.two_images(registry)
+            code, sent = self.webhook(registry)
+            headers = sent[0][1]
+            self.assertIn(f'X-Registry: {LOW}', headers)
+            self.assertIn('X-Image-Count: 2', headers)
+            self.assertFalse([h for h in headers if h.startswith('X-CI-')])
+            self.assertTrue(max(map(len, headers)) < 200)  # the image list is in the body only
+
+    def test_webhook_carries_ci_headers_when_set_and_strips_cr_lf(self):
+        os.environ.update({'CI_PROJECT_PATH': 'infra/mirror', 'CI_COMMIT_SHA': 'abc123',
+                           'CI_PIPELINE_URL': 'https://git.example.internal/p/1\r\nX-Evil: 1', 'CI_JOB_TOKEN': ''})
+        with Registry(self) as registry:
+            self.two_images(registry)
+            code, sent = self.webhook(registry)
+            headers = sent[0][1]
+            self.assertIn('X-CI-Project: infra/mirror', headers)
+            self.assertIn('X-CI-Commit-Sha: abc123', headers)
+            self.assertIn('X-CI-Pipeline-Url: https://git.example.internal/p/1X-Evil: 1', headers)
+            self.assertFalse([h for h in headers if '\r' in h or '\n' in h])
+            os.environ['CI_COMMIT_SHA'] = ' '  # empty after trimming: not sent
+            self.assertEqual(list(mirror.ci_attributes()), ['X-CI-Project', 'X-CI-Pipeline-Url'])
+
     def test_webhook_is_silent_when_nothing_changed_or_unset(self):
         with Registry(self) as registry:
             self.two_images(registry)
