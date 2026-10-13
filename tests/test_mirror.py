@@ -476,6 +476,20 @@ class MirrorTest(unittest.TestCase):
             self.assertIn('waiting for half.tar.sha256', self.out.getvalue())
             self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
 
+    def test_strip_base_path_removes_the_first_segment_on_export_or_import(self):
+        self.assertEqual(mirror.rebase('team/prom/prometheus', mirror.STRIP), 'prom/prometheus')
+        self.assertEqual(mirror.rebase('team/app', mirror.STRIP), 'app')
+        self.assertEqual(mirror.rebase('team/app', 'new-org'), 'new-org/app')
+        self.assertEqual(mirror.rebase('team/app', ''), 'team/app')
+        with Registry(self) as registry:
+            tar, digest = self.exported(registry)
+            os.environ['TARGET_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', tar, '--strip-base-path'), 0)
+            self.assertEqual(registry.tags['high.example.internal/app:1.0'], digest)
+            os.environ['MIRROR_REWRITE_BASE_PATH'] = 'org'
+            with self.assertRaises(SystemExit):  # both at once is refused
+                self.cli('import', tar, '--strip-base-path')
+
     def test_import_no_checksum_takes_a_tar_without_its_sha256_but_still_checks_one_that_is_there(self):
         with Registry(self) as registry:
             tar, digest = self.exported(registry)
