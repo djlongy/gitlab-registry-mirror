@@ -1,0 +1,37 @@
+---
+# Builds the NiFi NAR and publishes it as a GitHub release when a tag nifi-v<version> is pushed.
+# The tag must match the version in nifi/container-images-processors/pom.xml.
+name: release-nar
+on:
+  push:
+    tags: ['nifi-v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00  # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build and test
+        working-directory: nifi/container-images-processors
+        run: |
+          version=$(mvn -q -B -ntp help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "nifi-v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match pom version $version" >&2
+            exit 1
+          fi
+          mvn -B -ntp package
+          cd nifi-container-images-nar/target
+          sha256sum "nifi-container-images-nar-$version.nar" > "nifi-container-images-nar-$version.nar.sha256"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "NiFi container images NAR ${GITHUB_REF_NAME#nifi-v}" \
+            --notes "NiFi 2.x NAR with PushContainerImages and PullContainerImages. Copy the .nar into each node's extensions directory; check it with sha256sum -c." \
+            nifi/container-images-processors/nifi-container-images-nar/target/*.nar \
+            nifi/container-images-processors/nifi-container-images-nar/target/*.nar.sha256
