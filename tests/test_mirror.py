@@ -300,6 +300,80 @@ class MirrorTest(unittest.TestCase):
             self.assertEqual(self.cli('sync'), 0)
             self.assertIn(f'{LOW}/team/db:2', registry.tags)
 
+    def webhook(self, registry, token=None, bundle=None, error=None):
+        """Run sync with MIRROR_WEBHOOK_URL set; curl is mocked. Returns the curl calls and the payload sent."""
+        os.environ['MIRROR_WEBHOOK_URL'] = 'https://nifi.example.internal:9099/contentListener'
+        if token:
+            os.environ['MIRROR_WEBHOOK_TOKEN'] = token
+        if bundle:
+            os.environ['MIRROR_WEBHOOK_CA_BUNDLE'] = str(bundle)
+        sent = []
+
+        def fake(*args):
+            if args[0] != 'curl':
+                return real(*args)
+            if error:
+                raise mirror.MirrorError(error)
+            path = Path(args[args.index('--upload-file') + 1])
+            headers = [args[i + 1] for i, a in enumerate(args) if a == '--header']
+            sent.append((args, headers, json.loads(path.read_text()),
+                         [Path(h[1:]).read_text() for h in headers if h.startswith('@')]))
+            return b'200'
+
+        real = mirror.run
+        with mock.patch.object(mirror, 'run', side_effect=fake):
+            code = self.cli('sync')
+        return code, sent
+
+    def test_webhook_posts_once_after_a_sync_that_changed_images_as_a_send_delivery(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            code, sent = self.webhook(registry, token='s3cret')
+            self.assertEqual(code, 0)
+            [(args, headers, body, auth)] = sent
+            self.assertEqual(body['registry'], LOW)
+            self.assertEqual(body['images'], [{'repository': 'team/app', 'tag': '1.0', 'digest': app},
+                                              {'repository': 'team/db', 'tag': '2', 'digest': db}])
+            self.assertEqual(body['references'], 'team/app:1.0\nteam/db:2')
+            for header in ('Content-Type: application/json', 'X-Artifact-Type: container-images-request',
+                           'X-Artifact-Format: json', 'Filename: container-images-request.json', 'Expect:'):
+                self.assertIn(header, headers)
+            self.assertTrue(any(h.startswith('X-Sha256: ') for h in headers))
+            self.assertEqual(auth, ['Authorization: Bearer s3cret\n'])  # from a file, not the command line
+            self.assertNotIn('s3cret', ' '.join(args) + self.out.getvalue() + sys.stderr.getvalue())
+            self.assertIn('--max-time', args)
+            self.assertEqual(self.out.getvalue().count('posted to NiFi: container-images-request.json'), 1)
+
+    def test_webhook_is_silent_when_nothing_changed_or_unset(self):
+        with Registry(self) as registry:
+            self.two_images(registry)
+            self.assertEqual(self.cli('sync'), 0)
+            code, sent = self.webhook(registry)  # second run: every tag already there
+            self.assertEqual((code, sent), (0, []))
+            del os.environ['MIRROR_WEBHOOK_URL']
+            with mock.patch.object(mirror, 'run', side_effect=AssertionError('no curl')):
+                mirror.notify(LOW, [{'repository': 'a', 'tag': '1', 'digest': 'sha256:0'}])  # unset: no post
+
+    def test_webhook_trusts_its_ca_bundle_on_top_of_the_system_roots(self):
+        bundle = self.root / 'webhook-ca.pem'
+        bundle.write_text(SELF_SIGNED)
+        with Registry(self) as registry:
+            self.two_images(registry)
+            code, sent = self.webhook(registry, bundle=bundle)
+        self.assertEqual(code, 0)
+        args = sent[0][0]
+        pem = Path(args[args.index('--cacert') + 1])
+        self.assertIn(SELF_SIGNED, pem.read_text())
+
+    def test_webhook_failure_only_warns(self):
+        with Registry(self) as registry:
+            self.two_images(registry)
+            code, sent = self.webhook(registry, token='s3cret', error='curl POST failed: HTTP 503')
+            self.assertEqual(code, 0)
+            self.assertIn('warning: webhook not delivered', sys.stderr.getvalue())
+            self.assertNotIn('s3cret', sys.stderr.getvalue())
+            self.assertEqual(len(registry.tags), 2)
+
     def test_latest_gets_its_version_tag_but_never_one_the_catalog_pins_or_pinned(self):
         with Registry(self) as registry, mock.patch.object(mirror, 'app_version', return_value='8.10.2'):
             latest, pinned = registry.image('latest'), registry.image('pinned')
