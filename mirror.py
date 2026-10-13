@@ -153,16 +153,16 @@ def cert_dir(host):
 
 
 @functools.cache
-def ca_files():
+def ca_files(variable="CA_BUNDLE"):
     """CA_BUNDLE, a PEM file of one or more CA (or self-signed server) certificates. Every connection
     trusts it in addition to what the system already trusts, never instead: (the file, a skopeo cert dir,
     curl's trust arguments). None when unset."""
-    setting = os.environ.get("CA_BUNDLE", "").strip()
+    setting = os.environ.get(variable, "").strip()
     if not setting:
         return None
     bundle = Path(setting).resolve()
     if not bundle.is_file():
-        raise MirrorError(f"CA_BUNDLE {setting} is not a file")
+        raise MirrorError(f"{variable} {setting} is not a file")
     directory = Path(tempfile.mkdtemp(prefix="mirror-ca-"))
     atexit.register(shutil.rmtree, directory, ignore_errors=True)
     shutil.copyfile(bundle, directory / "ca.crt")  # skopeo adds every *.crt in --cert-dir to the system roots
@@ -621,7 +621,7 @@ def sync(path, ledger_file):
     # A tag a catalog entry pins, or pinned before its line was removed, is never a version tag.
     pinned = ledger.setdefault("pinned", [])
     catalog_tags = {f"{i['target']}:{i['tag']}" for i in images} | set(pinned)
-    copied = 0
+    copied, changed = 0, []
     for image in images:
         key = f"{image['target']}:{image['tag']}"
         source = transport_reference(image["source"])  # by digest: a moved source tag changes nothing
@@ -662,11 +662,13 @@ def sync(path, ledger_file):
                 raise MirrorError(f"digest mismatch in target registry: {image['target']}:{tag}")
             print(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
             copied += 1
+            changed.append({"repository": image["target"], "tag": tag, "digest": transfer})
         ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
     ledger["platforms"] = platforms
     if json.dumps(ledger, sort_keys=True) != loaded:
         save_ledger(ledger_file, ledger)
     print(f"synced {len(images)} image(s) into {low}: {copied} tag(s) copied, the rest already there")
+    return changed
 
 
 def pending(path, ledger_file):
@@ -954,22 +956,54 @@ def attributes(path, checksum):
             "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar"}
 
 
-def post_file(path, checksum, url):
-    """POST one file to a NiFi ListenHTTP, streamed, with its attributes as headers."""
+def post(path, headers, url, trust, limits=("--max-time", "3600", "--retry", "10"), token=None):
+    """POST one file to url, streamed, with headers (a dict). The one HTTP client for send and the webhook."""
     parts = urllib.parse.urlsplit(url)
     shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
-    file_size = path.stat().st_size
     # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break a case-sensitive
     # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
-    # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
-    # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
-    headers = ["Expect:", *(f"{name}: {value}" for name, value in attributes(path, checksum).items())]
-    trust = ca_files()[2] if ca_files() else []
-    status = run("curl", "--http1.1", *trust, "--fail", "--show-error", "--silent", "--connect-timeout", "15",
-                 "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
-                 "--output", "/dev/null", "--write-out", "%{http_code}",
-                 *[item for header in headers for item in ("--header", header)], "--upload-file", str(path), url)
-    print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes)")
+    # an empty Expect skips the 100-continue round trip. NiFi answers 503 while its queue is full
+    # (back pressure); ten retries back off from 1 s to about 8 minutes.
+    lines = ["Expect:", *(f"{name}: {value}" for name, value in headers.items())]
+    with tempfile.TemporaryDirectory(prefix="mirror-post-") as scratch:
+        if token:  # read from a 0600 file, so neither ps nor -v shows it
+            secret = Path(scratch) / "auth"
+            secret.touch(mode=0o600)
+            secret.write_text(f"Authorization: Bearer {token}\n")
+            lines.append(f"@{secret}")
+        status = run("curl", "--http1.1", *trust, "--fail", "--show-error", "--silent", "--connect-timeout", "15",
+                     *limits, "--request", "POST", "--output", "/dev/null", "--write-out", "%{http_code}",
+                     *[item for header in lines for item in ("--header", header)], "--upload-file", str(path), url)
+    print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {path.stat().st_size} bytes)")
+
+
+def post_file(path, checksum, url):
+    """POST one file to a NiFi ListenHTTP, with its attributes as headers."""
+    post(path, attributes(path, checksum), url, ca_files()[2] if ca_files() else [],
+         ("--max-time", str(max(3600, path.stat().st_size // 1_000_000)), "--retry", "10"))
+
+
+def notify(low, changed):
+    """After a sync that changed images, POST once to MIRROR_WEBHOOK_URL as a send delivery would arrive
+    (the same attribute headers, X-Artifact-Type container-images-request) so the low NiFi routes it on
+    attributes. Body: JSON {"registry", "images": [{repository, tag, digest}], "references": "repo:tag"
+    lines}. A failure warns and never fails the sync."""
+    url = os.environ.get("MIRROR_WEBHOOK_URL", "").strip()
+    if not url or not changed:
+        return
+    body = {"registry": low, "images": changed,
+            "references": "\n".join(f"{i['repository']}:{i['tag']}" for i in changed)}
+    try:
+        with tempfile.TemporaryDirectory(prefix="mirror-webhook-") as scratch:
+            payload = Path(scratch) / "container-images-request.json"
+            payload.write_text(json.dumps(body))
+            headers = {**attributes(payload, sha256(payload)), "Content-Type": "application/json",
+                       "X-Artifact-Type": "container-images-request", "X-Artifact-Format": "json"}
+            bundle = ca_files("MIRROR_WEBHOOK_CA_BUNDLE") or ca_files()
+            post(payload, headers, url, bundle[2] if bundle else [], ("--max-time", "30", "--retry", "2"),
+                 os.environ.get("MIRROR_WEBHOOK_TOKEN", "").strip() or None)
+    except (MirrorError, OSError) as error:
+        print(f"warning: webhook not delivered: {error}", file=sys.stderr)
 
 
 def land(destination, write):
@@ -1520,10 +1554,11 @@ def main(argv=None):
         base = STRIP
     try:
         check_renamed()
+        ca_files("MIRROR_WEBHOOK_CA_BUNDLE")
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
         ledger_file = ledger_location(args.catalog)
         if args.command == "sync":
-            sync(args.catalog, ledger_file)
+            notify(registry("TARGET_REGISTRY"), sync(args.catalog, ledger_file))
         elif args.command == "export":
             export(args.catalog, ledger_file, args.images, args.list, args.all, args.output, args.max_size,
                    args.staging_dir, base)
