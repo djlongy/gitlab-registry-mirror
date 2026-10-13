@@ -8,12 +8,34 @@ NiFi processors that export container images from a registry into a mirror.py ex
 - Java 21 and Maven 3.9 to build, or Docker to build in a container.
 - Any registry that follows the distribution API: `registry:2` (open, htpasswd or token auth), Quay, Artifactory, Harbor, GitLab.
 
+## Download
+
+Each tag `nifi-v<version>` publishes the NAR and its `.sha256` as a GitHub release:
+
+```sh
+curl -fLO https://github.com/djlongy/gitlab-registry-mirror/releases/download/nifi-v1.0.2/nifi-container-images-nar-1.0.2.nar
+curl -fLO https://github.com/djlongy/gitlab-registry-mirror/releases/download/nifi-v1.0.2/nifi-container-images-nar-1.0.2.nar.sha256
+sha256sum -c nifi-container-images-nar-1.0.2.nar.sha256
+```
+
+To release a new version, set it in the three `pom.xml` files and push the tag `nifi-v<version>`.
+
 ## Build
 
 ```sh
 docker run --rm -v "$PWD":/src -w /src maven:3.9.11-eclipse-temurin-21 mvn -B package
 # nifi-container-images-nar/target/nifi-container-images-nar-1.0.2.nar
 ```
+
+On RHEL with SELinux and rootless podman, label the mounts with `:Z`, and give Maven the proxy itself (it ignores `HTTPS_PROXY`), or point `~/.m2/settings.xml` at an internal Maven mirror (`<mirror><mirrorOf>*</mirrorOf><url>https://repo.example.internal/maven</url></mirror>`):
+
+```sh
+podman run --rm -v "$PWD:/src:Z" -v "$HOME/.m2:/root/.m2:Z" -w /src \
+  -e MAVEN_OPTS="-Dhttps.proxyHost=proxy.example.internal -Dhttps.proxyPort=3128" \
+  maven:3.9.11-eclipse-temurin-21 mvn -B package
+```
+
+The `Failed to mount subscriptions` warning from rootless podman is harmless. Where Maven Central is out of reach, download the release above instead.
 
 ## Install
 
