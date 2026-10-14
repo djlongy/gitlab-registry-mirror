@@ -951,9 +951,25 @@ def s3_list(s3):
 def attributes(path, checksum):
     """What each delivered file carries, names case for case: the HTTP headers to NiFi, the FlowFile
     attributes in a .ffv3, and S3 object metadata (which an S3 store may lowercase; a .ffv3 in the bucket
-    keeps the case)."""
+    keeps the case). Inside GitLab CI it adds X-CI-Project, X-CI-Pipeline-Url and X-CI-Commit-Sha: for
+    routing and display only, a receiver trusts the file, not these."""
     return {"Filename": path.name, "Content-Type": "application/octet-stream", "X-Sha256": checksum,
-            "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar"}
+            "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar", **ci_attributes()}
+
+
+CI_ATTRIBUTES = {"X-CI-Project": "CI_PROJECT_PATH", "X-CI-Pipeline-Url": "CI_PIPELINE_URL",
+                 "X-CI-Commit-Sha": "CI_COMMIT_SHA"}
+
+
+def header_value(value):
+    """A value safe in an HTTP header, a FlowFile attribute or S3 metadata: CR and LF removed."""
+    return re.sub(r"[\r\n]", "", str(value)).strip()
+
+
+def ci_attributes():
+    """The CI_* variables that are set and non-empty, as attributes; none outside GitLab CI."""
+    found = {name: header_value(os.environ.get(variable, "")) for name, variable in CI_ATTRIBUTES.items()}
+    return {name: value for name, value in found.items() if value}
 
 
 def post(path, headers, url, trust, limits=("--max-time", "3600", "--retry", "10"), token=None):
@@ -986,7 +1002,8 @@ def post_file(path, checksum, url):
 def notify(low, changed):
     """After a sync that changed images, POST once to MIRROR_WEBHOOK_URL as a send delivery would arrive
     (the same attribute headers, X-Artifact-Type container-images-request) so the low NiFi routes it on
-    attributes. Body: JSON {"registry", "images": [{repository, tag, digest}], "references": "repo:tag"
+    attributes, plus X-Registry and X-Image-Count (the image list stays in the body: a header is capped
+    near 8 KB). Body: JSON {"registry", "images": [{repository, tag, digest}], "references": "repo:tag"
     lines}. A failure warns and never fails the sync."""
     url = os.environ.get("MIRROR_WEBHOOK_URL", "").strip()
     if not url or not changed:
@@ -998,7 +1015,8 @@ def notify(low, changed):
             payload = Path(scratch) / "container-images-request.json"
             payload.write_text(json.dumps(body))
             headers = {**attributes(payload, sha256(payload)), "Content-Type": "application/json",
-                       "X-Artifact-Type": "container-images-request", "X-Artifact-Format": "json"}
+                       "X-Artifact-Type": "container-images-request", "X-Artifact-Format": "json",
+                       "X-Registry": header_value(low), "X-Image-Count": str(len(changed))}
             bundle = ca_files("MIRROR_WEBHOOK_CA_BUNDLE") or ca_files()
             post(payload, headers, url, bundle[2] if bundle else [], ("--max-time", "30", "--retry", "2"),
                  os.environ.get("MIRROR_WEBHOOK_TOKEN", "").strip() or None)
