@@ -139,13 +139,13 @@ if __name__ == '__main__':
         checks.append('reimport-is-a-no-op')
 
         cli('low', 'export', f'{target}:1.0.1', '-o', out / 'move.tar')
-        # Point the high tag elsewhere first: import must refuse to move it back silently.
+        # Point the high tag elsewhere first: --keep-tags refuses to move it back, a plain import moves it.
         mirror.copy(f"docker://{REGISTRIES['high']}/{target}:1.0.0", f"docker://{REGISTRIES['high']}/{target}:1.0.1",
                     'TARGET_REGISTRY', 'TARGET_REGISTRY')
-        cli('high', 'import', out / 'move.tar', fail='does not move without --force')
-        cli('high', 'import', out / 'move.tar', '--force')
+        cli('high', 'import', out / 'move.tar', '--keep-tags', fail='--keep-tags does not move a tag')
+        cli('high', 'import', out / 'move.tar')
         assert on_high(target, '1.0.1')[0] == mirror.catalog(CATALOG)[0]['digest']
-        checks.append('tag-move-needs-force')
+        checks.append('tag-moves-unless-keep-tags')
 
         with (out / 'move.tar').open('ab') as stream:
             stream.write(b'corrupt')

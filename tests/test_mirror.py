@@ -527,7 +527,7 @@ class MirrorTest(unittest.TestCase):
         self.assertEqual(self.cli('export', source, '-o', tar), 0)
         return tar, registry.tags[source]
 
-    def test_import_pushes_digests_unchanged_skips_present_and_never_moves_a_tag_without_force(self):
+    def test_import_pushes_digests_unchanged_skips_present_and_moves_a_tag_unless_keep_tags(self):
         with Registry(self) as registry:
             tar, digest = self.exported(registry)
             os.environ['TARGET_REGISTRY'] = 'high.example.internal'
@@ -540,9 +540,9 @@ class MirrorTest(unittest.TestCase):
                 self.assertEqual(self.cli('import', tar, '--rewrite-base-path', 'org-dev'), 0)
             push.assert_not_called()
             registry.tags['high.example.internal/team/app:1.0'] = 'sha256:' + 'b' * 64
-            self.assertEqual(self.cli('import', tar), 1)
+            self.assertEqual(self.cli('import', tar, '--keep-tags'), 1)
             self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], 'sha256:' + 'b' * 64)
-            self.assertEqual(self.cli('import', tar, '--force'), 0)
+            self.assertEqual(self.cli('import', tar), 0)
             self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
         with mock.patch.object(mirror, 'raw_digest', side_effect=mirror.MirrorError('skopeo inspect failed: unauthorized')), \
                 mock.patch.object(mirror, 'copy') as push:
@@ -754,15 +754,6 @@ class MirrorTest(unittest.TestCase):
             self.assertEqual(bucket, {})
             self.assertEqual([p.name for p in self.root.glob('.mirror-staging-*')], [])
 
-    def test_variables_from_an_older_release_fail_with_what_replaces_them(self):
-        os.environ.update({'LOW_QUAY_HOST': 'low.example.internal', 'RESEND_SEQUENCE': '3..', 'MIRROR_SEND': 'nifi'})
-        with mock.patch('sys.stderr', new_callable=io.StringIO) as err:
-            self.assertEqual(mirror.main(['targets']), 1)
-        said = err.getvalue()
-        self.assertIn('LOW_QUAY_HOST is replaced by TARGET_REGISTRY', said)
-        self.assertIn('RESEND_SEQUENCE is replaced by EXPORT_IMAGES', said)
-        self.assertIn('MIRROR_SEND is replaced by NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH', said)
-
     # Catalog, add, platforms and promote
 
     def test_catalog_requires_a_digest_and_an_org_and_repository(self):
@@ -779,6 +770,38 @@ class MirrorTest(unittest.TestCase):
         path.write_text(('docker.io/library/alpine:3.20@sha256:' + 'a'*64 + ' mirror/alpine\n') * 2)
         with self.assertRaisesRegex(mirror.MirrorError, 'duplicate'):
             mirror.catalog(path)
+
+    def test_catalog_names_every_bad_line(self):
+        path = self.root / 'images.txt'
+        good = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64
+        path.write_text(f'# header\n{good} mirror/alpine\ndocker.io/prom/prometheus:v3 itis-dev/prom/prometheus\n'
+                        f'{good} alpine\njust-one-field\n')
+        with self.assertRaises(mirror.MirrorError) as caught:
+            mirror.catalog(path)
+        said = str(caught.exception)
+        self.assertIn('has 3 invalid line(s)', said)
+        self.assertIn('images.txt line 3: source docker.io/prom/prometheus:v3 has no @sha256:<digest>', said)
+        self.assertIn('    docker.io/prom/prometheus:v3 itis-dev/prom/prometheus', said)
+        self.assertIn('images.txt line 4: target alpine is not <org>/<repository>', said)
+        self.assertIn('images.txt line 5: expected 2 fields (source and target), found 1', said)
+        self.assertIn('mirror.py add <registry>/<repository>:<tag>', said)
+        self.assertNotIn('line 2', said)
+
+    def test_catalog_skips_comments_including_after_a_byte_order_mark(self):
+        path = self.root / 'images.txt'
+        good = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64 + ' mirror/alpine'
+        path.write_bytes(('\ufeff# saved by Notepad\r\n   # indented\r\n\t# tab\r\n' + good + '  # note\r\n').encode())
+        self.assertEqual([i['target'] for i in mirror.catalog(path)], ['mirror/alpine'])
+        mirror.write_catalog(path, ['docker.io/library/busybox:1@sha256:' + 'b'*64 + ' mirror/busybox'])
+        self.assertEqual(len(mirror.catalog(path)), 2)
+
+    def test_add_reports_a_bad_catalog_line_before_any_lookup(self):
+        path = self.root / 'images.txt'
+        path.write_text('docker.io/prom/prometheus:v3 itis-dev/prom/prometheus\n')
+        with mock.patch.object(mirror, 'run') as lookup, \
+                self.assertRaisesRegex(mirror.MirrorError, 'images.txt line 1: source docker.io/prom/prometheus:v3 has no'):
+            mirror.add_image(path, 'docker.io/prom/prometheus:v3', 'itis-dev/prom/prometheus')
+        lookup.assert_not_called()
 
     def test_add_resolves_a_pin(self):
         path = self.root / 'images.txt'

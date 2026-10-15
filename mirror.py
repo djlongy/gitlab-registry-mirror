@@ -78,30 +78,68 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
-def parse_image(source, target):
+FORMAT = ("each line is: <registry>/<repository>:<tag>@sha256:<64 hex> <org>/<repository>, for example\n"
+          "  docker.io/prom/prometheus:v3.5.0@sha256:<digest> team/prom/prometheus\n"
+          "mirror.py add <registry>/<repository>:<tag> <org>/<repository> writes a correct line for you")
+
+
+def image_problem(source, target, pinned=True):
+    """What is wrong with a source and target pair, in words a first-time user can act on, or None."""
     name, separator, digest = source.partition("@")
     match = SOURCE.fullmatch(name)
-    if (not match or not separator or not re.fullmatch(DIGEST, digest)
-            or not TARGET.fullmatch(target) or any(p in ("", ".", "..") for p in match['repo'].split('/'))):
-        raise MirrorError("expected registry/repo:tag@sha256:<64 hex> org/repo[/path]")
-    return {"source": source, "target": target, "tag": match["tag"], "digest": digest}
+    if not re.match(rf"(?:{HOST})/", name):
+        return f"source {name} has no registry host; give the full reference, for example {normalise(name)}"
+    if not match:
+        return (f"source {name} is not <registry>/<repository>:<tag>; the repository is lowercase and the tag "
+                "comes after a colon")
+    if any(part in ("", ".", "..") for part in match["repo"].split("/")):
+        return f"source {name} has an empty, . or .. part in its repository path"
+    if pinned and not separator:
+        return f"source {name} has no @sha256:<digest>; mirror.py add looks the digest up and writes the line"
+    if pinned and not re.fullmatch(DIGEST, digest):
+        return f"digest {digest} is not sha256: followed by 64 lowercase hex characters"
+    if not target:
+        return "the target is missing; give the repository path in TARGET_REGISTRY, for example team/prom/prometheus"
+    if not TARGET.fullmatch(target):
+        return (f"target {target} is not <org>/<repository>: it needs at least one slash, lowercase letters, "
+                "digits and . _ - only, and no tag")
+    return None
+
+
+def parse_image(source, target):
+    problem = image_problem(source, target)
+    if problem:
+        raise MirrorError(problem)
+    match = SOURCE.fullmatch(source.partition("@")[0])
+    return {"source": source, "target": target, "tag": match["tag"], "digest": source.partition("@")[2]}
 
 
 def catalog(path):
-    images, seen = [], set()
-    for number, raw in enumerate(path.read_text().splitlines(), 1):
+    """Every image in the catalog. Every bad line is reported at once, by file and line number."""
+    images, seen, problems = [], {}, []
+    for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         fields = line.split()
         if len(fields) != 2:
-            raise MirrorError(f"{path}:{number}: expected a pinned source and target")
-        image = parse_image(*fields)
+            problems.append(f"{path.name} line {number}: expected 2 fields (source and target), found "
+                            f"{len(fields)}: {line}")
+            continue
+        try:
+            image = parse_image(*fields)
+        except MirrorError as error:
+            problems.append(f"{path.name} line {number}: {error}\n    {line}")
+            continue
         key = f"{image['target']}:{image['tag']}"
         if key in seen:
-            raise MirrorError(f"{path}:{number}: duplicate target tag {key}")
-        seen.add(key)
+            problems.append(f"{path.name} line {number}: duplicate target tag {key}, first on line {seen[key]}")
+            continue
+        seen[key] = number
         images.append(image)
+    if problems:
+        raise MirrorError(f"{path} has {len(problems)} invalid line(s); fix or remove them:\n  "
+                          + "\n  ".join(problems) + "\n" + FORMAT)
     return images
 
 
@@ -431,10 +469,9 @@ def rebase(path, base):
 def resolve_entry(source, target):
     """Pin source to the digest its tag points at now; returns the catalog image and the tags it publishes."""
     name = source.split("@", 1)[0]
-    if not re.match(rf"(?:{HOST})/", name):
-        raise MirrorError(f"{source} has no registry host; give the full reference, for example {normalise(source)}")
-    if not SOURCE.fullmatch(name) or not TARGET.fullmatch(target):
-        raise MirrorError("add needs registry/repo:tag and org/repo[/path]")
+    problem = image_problem(source, target, pinned=False)
+    if problem:
+        raise MirrorError(problem)
     raw = run("skopeo", "inspect", "--raw", *options(side_of(source), reference=source), "docker://" + transport_reference(source))
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
@@ -453,7 +490,7 @@ def write_catalog(path, lines):
     """Add catalog lines and keep the file sorted a to z by source. Leading comments stay at the
     top; a comment directly above an entry moves with it."""
     header, groups, notes = [], [], []
-    for raw in (path.read_text().splitlines() if path.exists() else []):
+    for raw in (path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []):
         text = raw.strip()
         if not groups and (not text or text.startswith("#")):
             header.append(raw)
@@ -470,12 +507,22 @@ def write_catalog(path, lines):
 
 
 def add_image(path, source, target):
-    image, tags = resolve_entry(source, target)
+    print(f"checking {path}", flush=True)
     images = catalog(path) if path.exists() else []
-    if any((i['target'], i['tag']) == (target, image['tag']) for i in images):
-        raise MirrorError("target tag already exists; edit its reviewed catalog entry")
+    print(f"resolving {source} to the digest its tag points at now")
+    image, tags = resolve_entry(source, target)
+    print(f"digest: {image['digest']}")
+    same = [i for i in images if i["target"] == target and i["tag"] == image["tag"]]
+    if same:
+        raise MirrorError(f"{target}:{image['tag']} is already in {path.name} as {same[0]['source']}; "
+                          "edit that line to move it to another digest")
+    shared = [f"{i['target']}:{i['tag']}" for i in images if i["digest"] == image["digest"]]
+    if shared:
+        print(f"same digest as {', '.join(shared)}: the registry stores the image once and adds this tag")
     write_catalog(path, [f"{image['source']} {target}"])
-    print(f"added: {image['source']} -> {target}:{', :'.join(tags)}")
+    print(f"added to {path.name}: {image['source']} {target}")
+    host = os.environ.get("TARGET_REGISTRY", "").strip().rstrip("/")
+    print(f"sync pushes it as {host + '/' if host else ''}{target}:{', :'.join(tags)}")
 
 
 def list_reference(text):
@@ -500,7 +547,7 @@ def add_list(path, folder, prefix=None):
     existing = {(i["target"], i["tag"]) for i in (catalog(path) if path.exists() else [])}
     added, failed = [], []
     for file in files:
-        for number, raw in enumerate(file.read_text().splitlines(), 1):
+        for number, raw in enumerate(file.read_text(encoding="utf-8-sig").splitlines(), 1):
             text = raw.split("#", 1)[0].strip()
             if not text:
                 continue
@@ -779,7 +826,7 @@ def wanted_images(path, ledger_file, entries, listing, everything):
     image sync has put in TARGET_REGISTRY and send has not delivered at that digest."""
     entries = list(entries)
     if listing:
-        entries += [line.split("#", 1)[0].strip() for line in Path(listing).read_text().splitlines()]
+        entries += [line.split("#", 1)[0].strip() for line in Path(listing).read_text(encoding="utf-8-sig").splitlines()]
         entries = [entry for entry in entries if entry]
     if entries:
         return [found for entry in entries for found in export_tags(entry)]
@@ -1172,7 +1219,7 @@ def record_sent(tar, ledger_file):
             print("ledger: read only, the pipeline's ledger is unchanged")
 
 
-def import_tar(tar, staging=None, force=False, base=None, record=None, no_checksum=False):
+def import_tar(tar, staging=None, keep_tags=False, base=None, record=None, no_checksum=False):
     """Push every image in an export tar into TARGET_REGISTRY, tags and digests unchanged. Every image is
     checked before the first push, so a refusal pushes nothing. A tag already at its digest is skipped.
     With no_checksum a tar whose .sha256 is missing still imports: each image is still checked against
@@ -1202,14 +1249,16 @@ def import_tar(tar, staging=None, force=False, base=None, record=None, no_checks
             target = rebase(image["target"], base)
             destination = f"docker://{high}/{target}:{image['tag']}"
             present = present_digest(destination, "TARGET_REGISTRY")
-            if present and present != image["digest"] and not force:
+            if present and present != image["digest"] and keep_tags:
                 raise MirrorError(f"{high}/{target}:{image['tag']} is {present}, the tar has {image['digest']}; "
-                                  "a tag does not move without --force")
+                                  "--keep-tags does not move a tag")
             plan.append((image, directory, target, destination, present))
         for image, directory, target, destination, present in plan:
             if present == image["digest"]:
                 print(f"already there: {high}/{target}:{image['tag']}@{present}")
             else:
+                if present:  # as docker push does: the tag moves, the old image stays reachable by digest
+                    print(f"moving tag: {high}/{target}:{image['tag']} from {present} to {image['digest']}")
                 copy(f"dir:{directory}", destination, None, "TARGET_REGISTRY")
                 if raw_digest(destination, "TARGET_REGISTRY") != image["digest"]:
                     raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the push: {target}:{image['tag']}")
@@ -1221,7 +1270,7 @@ def import_tar(tar, staging=None, force=False, base=None, record=None, no_checks
     print(f"{tar.name}: {len(plan)} image tag(s) in {high}, digests verified")
 
 
-def import_package(package, staging=None, force=False, base=None, record=None):
+def import_package(package, staging=None, keep_tags=False, base=None, record=None):
     """Import the tar inside a .ffv3 that send --flowfile (or NiFi PackageFlowFile) wrote, checked against
     its X-Sha256 attribute."""
     with staging_dir(package.parent, staging) as unpacked:
@@ -1232,10 +1281,10 @@ def import_package(package, staging=None, force=False, base=None, record=None):
         if not re.fullmatch(r"[0-9a-f]{64}", attrs.get("X-Sha256", "")):
             raise MirrorError(f"{package.name}: {tar.name} has no X-Sha256 attribute")
         tar.with_name(tar.name + ".sha256").write_text(f"{attrs['X-Sha256']}  {tar.name}\n")  # checked by import_tar
-        import_tar(tar, unpacked, force, base, record)
+        import_tar(tar, unpacked, keep_tags, base, record)
 
 
-def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, record=None, keep=False,
+def import_all(sources, s3_bucket=None, staging=None, keep_tags=False, base=None, record=None, keep=False,
                no_checksum=False):
     """Import tar or .ffv3 files, every one in a directory, or every one in an S3 bucket. A directory or a
     bucket is an inbox: each file is removed once imported, unless keep, and one that fails stays put
@@ -1265,14 +1314,14 @@ def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, re
             fetch(s3, key, local)
             if sidecar:
                 fetch(s3, key + ".sha256", local.with_name(local.name + ".sha256"))
-                import_tar(local, download, force, base, record)
+                import_tar(local, download, keep_tags, base, record)
             else:
-                import_package(local, download, force, base, record)
+                import_package(local, download, keep_tags, base, record)
 
     for source in map(Path, sources):
         if source.is_dir():
             for package in sorted(source.glob("*.ffv3")):
-                attempt(f"{source}/{package.name}", lambda: import_package(package, staging, force, base, record),
+                attempt(f"{source}/{package.name}", lambda: import_package(package, staging, keep_tags, base, record),
                         package.unlink)
             for tar in sorted(source.glob("*.tar")):
                 sidecar = tar.with_name(tar.name + ".sha256")
@@ -1280,13 +1329,13 @@ def import_all(sources, s3_bucket=None, staging=None, force=False, base=None, re
                     print(f"waiting for {sidecar.name}; skipped (--no-checksum imports it now)")
                     continue
                 # The tar first: a .sha256 left alone is never listed.
-                attempt(f"{source}/{tar.name}", lambda: import_tar(tar, staging, force, base, record, no_checksum),
+                attempt(f"{source}/{tar.name}", lambda: import_tar(tar, staging, keep_tags, base, record, no_checksum),
                         lambda: (tar.unlink(), sidecar.unlink(missing_ok=True)))
         elif source.suffix == ".ffv3":
-            import_package(source, staging, force, base, record)
+            import_package(source, staging, keep_tags, base, record)
             done += 1
         else:
-            import_tar(source, staging, force, base, record, no_checksum)
+            import_tar(source, staging, keep_tags, base, record, no_checksum)
             done += 1
     if s3_bucket:
         s3 = s3_settings(s3_bucket)
@@ -1380,37 +1429,6 @@ def covers(path, files):
     if missing:
         raise MirrorError(f"{missing} image(s) not in the mirror catalog; add them with mirror.py add")
     print("every image is in the mirror catalog")
-
-
-# Variables an older release read. Each set one fails with what replaces it, so nothing changes silently.
-RENAMED = {
-    "LOW_QUAY_HOST": "TARGET_REGISTRY", "HIGH_QUAY_HOST": "TARGET_REGISTRY",
-    "LOW_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME", "HIGH_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME",
-    "LOW_QUAY_PASSWORD": "TARGET_REGISTRY_PASSWORD", "HIGH_QUAY_PASSWORD": "TARGET_REGISTRY_PASSWORD",
-    "LOW_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY", "HIGH_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY",
-    "UPSTREAM_REGISTRY": "SOURCE_REGISTRY", "UPSTREAM_USERNAME": "SOURCE_REGISTRY_USERNAME",
-    "UPSTREAM_PASSWORD": "SOURCE_REGISTRY_PASSWORD", "UPSTREAM_TLS_VERIFY": "SOURCE_REGISTRY_TLS_VERIFY",
-    "S3_CA_BUNDLE": "CA_BUNDLE (one bundle for every connection)",
-    "MIRROR_SEND": "NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH (whichever is set says where the pipeline sends)",
-    "MIRROR_BUNDLE_MAX_SIZE": "MIRROR_MAX_SIZE (export --max-size)",
-    "MIRROR_STAGING_PATH": "MIRROR_STAGING_DIR", "MIRROR_STATE_DIR": "MIRROR_STAGING_DIR",
-    "IMPORT_STATE_DIR": "MIRROR_STAGING_DIR", "MIRROR_SCRATCH": "MIRROR_STAGING_DIR",
-    "IMPORT_PATH_REWRITE": "MIRROR_REWRITE_BASE_PATH (the new first path segment only)",
-    "PROMOTE_PATH_REWRITE": "MIRROR_REWRITE_BASE_PATH (the new first path segment only)",
-    "RESEND_ALL": "EXPORT_ALL", "RESEND_SINCE": "EXPORT_IMAGES (export names the images to send again)",
-    "RESEND_SEQUENCE": "EXPORT_IMAGES (export names the images to send again)",
-    "RESEND_IMAGE": "EXPORT_IMAGES (export names the images to send again)",
-    "MIRROR_BUNDLE_DIR": "export --output", "MIRROR_BLOB_DELTA": "nothing: tars carry whole images",
-    "IMPORT_STORE": "import DIR or import --s3-bucket", "IMPORT_INBOX_DIR": "import DIR",
-    "IMPORT_GAP_GRACE": "nothing: import is idempotent and has no sequence",
-    "IMPORT_DELETE_BUNDLES": "nothing: import removes what it imported from a directory or bucket (--keep)",
-}
-
-
-def check_renamed():
-    stale = sorted(f"{old} is replaced by {new}" for old, new in RENAMED.items() if os.environ.get(old, "").strip())
-    if stale:
-        raise MirrorError("unset these variables from an older release: " + "; ".join(stale))
 
 
 def login():
@@ -1527,7 +1545,9 @@ def main(argv=None):
     import_command.add_argument("sources", nargs="*", type=Path, help="tar files or directories of them")
     import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
     import_command.add_argument("--keep", action="store_true", help="leave imported tars in the directory or bucket")
-    import_command.add_argument("--force", action="store_true", help="move a tag that already points at another digest")
+    import_command.add_argument("--keep-tags", action="store_true",
+                                help="refuse to move a tag that already points at another digest; by default a tag "
+                                     "moves, as docker push moves it")
     import_command.add_argument("--no-checksum", action="store_true",
                                 help="import a tar whose .sha256 is missing, on its image digests alone; "
                                      "a .sha256 that is there is still checked")
@@ -1571,7 +1591,6 @@ def main(argv=None):
             parser.error("--strip-base-path and --rewrite-base-path (or MIRROR_REWRITE_BASE_PATH) are both set")
         base = STRIP
     try:
-        check_renamed()
         ca_files("MIRROR_WEBHOOK_CA_BUNDLE")
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
         ledger_file = ledger_location(args.catalog)
@@ -1585,7 +1604,7 @@ def main(argv=None):
         elif args.command == "import":
             if not args.sources and not args.s3_bucket:
                 raise MirrorError("import needs a tar, a directory or --s3-bucket")
-            import_all(args.sources, args.s3_bucket, args.staging_dir, args.force, base,
+            import_all(args.sources, args.s3_bucket, args.staging_dir, args.keep_tags, base,
                        args.record, args.keep, args.no_checksum)
         elif args.command == "login":
             login()

@@ -33,4 +33,4 @@ python3 mirror.py import /media/usb/carry.tar             # or a received direct
 
 It works when the `sync` job log ends `sent: container-images-<pipeline>.tar` and the high `import` prints `imported: <host>/team/prometheus:v3.13.4@sha256:...`.
 
-If `import` says a tag `does not move without --force`, the high tag points at another digest: check it, then rerun with `--force`.
+`import` moves a tag that points at another digest on the high side, as `docker push` does, and prints `moving tag:` with both digests. Pass `--keep-tags` to refuse instead.
