@@ -1479,8 +1479,8 @@ def main(argv=None):
                         help="print every skopeo and curl command (or MIRROR_VERBOSE=true)")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
 
-    def command(name, summary, examples):
-        return commands.add_parser(name, help=summary, description=summary, epilog="examples:\n" + examples,
+    def command(name, summary, examples, about=""):
+        return commands.add_parser(name, help=summary, description=summary, epilog=about + "examples:\n" + examples,
                                    formatter_class=raw)
 
     def staging_flag(sub):
@@ -1509,7 +1509,14 @@ def main(argv=None):
         "  mirror.py export --list carry.txt -o /share/carry.tar   # one reference per line\n"
         "  mirror.py export --max-size 4GiB                  # several tars, none over 4 GiB unless one image is\n"
         "  mirror.py export --rewrite-base-path new-org-dev  # team/app lands as new-org-dev/app\n"
-        "  mirror.py export --strip-base-path                # team/prom/prometheus lands as prom/prometheus")
+        "  mirror.py export --strip-base-path                # team/prom/prometheus lands as prom/prometheus",
+        "which images:\n"
+        "  no names       catalog images sync put in TARGET_REGISTRY that send has not delivered at that digest\n"
+        "  --all          every catalog image sync has put in TARGET_REGISTRY\n"
+        "  names, --list  exactly those references; repo:tag reads TARGET_REGISTRY, host/repo:tag that host,\n"
+        "                 repo with no tag every tag; the catalog and the ledger are not consulted\n"
+        "each image is copied whole by digest (every platform, as the registry holds it). export only reads\n"
+        "registries and never changes the ledger: send records what was delivered.\n\n")
     export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag")
     export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
     export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
