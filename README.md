@@ -10,6 +10,48 @@ Copies reviewed images and OCI Helm charts into a registry, carries them across 
 - Any OCI registry on either side: Quay, Harbor, GitLab, Artifactory, Nexus or `registry:2`.
 - For the low pipeline: a GitLab project from this repository using `.gitlab-ci.yml`.
 
+## Usage
+
+### Copy one image across by hand
+
+```sh
+# Low side: one image from any registry, named in full (a login only if that registry needs one)
+python3 mirror.py export docker.io/library/alpine:3.20.3 -o alpine.tar
+# or one image already in your low registry, by its path there
+TARGET_REGISTRY=registry.low.example.internal python3 mirror.py export team/app:v1.2.3 -o app.tar
+
+# Carry alpine.tar AND alpine.tar.sha256 together (USB stick, share, diode)
+
+# High side
+export TARGET_REGISTRY=registry.high.example.internal
+python3 mirror.py login                                              # only if the registry needs auth
+python3 mirror.py import /media/usb/alpine.tar                       # lands as library/alpine:3.20.3
+python3 mirror.py import /media/usb/alpine.tar --rewrite-base-path team   # lands as team/alpine:3.20.3
+```
+
+- One image is `host/repo:tag` (any registry) or `repo:tag` (in `TARGET_REGISTRY`). Name Docker Hub images with their `library/` path: `docker.io/library/alpine:3.20.3`, not `alpine`. A repo with no tag exports every tag of it.
+- Name several images on one `export` line, or one per line in a file with `--list`, for one tar holding them all.
+- The image lands on the high side at its path without the host, under the same tag and digest. `--rewrite-base-path ORG` swaps the first path segment, `--strip-base-path` drops it.
+- `import` of a named tar checks it against the `.sha256`, pushes it and keeps the tar. `--no-checksum` imports a tar whose `.sha256` was left behind.
+- Each image is copied whole, every platform its tag holds.
+
+### Mirror the catalog
+
+```sh
+# Low side
+export TARGET_REGISTRY=registry.low.example.internal
+python3 mirror.py login
+python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus   # pins the digest in images.txt
+python3 mirror.py sync                                    # copy images.txt into TARGET_REGISTRY
+python3 mirror.py export -o carry.tar                     # what sync added and send has not delivered
+python3 mirror.py send carry.tar --path /mnt/transfer     # or --nifi-url URL, or --s3-bucket NAME
+
+# High side
+export TARGET_REGISTRY=registry.high.example.internal
+python3 mirror.py login
+python3 mirror.py import /mnt/diode/received              # every tar there, each removed once imported
+```
+
 ## Commands
 
 Every command takes the global `--catalog FILE` (default `images.txt`), `--ledger FILE|URL` and `-v` before it. `mirror.py <command> -h` gives each one's flags in full, with examples.
@@ -47,23 +89,6 @@ A flag wins over its variable.
 | When webhook | `MIRROR_WEBHOOK_URL`, `MIRROR_WEBHOOK_TOKEN`, `MIRROR_WEBHOOK_CA_BUNDLE` | none | Endpoint `sync` posts to after it copied an image. Token sent as `Authorization: Bearer` |
 | Pipeline | `NIFI_URL`, `S3_BUCKET` or `MIRROR_SEND_PATH`, `MIRROR_SEND_FLOWFILE` | none | Where the low pipeline sends. None set means sync only |
 | Pipeline | `EXPORT_ALL`, `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `false`, `critical`, any runner | Resend everything, the Syft and Grype gate before `sync`, the runner tag |
-
-## Usage
-
-```sh
-# Low side
-export TARGET_REGISTRY=registry.low.example.internal
-python3 mirror.py login
-python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus   # pins the digest in images.txt
-python3 mirror.py sync
-python3 mirror.py export -o carry.tar
-python3 mirror.py send carry.tar --path /mnt/transfer
-
-# High side
-export TARGET_REGISTRY=registry.high.example.internal
-python3 mirror.py login
-python3 mirror.py import /mnt/diode/received
-```
 
 ## Preconditions
 
