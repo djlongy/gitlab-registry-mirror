@@ -1516,7 +1516,18 @@ def main(argv=None):
         "  names, --list  exactly those references; repo:tag reads TARGET_REGISTRY, host/repo:tag that host,\n"
         "                 repo with no tag every tag; the catalog and the ledger are not consulted\n"
         "each image is copied whole by digest (every platform, as the registry holds it). export only reads\n"
-        "registries and never changes the ledger: send records what was delivered.\n\n")
+        "registries and never changes the ledger: send records what was delivered.\n\n"
+        "what it writes:\n"
+        "  NAME.tar        uncompressed: export.json (each image's source, target path, tag, digest) and one\n"
+        "                  skopeo dir: copy per image (000001/, 000002/, ...), shared layers stored once\n"
+        "  NAME.tar.sha256 written after the tar; both land under a hidden name and are renamed when complete\n"
+        "  --max-size      NAME-001-of-00N.tar and so on, by the sizes the manifests declare; an image over\n"
+        "                  the cap goes in a tar of its own\n"
+        "  an existing tar or .sha256 of the same name is refused, never overwritten\n"
+        "  the staging directory needs about twice the export's size\n\n"
+        "check a tar:\n"
+        "  sha256sum -c NAME.tar.sha256\n"
+        "  tar -xOf NAME.tar ./export.json | python3 -m json.tool\n\n")
     export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag")
     export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
     export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
@@ -1530,7 +1541,18 @@ def main(argv=None):
         "  mirror.py send container-images-*.tar --path /mnt/transfer     # an NFS share or a USB stick\n"
         "  mirror.py send container-images-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
         "  mirror.py send container-images-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys\n"
-        "  mirror.py send container-images-*.tar --path /mnt/transfer --flowfile   # one NAME.tar.ffv3 per tar")
+        "  mirror.py send container-images-*.tar --path /mnt/transfer --flowfile   # one NAME.tar.ffv3 per tar",
+        "every tar is checked against its .sha256 before the first is sent; then each tar is delivered, its\n"
+        ".sha256 last, and its images are marked sent in TARGET_REGISTRY's ledger. A tar that fails is not\n"
+        "marked, so the next plain export takes it again.\n\n"
+        "destinations:\n"
+        "  --path      a mounted directory; each file is written as .NAME.partial and renamed when complete\n"
+        "  --nifi-url  one HTTP/1.1 POST per file to a NiFi ListenHTTP\n"
+        "  --s3-bucket path-style bucket at S3_ENDPOINT with the AWS_* keys\n"
+        "  --flowfile  with --path or --s3-bucket: one NiFi FlowFile v3 NAME.tar.ffv3 per tar, no separate .sha256\n\n"
+        "every file carries Filename, Content-Type, X-Sha256, X-Artifact-Type: container-images and\n"
+        "X-Artifact-Format: tar (POST headers, S3 metadata or FlowFile attributes), plus X-CI-Project,\n"
+        "X-CI-Pipeline-Url and X-CI-Commit-Sha in CI.\n\n")
     send_command.add_argument("tars", nargs="+", type=Path, help="tar files export wrote")
     where = send_command.add_mutually_exclusive_group(required=True)
     where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
@@ -1548,7 +1570,16 @@ def main(argv=None):
         "  mirror.py import /mnt/diode/received --rewrite-base-path new-org-dev\n"
         "  mirror.py import /mnt/diode/received --strip-base-path   # team/app lands as app\n"
         "  mirror.py import /media/usb/carry.tar --no-checksum      # the .sha256 was not copied\n"
-        "  mirror.py import /mnt/diode/received/container-images-1.tar.ffv3   # a NiFi FlowFile v3 package")
+        "  mirror.py import /mnt/diode/received/container-images-1.tar.ffv3   # a NiFi FlowFile v3 package",
+        "sources:\n"
+        "  a tar or .ffv3   imported, then kept\n"
+        "  a directory      an inbox: every tar and .ffv3, each removed once imported (--keep leaves it);\n"
+        "                   one that fails stays put, a tar without its .sha256 waits\n"
+        "  --s3-bucket      the same inbox, in a bucket\n\n"
+        "checks: the .sha256 (or a .ffv3's X-Sha256), then every image against its digest in export.json\n"
+        "before the first push, so a refusal pushes nothing, then each digest again after the push.\n"
+        "tags: one already at its digest is skipped; one at another digest moves, as docker push moves it\n"
+        "(--keep-tags refuses instead). Unpacking needs up to twice the tar's size.\n\n")
     import_command.add_argument("sources", nargs="*", type=Path, help="tar files or directories of them")
     import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
     import_command.add_argument("--keep", action="store_true", help="leave imported tars in the directory or bucket")
