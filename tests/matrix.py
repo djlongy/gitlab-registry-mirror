@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="registry-mirror-matrix-") as temporary:
     def cli(side, *args):
         result = subprocess.run([sys.executable, str(ROOT / "mirror.py"), "--catalog", str(catalog), *map(str, args)],
                                 capture_output=True, text=True, check=False, cwd=directory,
-                                env=dict(os.environ, TARGET_REGISTRY=REGISTRIES[side]))
+                                env=dict(os.environ, MIRROR_REGISTRY=REGISTRIES[side]))
         assert result.returncode == 0, f"{args}: {result.stderr}"
         return result.stdout
 
@@ -41,11 +41,11 @@ with tempfile.TemporaryDirectory(prefix="registry-mirror-matrix-") as temporary:
     cli("high", "import", tar)
     with tarfile.open(tar) as archive:
         entries = json.load(archive.extractfile("./export.json"))["images"]
-    os.environ["TARGET_REGISTRY"] = REGISTRIES["high"]
+    os.environ["MIRROR_REGISTRY"] = REGISTRIES["high"]
     for entry in entries:
         high = f"docker://{REGISTRIES['high']}/{entry['target']}:{entry['tag']}"
-        raw = json.loads(mirror.run("skopeo", "inspect", "--raw", *mirror.options("TARGET_REGISTRY"), high))
-        assert mirror.raw_digest(high, "TARGET_REGISTRY") == entry["digest"], entry
+        raw = json.loads(mirror.run("skopeo", "inspect", "--raw", *mirror.options("MIRROR_REGISTRY"), high))
+        assert mirror.raw_digest(high, "MIRROR_REGISTRY") == entry["digest"], entry
         kind = raw.get("mediaType") or raw.get("config", {}).get("mediaType")
         platforms = sorted({f"{m['platform']['os']}/{m['platform']['architecture']}"
                             for m in raw.get("manifests", []) if "platform" in m})

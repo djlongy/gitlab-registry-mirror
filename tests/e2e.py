@@ -30,14 +30,15 @@ ROOT = Path(__file__).resolve().parents[1]
 def cli(side, *args, fail=None):
     result = subprocess.run([sys.executable, str(ROOT / 'mirror.py'), '--catalog', str(CATALOG), *map(str, args)],
                             capture_output=True, text=True, check=False, cwd=WORK,
-                            env=dict(os.environ, TARGET_REGISTRY=REGISTRIES[side]))
+                            env=dict(os.environ, MIRROR_REGISTRY=REGISTRIES[side]))
     print(result.stdout, end='', flush=True)
+    print(result.stderr, end='', file=sys.stderr, flush=True)
     if fail:
         assert result.returncode != 0 and fail in result.stderr, result.stdout + result.stderr
         print('expected refusal:', fail, flush=True)
     else:
         assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout
+    return result.stdout + result.stderr  # progress is on stderr, data on stdout
 
 
 def seed(target):
@@ -73,7 +74,7 @@ def seed(target):
         (layout / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [
             index | {'annotations': {'org.opencontainers.image.ref.name': version}}]}))
         source = f"{REGISTRIES['low']}/{target}-source:{version}"
-        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='TARGET_REGISTRY')
+        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='MIRROR_REGISTRY')
         sources.append(source)
     return sources
 
@@ -81,8 +82,8 @@ def seed(target):
 def on_high(target, tag):
     """The digest and platforms of target:tag in the high registry."""
     reference = f"docker://{REGISTRIES['high']}/{target}:{tag}"
-    raw = json.loads(mirror.run('skopeo', 'inspect', '--raw', *mirror.options('TARGET_REGISTRY'), reference))
-    return mirror.raw_digest(reference, 'TARGET_REGISTRY'), len(raw.get('manifests', []))
+    raw = json.loads(mirror.run('skopeo', 'inspect', '--raw', *mirror.options('MIRROR_REGISTRY'), reference))
+    return mirror.raw_digest(reference, 'MIRROR_REGISTRY'), len(raw.get('manifests', []))
 
 
 def tars(directory):
@@ -91,8 +92,8 @@ def tars(directory):
 
 if __name__ == '__main__':
     REGISTRIES = {'low': mirror.required_env('E2E_LOW_REGISTRY'), 'high': mirror.required_env('E2E_HIGH_REGISTRY')}
-    os.environ['TARGET_REGISTRY_TLS_VERIFY'] = os.environ.get('E2E_TLS_VERIFY', 'true')
-    os.environ['TARGET_REGISTRY'] = REGISTRIES['low']
+    os.environ['MIRROR_REGISTRY_TLS_VERIFY'] = os.environ.get('E2E_TLS_VERIFY', 'true')
+    os.environ['MIRROR_REGISTRY'] = REGISTRIES['low']
     os.environ.pop('CI_JOB_TOKEN', None)  # the ledger is a local file here, even inside a CI job
     with tempfile.TemporaryDirectory(prefix='registry-mirror-e2e-') as temporary:
         WORK = Path(temporary)
@@ -112,7 +113,7 @@ if __name__ == '__main__':
         checks.append('sync-idempotent')
 
         cli('low', 'export', '-o', out / 'first.tar')
-        cli('low', 'send', out / 'first.tar', '--path', transfer)
+        cli('low', 'send', out / 'first.tar', '--target-directory', transfer)
         assert 'nothing new to export' in cli('low', 'export', '-o', out / 'none.tar')
         checks.append('ledger-delta-after-send')
 
@@ -129,7 +130,7 @@ if __name__ == '__main__':
         with tarfile.open(out / 'second.tar') as archive:
             listed = json.load(archive.extractfile('./export.json'))['images']
         assert [(i['target'], i['tag']) for i in listed] == [(rebased, '1.0.1')], listed
-        cli('low', 'send', out / 'second.tar', '--path', transfer)
+        cli('low', 'send', out / 'second.tar', '--target-directory', transfer)
         cli('high', 'import', transfer / 'second.tar')
         assert on_high(rebased, '1.0.1')[0] == mirror.catalog(CATALOG)[0]['digest']
         assert (transfer / 'second.tar').exists(), 'a tar named on its own is kept'
@@ -139,13 +140,13 @@ if __name__ == '__main__':
         checks.append('reimport-is-a-no-op')
 
         cli('low', 'export', f'{target}:1.0.1', '-o', out / 'move.tar')
-        # Point the high tag elsewhere first: --keep-tags refuses to move it back, a plain import moves it.
+        # Point the high tag elsewhere first: --no-clobber refuses to move it back, a plain import moves it.
         mirror.copy(f"docker://{REGISTRIES['high']}/{target}:1.0.0", f"docker://{REGISTRIES['high']}/{target}:1.0.1",
-                    'TARGET_REGISTRY', 'TARGET_REGISTRY')
-        cli('high', 'import', out / 'move.tar', '--keep-tags', fail='--keep-tags does not move a tag')
+                    'MIRROR_REGISTRY', 'MIRROR_REGISTRY')
+        cli('high', 'import', out / 'move.tar', '--no-clobber', fail='--no-clobber does not move a tag')
         cli('high', 'import', out / 'move.tar')
         assert on_high(target, '1.0.1')[0] == mirror.catalog(CATALOG)[0]['digest']
-        checks.append('tag-moves-unless-keep-tags')
+        checks.append('tag-moves-unless-no-clobber')
 
         with (out / 'move.tar').open('ab') as stream:
             stream.write(b'corrupt')

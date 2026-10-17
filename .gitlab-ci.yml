@@ -34,7 +34,7 @@ variables:
   MIRROR_STAGING_DIR: ''
   # PEM file of extra CAs (or self-signed certificates) for a runner that does not already trust them.
   # Every connection (registries, GitLab, S3, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
-  CA_BUNDLE: ''
+  MIRROR_CA_BUNDLE: ''
 
 verify:
   stage: verify
@@ -42,7 +42,7 @@ verify:
   tags: [$MIRROR_JOB_TAG]
   dependencies: []
   script:
-    - python3 mirror.py targets
+    - python3 mirror.py list
     - python3 -m unittest discover -s tests -v
     # What sync copies next; sbom and scan check exactly these. The job token reads the ledger.
     - python3 mirror.py pending > pending.txt
@@ -130,7 +130,7 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A runner with python3, skopeo and curl. sync copies the catalog into TARGET_REGISTRY; export and
+# A runner with python3, skopeo and curl. sync copies the catalog into MIRROR_REGISTRY; export and
 # send carry what is new as a tar when a destination is set. The ledger lives in the package registry.
 # Merge-request validation runs elsewhere, without registry credentials.
 sync:
@@ -153,7 +153,7 @@ sync:
     - python3 mirror.py login
     - python3 mirror.py sync
     - |
-      set -- ${NIFI_URL:+--nifi-url "$NIFI_URL"} ${S3_BUCKET:+--s3-bucket "$S3_BUCKET"} ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
+      set -- ${NIFI_URL:+--nifi-url "$NIFI_URL"} ${S3_BUCKET:+--s3-bucket "$S3_BUCKET"} ${MIRROR_SEND_PATH:+--target-directory "$MIRROR_SEND_PATH"}
       if [ "$#" -eq 0 ]; then
         echo "no NIFI_URL, S3_BUCKET or MIRROR_SEND_PATH: sync only"
       else
@@ -166,7 +166,7 @@ sync:
         [ -e "$file" ] || continue
         base=$(basename "$file"); version=${base%%.*}
         curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" \
-          "${GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/registry-mirror-sbom/$version/$base"
+          "${MIRROR_GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/registry-mirror-sbom/$version/$base"
         echo "kept: registry-mirror-sbom/$version/$base"
       done
   after_script:
@@ -175,9 +175,9 @@ sync:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
     # A project without a target registry is the source repository, not a deployment: nothing to sync.
-    - if: '$TARGET_REGISTRY == null'
+    - if: '$MIRROR_REGISTRY == null'
       when: never
-    - if: '$TARGET_REGISTRY == ""'
+    - if: '$MIRROR_REGISTRY == ""'
       when: never
     - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
     - if: '$CI_PIPELINE_SOURCE == "push"'

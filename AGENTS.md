@@ -8,4 +8,4 @@ Validate changes with `python3 -m unittest discover -s tests -v`, `ruff check mi
 
 The NiFi processors live in github.com/djlongy/nifi-container-registry-processors.
 
-Keep the README under 80 lines and QUICKSTART under 40.
+Keep the README under 140 lines and QUICKSTART under 40. The README leads with Usage (copy one image across by hand, then mirror the catalog), then the Commands table listing every command and flag, then Environment.

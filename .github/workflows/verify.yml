@@ -16,7 +16,7 @@ jobs:
           python-version: '3.12'
       - name: Unit tests and catalog
         run: |
-          python3 mirror.py targets
+          python3 mirror.py list
           python3 -m unittest discover -s tests -v
       - name: Install registry-copy tool
         run: |

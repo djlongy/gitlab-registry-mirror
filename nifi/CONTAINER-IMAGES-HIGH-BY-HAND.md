@@ -211,7 +211,7 @@ reassembled, decrypted files) to the group's **From diode** port.
 
    ```sh
    python3 mirror.py export team/app:1.0 -o container-images-test.tar
-   python3 mirror.py send container-images-test.tar --path /mnt/transfer --flowfile
+   python3 mirror.py send container-images-test.tar --target-directory /mnt/transfer --flowfile
    ```
 
 5. Watch the queues: the package passes every step and
@@ -220,7 +220,7 @@ reassembled, decrypted files) to the group's **From diode** port.
 6. Import it on the high side:
 
    ```sh
-   TARGET_REGISTRY=registry.high.example.internal python3 mirror.py import /data/container-images/inbox
+   MIRROR_REGISTRY=registry.high.example.internal python3 mirror.py import /data/container-images/inbox
    ```
 
    It prints `imported: <host>/team/app:1.0@sha256:...` and removes the file.
