@@ -10,9 +10,27 @@ Copies reviewed images and OCI Helm charts into a registry, carries them across 
 - Any OCI registry on either side: Quay, Harbor, GitLab, Artifactory, Nexus or `registry:2`.
 - For the low pipeline: a GitLab project from this repository using `.gitlab-ci.yml`.
 
-## Flags
+## Commands
 
-Full set: `mirror.py <command> -h`, which lists every flag with its examples. A flag wins over its variable.
+Every command takes the global `--catalog FILE` (default `images.txt`), `--ledger FILE|URL` and `-v` before it. `mirror.py <command> -h` gives each one's flags in full, with examples.
+
+| Command | Side | What it does | Main flags |
+|---|---|---|---|
+| `login` | both | Stores `TARGET_REGISTRY` and `SOURCE_REGISTRY` credentials for skopeo | none |
+| `add SOURCE TARGET` | low | Resolves `registry/repo:tag` to its digest and adds the line to `images.txt` | none |
+| `add-list FOLDER` | low | Adds every image named in `FOLDER/*.txt`, keeping `images.txt` sorted | `--prefix PATH` |
+| `targets` | low | Validates and lists the catalog | none |
+| `pending` | low | Lists catalog sources `sync` has not copied yet | none |
+| `covers FILE...` | low | Fails when a Containerfile or manifest uses an image the catalog lacks; `-` reads stdin | none |
+| `sync` | low | Copies every catalog image into `TARGET_REGISTRY` at its pinned digest | none |
+| `export [IMAGE...]` | low | Writes images to `NAME.tar` and `NAME.tar.sha256` | `--all`, `--list FILE`, `-o NAME.tar`, `--max-size 4GiB`, `--staging-dir DIR`, `--rewrite-base-path ORG`, `--strip-base-path` |
+| `send TAR...` | low | Delivers tars and their `.sha256` files | `--path DIR`, `--nifi-url URL` or `--s3-bucket NAME` (one), `--flowfile` |
+| `import [SOURCE...]` | high | Pushes the images in tars, a directory of them or `.ffv3` packages into `TARGET_REGISTRY` | `--s3-bucket NAME`, `--keep`, `--keep-tags`, `--no-checksum`, `--record FILE`, `--staging-dir DIR`, `--rewrite-base-path ORG`, `--strip-base-path` |
+| `promote RECORD` | high | Copies the digests `import --record` wrote from `SOURCE_REGISTRY` (dev) to `TARGET_REGISTRY` (prod) | `--rewrite-base-path ORG`, `--strip-base-path` |
+
+## Environment
+
+A flag wins over its variable.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
