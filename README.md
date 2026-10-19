@@ -44,6 +44,8 @@ export MIRROR_REGISTRY=registry.low.example.internal
 python3 mirror.py login
 python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus   # pins the digest in images.txt
 python3 mirror.py sync                                    # copy images.txt into MIRROR_REGISTRY
+# then either the webhook (MIRROR_REQUEST_URL set: sync has already asked NiFi for what is new)
+# or a tar:
 python3 mirror.py export -o carry.tar                     # what sync added and send has not delivered
 python3 mirror.py send carry.tar -t /mnt/transfer         # or --nifi-url URL, or --s3-bucket NAME
 
@@ -51,6 +53,15 @@ python3 mirror.py send carry.tar -t /mnt/transfer         # or --nifi-url URL, o
 export MIRROR_REGISTRY=registry.high.example.internal
 python3 mirror.py login
 python3 mirror.py import /mnt/diode/received              # every tar there, each removed once imported
+```
+
+### Send a batch again
+
+Every run sends only what is new. To send chosen images again, open **Build > Pipelines > Run pipeline** and paste them into `MIRROR_RESEND_IMAGES`, one per line: `team/app:v1`, `team/app` (every tag) or `images.txt` lines as they are. `MIRROR_RESEND_ALL=true` sends every synced image. Both go to the webhook and to the tar destination, whichever is set. By hand:
+
+```sh
+python3 mirror.py request -T batch.txt          # webhook; batch.txt may be lines copied from images.txt
+python3 mirror.py export -T batch.txt -o batch.tar && python3 mirror.py send batch.tar -t /mnt/transfer
 ```
 
 ## Commands
@@ -65,7 +76,8 @@ Global flags go before the command: `--catalog FILE` (default `images.txt`), `--
 | `pending` | low | Lists catalog sources `sync` has not copied yet | none |
 | `check FILE...` | low | Fails when a Containerfile or manifest uses an image the catalog lacks; `-` reads stdin | none |
 | `sync` | low | Copies every catalog image into `MIRROR_REGISTRY` at its pinned digest | `-n`, `--dry-run` |
-| `export [IMAGE...]` | low | Writes images to `NAME.tar` and `NAME.tar.sha256` | `--all`, `-T FILE`, `-o NAME.tar` or `-o -`, `--max-size SIZE`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
+| `export [IMAGE...]` | low | Writes images to `NAME.tar` and `NAME.tar.sha256` | `--all`, `-T FILE` (`images.txt` lines work), `-o NAME.tar` or `-o -`, `--max-size SIZE`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
+| `request [IMAGE...]` | low | POSTs one webhook request to `MIRROR_REQUEST_URL` naming images in `MIRROR_REGISTRY` for the low NiFi to carry: what is synced and not yet requested, `--all`, or the names given (references or `images.txt` lines) | `--all`, `-T FILE` (`-` is stdin), `-n` |
 | `send TAR...` | low | Delivers tars and their `.sha256` files | `-t DIR`, `--nifi-url URL` or `--s3-bucket NAME` (one), `--flowfile`, `-n` |
 | `import [SOURCE...]` | high | Pushes the images in tars, a directory of them or `.ffv3` packages into `MIRROR_REGISTRY` | `--s3-bucket NAME`, `-k`, `--no-clobber`, `--no-checksum`, `--record FILE`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
 | `promote RECORD` | high | Copies the digests `import --record` wrote from `MIRROR_SOURCE_REGISTRY` (dev) to `MIRROR_REGISTRY` (prod) | `--rewrite-base-path ORG` or `--strip-components N` |
@@ -76,23 +88,24 @@ A flag wins over its variable.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
-| **Required** | `MIRROR_REGISTRY` (`--registry`) | none | This side's registry, `host[:port]`: the low one for `sync`, `export` and `send`, the high one for `import` |
+| **Required** | `MIRROR_REGISTRY` (`--registry`) | none | This side's registry, `host[:port]`: the low one for `sync`, `export`, `request` and `send`, the high one for `import`, prod for `promote` |
 | Optional | `MIRROR_REGISTRY_USERNAME`, `MIRROR_REGISTRY_PASSWORD` | none | Account `mirror.py login` stores for skopeo. Unset for a registry without auth |
-| Optional | `MIRROR_SOURCE_REGISTRY` (`--source-registry`), `MIRROR_SOURCE_REGISTRY_USERNAME`, `MIRROR_SOURCE_REGISTRY_PASSWORD` | none | One source registry to log in to, e.g. `docker.io`. `promote` reads dev from it |
-| Optional | `MIRROR_CA_BUNDLE` | system roots | PEM of extra CAs, trusted by every connection on top of the system roots and `certs.d` |
+| Optional | `MIRROR_SOURCE_REGISTRY` (`--source-registry`), `MIRROR_SOURCE_REGISTRY_USERNAME`, `MIRROR_SOURCE_REGISTRY_PASSWORD` | none | The registry images are copied from into `MIRROR_REGISTRY`: an upstream such as `docker.io` for `sync` (only to log in to it), dev for `promote` |
 | Optional | `MIRROR_REGISTRY_TLS_VERIFY`, `MIRROR_SOURCE_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
+| Optional | `MIRROR_CA_BUNDLE` | system roots | PEM of extra CAs, trusted by every connection on top of the system roots and `certs.d` |
 | Optional | `MIRROR_PLATFORM` | all platforms | `sync` copies one platform, e.g. `linux/amd64`. Quay refuses Windows manifests, so set it for images with Windows children |
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` | Ledger file, or the pipeline ledger's `https://` URL (read only). `MIRROR_LEDGER_TOKEN`, `MIRROR_LEDGER_PROJECT` and `MIRROR_GITLAB_API_URL` reach the CI ledger from outside a job |
-| Optional | `MIRROR_STAGING_DIR`, `MIRROR_MAX_SIZE` | beside the tar, one tar | `--staging-dir` for `export` and `import`, `--max-size` for `export` |
+| Optional | `MIRROR_STAGING_DIR`, `MIRROR_EXPORT_MAX_SIZE` | beside the tar, one tar | `--staging-dir` for `export` and `import`, `--max-size` for `export` |
 | Optional | `MIRROR_REWRITE_BASE_PATH`, `MIRROR_STRIP_COMPONENTS` | none | Change the path on `export`, `import` or `promote`: swap the first segment, or drop the first N (an integer). The NiFi processors keep their own boolean Strip Base Path property |
-| When S3 | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Path-style bucket for `send` and `import`. `S3_PREFIX`, `S3_REGION`, `S3_TLS_VERIFY` optional |
-| When webhook | `MIRROR_WEBHOOK_URL`, `MIRROR_WEBHOOK_TOKEN`, `MIRROR_WEBHOOK_CA_BUNDLE` | none | Endpoint `sync` posts to after it copied an image. Token sent as `Authorization: Bearer` |
-| Pipeline | `NIFI_URL`, `S3_BUCKET` or `MIRROR_SEND_PATH`, `MIRROR_SEND_FLOWFILE` | none | Where the low pipeline sends. None set means sync only |
-| Pipeline | `EXPORT_ALL`, `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `false`, `critical`, any runner | Resend everything, the Syft and Grype gate before `sync`, the runner tag |
+| Webhook | `MIRROR_REQUEST_URL`, `MIRROR_REQUEST_TOKEN`, `MIRROR_REQUEST_CA_BUNDLE` | none | Where `sync` and `request` post the request for NiFi to pull images. Token sent as `Authorization: Bearer` |
+| Tar | `MIRROR_SEND_NIFI_URL`, `MIRROR_SEND_S3_BUCKET` or `MIRROR_SEND_DIRECTORY`, `MIRROR_SEND_FLOWFILE` | none | Where the pipeline sends tars: a NiFi ListenHTTP, a bucket or a mounted directory (set one), and `true` for one `.ffv3` per tar |
+| S3 | `MIRROR_S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | The store for `send --s3-bucket` and `import --s3-bucket`, path style. `MIRROR_S3_PREFIX`, `AWS_REGION`, `MIRROR_S3_TLS_VERIFY` optional |
+| Resend | `MIRROR_RESEND_IMAGES`, `MIRROR_RESEND_ALL` | none, `false` | Send these images again, or every synced image, as [above](#send-a-batch-again). `MIRROR_RESEND_ALL` also applies to `sync`, `request` and `export` by hand |
+| Pipeline | `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `critical`, any runner | The Syft and Grype gate before `sync`, its threshold, the runner tag |
 
 ## Preconditions
 
-- Each target registry holds the repositories, or the push account may create them.
+- Each `MIRROR_REGISTRY` holds the repositories, or the push account may create them.
 - A `send -t` destination exists and is mounted.
 - A registry outside `MIRROR_REGISTRY` and `MIRROR_SOURCE_REGISTRY` that `export` reads needs your own `skopeo login`.
 - In the pipeline: a protected default branch, **Pipelines must succeed**, a nightly schedule. `MIRROR_SCAN=true` needs `grype.anchore.io` or `GRYPE_DB_UPDATE_URL`, and `podman` on a shell runner.
@@ -106,7 +119,8 @@ A flag wins over its variable.
 - `send` checks every tar against its `.sha256`, delivers the tar then its `.sha256`, and marks the tar's images sent. A tar whose delivery fails is taken again by the next `export`.
 - `import` treats a directory or bucket as an inbox: each tar or `.ffv3` is removed once imported, and one that fails stays put. It checks every image before the first push, moves an existing tag as `docker push` does (`--no-clobber` refuses the whole tar before any push), and verifies each digest after the push.
 - `--rewrite-base-path` and `--strip-components` change the path on whichever side you pass them. Pass them on one side only.
-- With `MIRROR_WEBHOOK_URL`, `sync` posts once when it copied a tag: JSON body `{"registry", "images": [{"repository", "tag", "digest"}], "references"}`, header `X-Artifact-Type: container-images-request`. A failed post is a warning.
+- With `MIRROR_REQUEST_URL`, `sync` ends with a `request`: one post naming every synced tag the ledger does not yet record as requested at that digest, copied this run or not (everything with `MIRROR_RESEND_ALL`). JSON body `{"registry", "images": [{"repository", "tag", "digest"}], "references"}`, header `X-Artifact-Type: container-images-request`. A failed post is a warning.
+- HTTP 202 means NiFi took the request, not that it carries it: the low NiFi's PlanRegistryTransfer refuses a repository missing from its Allowed Repositories with the bulletin `Plan refused: <repo> is not in Allowed Repositories`. List every `images.txt` target path there (`org/*` covers an org).
 
 ## Out of scope
 

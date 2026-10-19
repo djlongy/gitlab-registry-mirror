@@ -310,17 +310,19 @@ class MirrorTest(MirrorCase):
             with mock.patch.object(mirror, 'copy') as again:
                 self.assertEqual(self.cli('sync'), 0)
             again.assert_not_called()
+            self.assertIn(f'already in MIRROR_REGISTRY: {LOW}/team/app:1.0@{app}', self.err.getvalue())
             del registry.tags[f'{LOW}/team/db:2']  # deleted or expired: the next run puts it back
             self.assertEqual(self.cli('sync'), 0)
             self.assertIn(f'{LOW}/team/db:2', registry.tags)
+            self.assertIn(f'copying: docker.io/team/db@{db} -> {LOW}/team/db:2', self.err.getvalue())
 
     def webhook(self, registry, token=None, bundle=None, error=None):
-        """Run sync with MIRROR_WEBHOOK_URL set; curl is mocked. Returns the curl calls and the payload sent."""
-        os.environ['MIRROR_WEBHOOK_URL'] = 'https://nifi.example.internal:9099/contentListener'
+        """Run sync with MIRROR_REQUEST_URL set; curl is mocked. Returns the curl calls and the payload sent."""
+        os.environ['MIRROR_REQUEST_URL'] = 'https://nifi.example.internal:9099/contentListener'
         if token:
-            os.environ['MIRROR_WEBHOOK_TOKEN'] = token
+            os.environ['MIRROR_REQUEST_TOKEN'] = token
         if bundle:
-            os.environ['MIRROR_WEBHOOK_CA_BUNDLE'] = str(bundle)
+            os.environ['MIRROR_REQUEST_CA_BUNDLE'] = str(bundle)
         sent = []
 
         def fake(*args):
@@ -382,15 +384,46 @@ class MirrorTest(MirrorCase):
             os.environ['CI_COMMIT_SHA'] = ' '  # empty after trimming: not sent
             self.assertEqual(list(mirror.ci_attributes()), ['X-CI-Project', 'X-CI-Pipeline-Url'])
 
-    def test_webhook_is_silent_when_nothing_changed_or_unset(self):
+    def test_webhook_asks_for_what_it_has_not_asked_for_whether_or_not_sync_copied_it(self):
         with Registry(self) as registry:
-            self.two_images(registry)
-            self.assertEqual(self.cli('sync'), 0)
-            code, sent = self.webhook(registry)  # second run: every tag already there
+            app, db = self.two_images(registry)
+            self.assertEqual(self.cli('sync'), 0)  # synced with no webhook set: nothing asked for yet
+            code, sent = self.webhook(registry)
+            self.assertEqual(len(sent[0][2]['images']), 2)
+            self.assertEqual(json.loads(self.ledger.read_text())['requested'], {'team/app:1.0': app, 'team/db:2': db})
+            code, sent = self.webhook(registry)  # every tag asked for already
             self.assertEqual((code, sent), (0, []))
-            del os.environ['MIRROR_WEBHOOK_URL']
+            self.assertIn('already requested at', self.err.getvalue())
+            with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'yes'}):
+                code, sent = self.webhook(registry)
+            self.assertEqual(len(sent[0][2]['images']), 2)
+            del os.environ['MIRROR_REQUEST_URL']
             with mock.patch.object(mirror, 'run', side_effect=AssertionError('no curl')):
                 mirror.notify(LOW, [{'repository': 'a', 'tag': '1', 'digest': 'sha256:0'}])  # unset: no post
+
+    def test_request_names_images_txt_lines_or_references_and_refuses_another_registry(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(self.cli('sync'), 0)
+            listing = self.root / 'paste.txt'
+            listing.write_text(f'# pasted from images.txt\ndocker.io/team/app:1.0@{app} team/app\n')
+            os.environ['MIRROR_REQUEST_URL'] = 'https://nifi.example.internal:9099/contentListener'
+            with mock.patch.object(mirror, 'notify') as post:
+                self.assertEqual(self.cli('request', '-T', listing, 'team/db:2'), 0)
+            self.assertEqual(post.call_args[0][1], [{'repository': 'team/db', 'tag': '2', 'digest': db},
+                                                    {'repository': 'team/app', 'tag': '1.0', 'digest': app}])
+            self.assertEqual(self.cli('request', '-n', 'team/app:1.0'), 0)
+            self.assertEqual(self.out.getvalue(), f'would request: {LOW}/team/app:1.0@{app}\n')
+            self.out.truncate(0)
+            self.out.seek(0)
+            self.assertEqual(self.cli('request', '--all', '--dry-run'), 0)
+            self.assertEqual(len(self.out.getvalue().splitlines()), 2)
+            with mock.patch.object(mirror, 'notify') as post:
+                self.assertEqual(self.cli('request', 'other.example.com/team/app:1.0'), 1)
+                self.assertEqual(self.cli('request', 'team/app:1.0', 'team/ap:1.0'), 1)
+            post.assert_not_called()
+            self.assertIn(f'{LOW}/team/ap:1.0 is not in MIRROR_REGISTRY; check the name, nothing was requested',
+                          self.err.getvalue())
 
     def test_webhook_trusts_its_ca_bundle_on_top_of_the_system_roots(self):
         bundle = self.root / 'webhook-ca.pem'
@@ -467,7 +500,12 @@ class MirrorTest(MirrorCase):
             self.assertEqual(json.loads(self.ledger.read_text())['sent'], {'team/app:1.0': app, 'team/db:2': db})
             self.assertEqual(self.cli('export', '-o', self.root / 'quiet.tar'), 0)
             self.assertIn('nothing new to export', self.err.getvalue())
+            self.assertIn(f'already sent at {db}, skipped (send again: --all or its name, in a pipeline MIRROR_RESEND_ALL or MIRROR_RESEND_IMAGES): team/db:2',
+                          self.err.getvalue())
             self.assertFalse((self.root / 'quiet.tar').exists())
+            with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'True'}):
+                self.assertEqual(self.cli('export', '-o', self.root / 'env-all.tar'), 0)
+            self.assertEqual(len(self.tar_images(self.root / 'env-all.tar')), 2)
             new = registry.image('app-1.1')
             self.catalog.write_text(f'docker.io/team/app:1.1@{new} team/app\ndocker.io/team/db:2@{db} team/db\n')
             self.cli('sync')
@@ -701,8 +739,8 @@ class MirrorTest(MirrorCase):
             mirror.read_flowfiles(evil, unpacked)
 
     def s3_env(self):
-        os.environ.update({'S3_ENDPOINT': 'https://s3.example.internal:9000', 'AWS_ACCESS_KEY_ID': 'AKID',
-                           'AWS_SECRET_ACCESS_KEY': 'secret', 'S3_PREFIX': 'mirror'})
+        os.environ.update({'MIRROR_S3_ENDPOINT': 'https://s3.example.internal:9000', 'AWS_ACCESS_KEY_ID': 'AKID',
+                           'AWS_SECRET_ACCESS_KEY': 'secret', 'MIRROR_S3_PREFIX': 'mirror'})
 
     def test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket(self):
         self.s3_env()

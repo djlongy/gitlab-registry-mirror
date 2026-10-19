@@ -195,9 +195,12 @@ def say(message):
         print(re.sub(r"://[^/@\s]+@", "://", message), file=sys.stderr, flush=True)
 
 
-def run(*args):
+def run(*args, live=False):
+    """Run a command and return its stdout. With live and -v, its stdout (skopeo copy's blob by blob
+    progress) goes straight to stderr instead."""
     say("+ " + " ".join(args))
-    result = subprocess.run(args, capture_output=True, check=False)
+    shown = live and env_flag("MIRROR_VERBOSE")
+    result = subprocess.run(args, stdout=sys.stderr if shown else subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode:
         raise MirrorError(f"{args[0]} {args[1]} failed: {result.stderr.decode(errors='replace')[-500:].strip()}")
     return result.stdout
@@ -303,7 +306,7 @@ def copy(source, destination, source_side=None, destination_side=None):
         args += options(source_side, "src-", source)
     if destination.startswith("docker://"):
         args += options(destination_side, "dest-", destination)
-    run(*args, source, destination)
+    run(*args, source, destination, live=True)
 
 
 def tls_context(verify=True):
@@ -378,9 +381,9 @@ def load_ledger(location, low, create=True):
         if not create:
             return None
         progress(f"ledger: none at {shown}, starting a new one")
-        return {"registry": low, "synced": {}, "sent": {}, "platforms": {}}
+        return {"registry": low, "synced": {}, "sent": {}, "requested": {}, "platforms": {}}
     ledger = json.loads(raw)
-    for part in ("synced", "sent", "platforms"):
+    for part in ("synced", "sent", "requested", "platforms"):
         ledger.setdefault(part, {})
     if low and ledger.get("registry") != low:
         raise MirrorError(f"the ledger at {shown} belongs to {ledger.get('registry')}, not {low}; "
@@ -667,7 +670,7 @@ def platform_digest(reference, digest, side):
 
 
 def publish_tags(tag, transfer, repository, side):
-    """The tags an image gets in the target registry: the source tag, unchanged.
+    """The tags an image gets in MIRROR_REGISTRY: the source tag, unchanged.
 
     latest names no release, and once it moves the registry may garbage-collect the untagged
     old image. A latest image is therefore also tagged with the version it reports.
@@ -752,21 +755,23 @@ def sync(path, ledger_file, dry_run=False):
                 observed = raw_digest(destination, "MIRROR_REGISTRY")
             except MirrorError as error:  # missing, deleted or expired: copy it; a real fault fails the copy
                 observed = None
-                say(f"not readable in target registry, copying: {error}")
+                say(f"not readable in MIRROR_REGISTRY, copying: {error}")
             if observed == transfer:
-                say(f"already in target registry: {low}/{image['target']}:{tag}@{transfer}")
+                progress(f"already in MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
                 continue
             if dry_run:
                 print(f"would copy: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}")
                 copied += 1
                 continue
-            if number:  # a version tag points at the image already in the target registry
+            progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
+                     + (f" (target has {observed})" if observed else ""))
+            if number:  # a version tag points at the image already in MIRROR_REGISTRY
                 copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
             else:
                 copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "MIRROR_REGISTRY")
             if raw_digest(destination, "MIRROR_REGISTRY") != transfer:
-                raise MirrorError(f"digest mismatch in target registry: {image['target']}:{tag}")
-            progress(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
+                raise MirrorError(f"digest mismatch in MIRROR_REGISTRY: {image['target']}:{tag}")
+            progress(f"pushed to MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
             copied += 1
             changed.append({"repository": image["target"], "tag": tag, "digest": transfer})
         ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
@@ -890,16 +895,26 @@ def staging_dir(near, override=None):
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def wanted_images(path, ledger_file, entries, files_from, everything):
-    """What export copies: the named references, else every catalog image (all), else every catalog
-    image sync has put in MIRROR_REGISTRY and send has not delivered at that digest."""
-    entries = list(entries)
-    entries += [text for file in files_from or () for _, text in list_lines(file)]
+def named(text):
+    """The references a line names: an images.txt line (source and target) names its target:tag in
+    MIRROR_REGISTRY, anything else is references separated by spaces."""
+    fields = text.split()
+    if len(fields) == 2 and not image_problem(*fields, pinned=False):
+        return [f"{fields[1]}:{SOURCE.fullmatch(fields[0].partition('@')[0])['tag']}"]
+    return fields
+
+
+def wanted_images(path, ledger_file, entries, files_from, everything, done="sent"):
+    """What export (or request) takes: the named references, else every catalog image (all), else every
+    catalog image sync has put in MIRROR_REGISTRY that the ledger's done part (sent, or requested) does
+    not hold at that digest."""
+    entries = [name for text in entries for name in named(text)]
+    entries += [name for file in files_from or () for _, text in list_lines(file) for name in named(text)]
     if entries:
         return [found for entry in entries for found in export_tags(entry)]
     low = registry("MIRROR_REGISTRY")
     ledger = load_ledger(ledger_file, low)
-    synced, sent = ledger["synced"], ledger["sent"]
+    synced, sent = ledger["synced"], ledger[done]
     found = []
     for image in catalog(path):
         record = synced.get(f"{image['target']}:{image['tag']}")
@@ -910,6 +925,10 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
             continue
         if everything or sent.get(f"{image['target']}:{image['tag']}") != record["digest"]:
             found += [(low, image["target"], tag) for tag in record["tags"]]
+        else:
+            # The ledger keys on target path and digest, not source: a new source at a sent digest is sent.
+            progress(f"already {done} at {record['digest']}, skipped (send again: --all or its name, in a pipeline MIRROR_RESEND_ALL or MIRROR_RESEND_IMAGES): "
+                     f"{image['target']}:{image['tag']}")
     return found
 
 
@@ -1017,12 +1036,12 @@ def read_index(tar):
 
 
 def s3_settings(bucket=None):
-    """The bucket send and import use: --s3-bucket or S3_BUCKET, at S3_ENDPOINT with the AWS_* keys."""
-    settings = {"endpoint": os.environ.get("S3_ENDPOINT", "").rstrip("/"), "bucket": bucket or os.environ.get("S3_BUCKET", ""),
+    """The bucket send and import use: --s3-bucket, at MIRROR_S3_ENDPOINT with the AWS_* keys."""
+    settings = {"endpoint": os.environ.get("MIRROR_S3_ENDPOINT", "").rstrip("/"), "bucket": bucket or "",
                 "access": os.environ.get("AWS_ACCESS_KEY_ID", ""), "secret": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-                "region": os.environ.get("S3_REGION") or "us-east-1", "prefix": os.environ.get("S3_PREFIX", "").strip("/")}
+                "region": os.environ.get("AWS_REGION") or "us-east-1", "prefix": os.environ.get("MIRROR_S3_PREFIX", "").strip("/")}
     if not all(settings[k] for k in ("endpoint", "bucket", "access", "secret")):
-        raise MirrorError("S3 needs S3_ENDPOINT, a bucket (--s3-bucket or S3_BUCKET), AWS_ACCESS_KEY_ID and "
+        raise MirrorError("S3 needs MIRROR_S3_ENDPOINT, a bucket (--s3-bucket), AWS_ACCESS_KEY_ID and "
                           "AWS_SECRET_ACCESS_KEY")
     return settings
 
@@ -1050,7 +1069,7 @@ def s3_request(s3, method, key="", data=None, length=None, query=None, extra=Non
     del headers["host"]  # urllib sends the same value
     if length is not None:
         headers["Content-Length"] = str(length)
-    context = tls_context(env_flag("S3_TLS_VERIFY", True))
+    context = tls_context(env_flag("MIRROR_S3_TLS_VERIFY", True))
     say(f"+ {method} {url}")
     try:
         return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers),
@@ -1066,7 +1085,7 @@ def s3_key(s3, name):
 
 
 def s3_list(s3):
-    """Every key in the bucket under S3_PREFIX."""
+    """Every key in the bucket under MIRROR_S3_PREFIX."""
     keys, token = [], None
     while True:
         query = {"list-type": "2", **({"prefix": s3["prefix"] + "/"} if s3["prefix"] else {}),
@@ -1131,29 +1150,56 @@ def post_file(path, checksum, url):
          ("--max-time", str(max(3600, path.stat().st_size // 1_000_000)), "--retry", "10"))
 
 
-def notify(low, changed):
-    """After a sync that changed images, POST once to MIRROR_WEBHOOK_URL as a send delivery would arrive
-    (the same attribute headers, X-Artifact-Type container-images-request) so the low NiFi routes it on
-    attributes, plus X-Registry and X-Image-Count (the image list stays in the body: a header is capped
-    near 8 KB). Body: JSON {"registry", "images": [{repository, tag, digest}], "references": "repo:tag"
-    lines}. A failure warns and never fails the sync."""
-    url = os.environ.get("MIRROR_WEBHOOK_URL", "").strip()
-    if not url or not changed:
+def notify(low, images):
+    """POST once to MIRROR_REQUEST_URL as a send delivery would arrive (the same attribute headers,
+    X-Artifact-Type container-images-request) so the low NiFi routes it on attributes, plus X-Registry and
+    X-Image-Count (the image list stays in the body: a header is capped near 8 KB). Body: JSON {"registry",
+    "images": [{repository, tag, digest}], "references": "repo:tag" lines}. Nothing when unset."""
+    url = os.environ.get("MIRROR_REQUEST_URL", "").strip()
+    if not url or not images:
         return
-    body = {"registry": low, "images": changed,
-            "references": "\n".join(f"{i['repository']}:{i['tag']}" for i in changed)}
-    try:
-        with tempfile.TemporaryDirectory(prefix="mirror-webhook-") as scratch:
-            payload = Path(scratch) / "container-images-request.json"
-            payload.write_text(json.dumps(body))
-            headers = {**attributes(payload, sha256(payload)), "Content-Type": "application/json",
-                       "X-Artifact-Type": "container-images-request", "X-Artifact-Format": "json",
-                       "X-Registry": header_value(low), "X-Image-Count": str(len(changed))}
-            bundle = ca_files("MIRROR_WEBHOOK_CA_BUNDLE") or ca_files()
-            post(payload, headers, url, bundle[2] if bundle else [], ("--max-time", "30", "--retry", "2"),
-                 os.environ.get("MIRROR_WEBHOOK_TOKEN", "").strip() or None)
-    except (MirrorError, OSError) as error:
-        warn(f"webhook not delivered: {error}")
+    body = {"registry": low, "images": images,
+            "references": "\n".join(f"{i['repository']}:{i['tag']}" for i in images)}
+    with tempfile.TemporaryDirectory(prefix="mirror-webhook-") as scratch:
+        payload = Path(scratch) / "container-images-request.json"
+        payload.write_text(json.dumps(body))
+        headers = {**attributes(payload, sha256(payload)), "Content-Type": "application/json",
+                   "X-Artifact-Type": "container-images-request", "X-Artifact-Format": "json",
+                   "X-Registry": header_value(low), "X-Image-Count": str(len(images))}
+        bundle = ca_files("MIRROR_REQUEST_CA_BUNDLE") or ca_files()
+        post(payload, headers, url, bundle[2] if bundle else [], ("--max-time", "30", "--retry", "2"),
+             os.environ.get("MIRROR_REQUEST_TOKEN", "").strip() or None)
+
+
+def request(path, ledger_file, entries=(), files_from=None, everything=False, dry_run=False):
+    """Ask the low NiFi, through MIRROR_REQUEST_URL, to carry images in MIRROR_REGISTRY: the named ones,
+    else every synced catalog image (everything), else those synced and not yet requested at that digest.
+    The ledger records them as requested once the POST succeeds."""
+    if not os.environ.get("MIRROR_REQUEST_URL", "").strip():
+        raise MirrorError("request needs MIRROR_REQUEST_URL")
+    low = registry("MIRROR_REGISTRY")
+    images = []
+    # ponytail: one manifest read per tag; read the ledger's digest instead if a large catalog is too slow.
+    for host, repository, tag in dict.fromkeys(wanted_images(path, ledger_file, entries, files_from, everything,
+                                                             "requested")):
+        if host != low:
+            raise MirrorError(f"{host}/{repository}:{tag}: the webhook names images in MIRROR_REGISTRY ({low}) only")
+        digest = present_digest(f"docker://{low}/{repository}:{tag}", "MIRROR_REGISTRY")
+        if not digest:  # every name is checked before the post, so a typo sends nothing
+            raise MirrorError(f"{low}/{repository}:{tag} is not in MIRROR_REGISTRY; check the name, nothing was requested")
+        images.append({"repository": repository, "tag": tag, "digest": digest})
+    if not images:
+        progress("nothing new to request")
+        return
+    if dry_run:
+        for image in images:
+            print(f"would request: {low}/{image['repository']}:{image['tag']}@{image['digest']}")
+        return
+    notify(low, images)
+    ledger = load_ledger(ledger_file, low)
+    ledger["requested"].update({f"{i['repository']}:{i['tag']}": i["digest"] for i in images})
+    save_ledger(ledger_file, ledger)
+    progress(f"requested {len(images)} image tag(s) from {low}")
 
 
 def land(destination, write):
@@ -1707,11 +1753,12 @@ def build_parser():
     export_command.add_argument("images", nargs="*", help="registry/repo:tag, or repo:tag in MIRROR_REGISTRY; no tag: every tag")
     export_command.add_argument("-T", "--files-from", type=Path, action="append", metavar="FILE",
                                 help="a file of image references, one per line, # comments; - is stdin; repeat for more files")
-    export_command.add_argument("--all", action="store_true", help="every catalog image, not only what is new")
+    export_command.add_argument("--all", action="store_true",
+                                help="every catalog image, not only what is new (or MIRROR_RESEND_ALL=true)")
     export_command.add_argument("-o", "--output", type=Path, help="the tar to write (default container-images-<UTC time>.tar here), or - for stdout, "
                                      "with no .sha256: pipe it to tee and sha256sum")
-    export_command.add_argument("--max-size", type=size, default=os.environ.get("MIRROR_MAX_SIZE") or None, metavar="SIZE",
-                                help="split into tars of at most this size, e.g. 4GiB or 500MB (or MIRROR_MAX_SIZE; "
+    export_command.add_argument("--max-size", type=size, default=os.environ.get("MIRROR_EXPORT_MAX_SIZE") or None, metavar="SIZE",
+                                help="split into tars of at most this size, e.g. 4GiB or 500MB (or MIRROR_EXPORT_MAX_SIZE; "
                                      "K M G T and KiB MiB GiB TiB are powers of 1024, KB MB GB TB of 1000; default one tar)")
     staging_flag(export_command)
     base_flag(export_command)
@@ -1720,7 +1767,7 @@ def build_parser():
         "send", "deliver tars and their .sha256 files to NiFi, an S3 bucket or a directory",
         "  {prog} send container-images-*.tar -t /mnt/transfer         # an NFS share or a USB stick\n"
         "  {prog} send container-images-*.tar --nifi-url https://nifi.low:9443/contentListener\n"
-        "  {prog} send container-images-*.tar --s3-bucket transfer     # S3_ENDPOINT and AWS_* keys\n"
+        "  {prog} send container-images-*.tar --s3-bucket transfer     # MIRROR_S3_ENDPOINT and AWS_* keys\n"
         "  {prog} send container-images-*.tar -t /mnt/transfer --flowfile   # one NAME.tar.ffv3 per tar\n"
         "  {prog} send container-images-*.tar -t /mnt/transfer --dry-run    # checks the tars, delivers nothing",
         "every tar is checked against its .sha256 before the first is sent; then each tar is delivered, its\n"
@@ -1729,7 +1776,7 @@ def build_parser():
         "destinations:\n"
         "  -t, --target-directory  a mounted directory; each file is written as .NAME.partial and renamed when complete\n"
         "  --nifi-url  one HTTP/1.1 POST per file to a NiFi ListenHTTP\n"
-        "  --s3-bucket path-style bucket at S3_ENDPOINT with the AWS_* keys\n"
+        "  --s3-bucket path-style bucket at MIRROR_S3_ENDPOINT with the AWS_* keys\n"
         "  --flowfile  with -t or --s3-bucket: one NiFi FlowFile v3 NAME.tar.ffv3 per tar, no separate .sha256\n\n"
         "every file carries Filename, Content-Type, X-Sha256, X-Artifact-Type: container-images and\n"
         "X-Artifact-Format: tar (POST headers, S3 metadata or FlowFile attributes), plus X-CI-Project,\n"
@@ -1737,7 +1784,7 @@ def build_parser():
     send_command.add_argument("tars", nargs="+", type=Path, help="tar files export wrote")
     where = send_command.add_mutually_exclusive_group(required=True)
     where.add_argument("--nifi-url", help="a NiFi ListenHTTP URL")
-    where.add_argument("--s3-bucket", help="a bucket at S3_ENDPOINT (S3_PREFIX optional)")
+    where.add_argument("--s3-bucket", help="a bucket at MIRROR_S3_ENDPOINT (MIRROR_S3_PREFIX optional)")
     where.add_argument("-t", "--target-directory", dest="directory", metavar="DIR", help="a directory; it must exist")
     dry_flag(send_command, "the deliveries")
     send_command.add_argument("--flowfile", action="store_true",
@@ -1766,7 +1813,7 @@ def build_parser():
         "--dry-run checks each .sha256 and export.json and reads the registry, then prints would push:, would move tag:\n"
         "and would remove: lines. It unpacks nothing, so image contents are checked only by a real import.\n\n")
     import_command.add_argument("sources", nargs="*", type=Path, help="tar files or directories of them")
-    import_command.add_argument("--s3-bucket", help="import every tar in this bucket at S3_ENDPOINT (S3_PREFIX optional)")
+    import_command.add_argument("--s3-bucket", help="import every tar in this bucket at MIRROR_S3_ENDPOINT (MIRROR_S3_PREFIX optional)")
     import_command.add_argument("-k", "--keep", action="store_true", help="leave imported tars in the inbox directory or bucket")
     import_command.add_argument("--no-clobber", action="store_true",
                                 help="refuse to move a tag that already points at another digest; by default a tag "
@@ -1778,6 +1825,21 @@ def build_parser():
     staging_flag(import_command)
     base_flag(import_command)
     dry_flag(import_command, "the pushes and the inbox files it would remove")
+
+    request_command = command(
+        "request", "ask the low NiFi, through MIRROR_REQUEST_URL, to carry images from MIRROR_REGISTRY",
+        "  {prog} request                       # synced and not yet requested (sync does this itself)\n"
+        "  {prog} request --all                 # every synced catalog image again\n"
+        "  {prog} request team/app:v1 team/db   # a tag, every tag of a repository\n"
+        "  {prog} request -T images.txt         # images.txt lines work: each names its target:tag\n"
+        "  {prog} request -T - --dry-run        # paste lines on stdin, print the request, post nothing",
+        "one POST, the same body and headers as the webhook sync sends. Names are references in\n"
+        "MIRROR_REGISTRY or images.txt lines; the ledger records what was requested.\n\n")
+    request_command.add_argument("images", nargs="*", help="repo:tag or repo in MIRROR_REGISTRY, or an images.txt line")
+    request_command.add_argument("-T", "--files-from", type=Path, action="append", metavar="FILE",
+                                 help="a file of references or images.txt lines, one per line; - is stdin")
+    request_command.add_argument("--all", action="store_true", help="every synced catalog image (or MIRROR_RESEND_ALL=true)")
+    dry_flag(request_command, "the images it would request")
 
     login_command = command(
         "login", "log in to a registry for skopeo, as skopeo login does",
@@ -1860,13 +1922,21 @@ def main(argv=None):
             if base:
                 parser.error("--strip-components and --rewrite-base-path (or their MIRROR_ variables) are both set")
             base = args.strip_components
-        ca_files("MIRROR_WEBHOOK_CA_BUNDLE")
+        ca_files("MIRROR_REQUEST_CA_BUNDLE")
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
         ledger_file = ledger_location(args.catalog)
         if args.command == "sync":
-            notify(registry("MIRROR_REGISTRY"), sync(args.catalog, ledger_file, args.dry_run))
+            sync(args.catalog, ledger_file, args.dry_run)
+            if os.environ.get("MIRROR_REQUEST_URL", "").strip() and not args.dry_run:
+                try:  # what sync synced and no webhook has asked for yet, or everything with MIRROR_RESEND_ALL
+                    request(args.catalog, ledger_file, everything=env_flag("MIRROR_RESEND_ALL"))
+                except (MirrorError, OSError) as error:
+                    warn(f"webhook not delivered: {error}")
+        elif args.command == "request":
+            request(args.catalog, ledger_file, args.images, args.files_from, args.all or env_flag("MIRROR_RESEND_ALL"),
+                    args.dry_run)
         elif args.command == "export":
-            export(args.catalog, ledger_file, args.images, args.files_from, args.all, args.output, args.max_size,
+            export(args.catalog, ledger_file, args.images, args.files_from, args.all or env_flag("MIRROR_RESEND_ALL"), args.output, args.max_size,
                    args.staging_dir, base, args.dry_run)
         elif args.command == "send":
             send(args.tars, ledger_file, args.nifi_url, args.s3_bucket, args.directory,

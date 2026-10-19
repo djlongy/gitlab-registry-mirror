@@ -28,8 +28,8 @@ python3 mirror.py import /media/usb/carry.tar             # or a received direct
 
 1. Create a GitLab project from this repository.
 2. In **Settings > CI/CD > Variables**, scoped to environment `mirror-low` and masked: `MIRROR_REGISTRY`, `MIRROR_REGISTRY_USERNAME`, `MIRROR_REGISTRY_PASSWORD`.
-3. Set where it sends: `MIRROR_SEND_PATH` (a directory mounted on the runner), `NIFI_URL`, or `S3_BUCKET` with `S3_ENDPOINT` and the `AWS_*` keys. Set none to sync only.
-4. **Build > Pipelines > Run pipeline** on the default branch. `EXPORT_ALL=true` sends every image again.
+3. Set how images cross: `MIRROR_REQUEST_URL` (webhook: NiFi pulls them), and/or one tar destination: `MIRROR_SEND_DIRECTORY` (a directory mounted on the runner), `MIRROR_SEND_NIFI_URL`, or `MIRROR_SEND_S3_BUCKET` with `MIRROR_S3_ENDPOINT` and the `AWS_*` keys. Set none to sync only.
+4. **Build > Pipelines > Run pipeline** on the default branch. Each run sends what is new. To send a batch again, paste images (or `images.txt` lines) into `MIRROR_RESEND_IMAGES`, one per line; `MIRROR_RESEND_ALL=true` sends everything.
 
 It works when the `sync` job log ends `sent: container-images-<pipeline>.tar` and the high `import` prints `imported: <host>/team/prometheus:v3.13.4@sha256:...`.
 

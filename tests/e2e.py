@@ -6,7 +6,7 @@ Log in to both registries with skopeo first and set E2E_LOW_REGISTRY and E2E_HIG
 named repositories under E2E_ORG (default mirror). It seeds two multi-platform OCI indexes into the
 low registry as sources, so nothing is pulled from the internet.
 
-With S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and E2E_S3_BUCKET set, it also sends
+With MIRROR_S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and E2E_S3_BUCKET set, it also sends
 through that bucket and imports from it.
 """
 import gzip
