@@ -92,7 +92,7 @@ class CliTest(MirrorCase):
         with mock.patch.object(mirror, 'run', side_effect=AssertionError('no skopeo call before parsing')):
             self.assertEqual(self.run_cli('export', 'team/a:1', '--max-size', '4XB'), 2)
             self.assertIn('--max-size', self.err.getvalue())
-            with mock.patch.dict(os.environ, {'MIRROR_MAX_SIZE': 'bogus'}):
+            with mock.patch.dict(os.environ, {'MIRROR_EXPORT_MAX_SIZE': 'bogus'}):
                 self.assertEqual(self.run_cli('export', 'team/a:1'), 2, 'the environment default is checked too')
 
     def test_boolean_environment_variables_accept_the_usual_words_in_any_case(self):
@@ -116,7 +116,7 @@ class CliTest(MirrorCase):
         cases = (('MIRROR_VERBOSE', ('pending',), {}),
                  ('MIRROR_SEND_FLOWFILE', ('send', tar, '--target-directory', self.root), {}),
                  ('MIRROR_REGISTRY_TLS_VERIFY', ('login',), {'MIRROR_REGISTRY_USERNAME': 'robot'}),
-                 ('S3_TLS_VERIFY', ('import', '--s3-bucket', 'b'), {'S3_ENDPOINT': 'https://s3.example.internal',
+                 ('MIRROR_S3_TLS_VERIFY', ('import', '--s3-bucket', 'b'), {'MIRROR_S3_ENDPOINT': 'https://s3.example.internal',
                                                                     'AWS_ACCESS_KEY_ID': 'a', 'AWS_SECRET_ACCESS_KEY': 'b'}))
         self.catalog.write_text('')
         for name, args, extra in cases:
@@ -332,7 +332,7 @@ class CliTest(MirrorCase):
         for spelling in ('-n', '--dry-run'):
             with self.subTest(spelling), Registry(self) as registry, mock.patch.object(mirror, 'post') as webhook:
                 self.two_images(registry)
-                os.environ['MIRROR_WEBHOOK_URL'] = 'https://hook.example.internal/in'
+                os.environ['MIRROR_REQUEST_URL'] = 'https://hook.example.internal/in'
                 before = self.snapshot()
                 self.clear(self.out)
                 self.assertEqual(self.cli('sync', spelling), 0)
@@ -616,6 +616,11 @@ COVERAGE = {
     'sync': 'test_sync_copies_by_digest_records_the_ledger_and_is_idempotent',
     'sync --dry-run': 'test_dry_run_sync_prints_the_copies_and_saves_nothing',
     'export': 'test_export_takes_what_is_new_since_the_last_send',
+    'request': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
+    'request --files-from': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
+    'request --all': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
+    'request --dry-run': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
+    'request images': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'export images': 'test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path',
     'export --files-from': 'test_files_from_names_images_in_files_and_stdin_and_repeats',
     'export --all': 'test_export_takes_what_is_new_since_the_last_send',

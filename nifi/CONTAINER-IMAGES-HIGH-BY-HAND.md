@@ -11,10 +11,10 @@ case-sensitive: type them exactly as written.
 
 ## What arrives
 
-The low pipeline (`MIRROR_SEND_FLOWFILE=true`, `MIRROR_SEND_PATH` on the NFS share)
+The low pipeline (`MIRROR_SEND_FLOWFILE=true`, `MIRROR_SEND_DIRECTORY` on the NFS share)
 writes one file per export: `container-images-<pipeline id>.tar.ffv3`, or
 `container-images-<pipeline id>-001-of-003.tar.ffv3` and so on with
-`MIRROR_MAX_SIZE`. Each is a NiFi FlowFile v3 package holding one FlowFile: the tar,
+`MIRROR_EXPORT_MAX_SIZE`. Each is a NiFi FlowFile v3 package holding one FlowFile: the tar,
 with these attributes, names exactly as written:
 
 | Attribute | Value |
@@ -255,6 +255,6 @@ open the FlowFile's attributes:
   or `X-Artifact-Format` did not. Something other than mirror.py wrote it.
 - From **Tar matches X-Sha256**: compare `content_SHA-256` with `X-Sha256`. The tar
   was damaged in transit or in reassembly. Send it again from the low side:
-  `mirror.py export` the images by name, or run the pipeline with `EXPORT_ALL=true`.
+  `mirror.py export` the images by name, or run the pipeline with `MIRROR_RESEND_ALL=true`.
 - From **Write import inbox**: the inbox directory is missing or not writable by
   the NiFi user.
