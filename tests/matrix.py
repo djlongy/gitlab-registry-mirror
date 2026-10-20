@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Carry a set of real source references through sync, export, send and import.
+"""Carry a set of real source references through sync, export and import.
 
 Log in to both registries with skopeo first and set E2E_LOW_REGISTRY, E2E_HIGH_REGISTRY and E2E_ORG.
 Each argument is a catalog source: registry/repo:tag in full. Set MIRROR_PLATFORM to check
@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="registry-mirror-matrix-") as temporary:
         cli("low", "add", source, f"{prefix}/{number}/{source.split('@')[0].rsplit(':', 1)[0].rsplit('/', 1)[-1]}")
     cli("low", "sync")
     tar = directory / "matrix.tar"
-    cli("low", "export", "-o", tar)
+    cli("low", "export", "--all", "-o", tar)
     cli("high", "import", tar)
     with tarfile.open(tar) as archive:
         entries = json.load(archive.extractfile("./export.json"))["images"]

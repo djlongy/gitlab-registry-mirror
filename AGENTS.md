@@ -1,10 +1,10 @@
 # gitlab-registry-mirror
 
-Keep this repository limited to a reviewed image catalog, tagged registry copies and tar transfer: `sync`, `export`, `send`, `import`. Jobs need Python and skopeo, not Docker or privileged execution.
+Keep this repository limited to a reviewed image catalog, tagged registry copies, the webhook request the low NiFi acts on, and tars carried by hand: `sync`, `request`, `export`, `import`. Jobs need Python and skopeo, not Docker or privileged execution.
 
 Read `.agent/PENDING.md` and `.agent/SKILL.md` when present. Never commit `.agent/`, credentials, ledgers, staging directories or tars.
 
-Validate changes with `python3 -m unittest discover -s tests -v`, `ruff check mirror.py tests`, and `yamllint -d relaxed` on `.gitlab-ci.yml` and the GitHub workflow. A unit test is not a transfer: `tests/e2e.py` runs sync, export, send and import against real registries (log in with skopeo, set E2E_LOW_REGISTRY, E2E_HIGH_REGISTRY, E2E_TLS_VERIFY, optional E2E_S3_BUCKET with the S3_* and AWS_* variables), and `tests/matrix.py <registry/repo:tag>...` carries real source references. Point them only at test registries.
+Validate changes with `python3 -m unittest discover -s tests -v`, `ruff check mirror.py tests`, and `yamllint -d relaxed` on `.gitlab-ci.yml` and the GitHub workflow. A unit test is not a transfer: `tests/e2e.py` runs sync, request (to a listener it starts), export and import against real registries (log in with skopeo, set E2E_LOW_REGISTRY, E2E_HIGH_REGISTRY, E2E_TLS_VERIFY), and `tests/matrix.py <registry/repo:tag>...` carries real source references. Point them only at test registries.
 
 The NiFi processors live in github.com/djlongy/nifi-container-registry-processors.
 

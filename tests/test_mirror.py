@@ -249,9 +249,9 @@ class MirrorTest(MirrorCase):
         gitlab = FakeGitLab(self)
         with gitlab:
             ledger = mirror.load_ledger('gitlab', LOW)
-            ledger['sent']['team/app:1.0'] = 'sha256:' + 'a' * 64
+            ledger['requested']['team/app:1.0'] = 'sha256:' + 'a' * 64
             mirror.save_ledger('gitlab', ledger)
-            self.assertEqual(mirror.load_ledger('gitlab', LOW)['sent'], ledger['sent'])
+            self.assertEqual(mirror.load_ledger('gitlab', LOW)['requested'], ledger['requested'])
 
     def test_saving_the_ci_ledger_prunes_uploads_past_the_window_but_keeps_the_newest_two(self):
         gitlab = FakeGitLab(self)
@@ -270,7 +270,7 @@ class MirrorTest(MirrorCase):
         self.assertIn('not pruned: DELETE', stderr.getvalue())
         self.assertEqual(len(gitlab.uploads), 5)
 
-    def test_a_ledger_url_gives_a_manual_export_the_pipelines_delta_and_is_never_written(self):
+    def test_a_ledger_url_gives_a_manual_export_the_pipelines_synced_images_and_is_never_written(self):
         url = 'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'
         requests = []
 
@@ -279,24 +279,23 @@ class MirrorTest(MirrorCase):
             return io.BytesIO(json.dumps(pipeline).encode())
 
         with Registry(self) as registry:
-            app, db = self.two_images(registry)
+            self.two_images(registry)
             self.cli('sync')
             pipeline = json.loads(self.ledger.read_text())
-            pipeline['sent'] = {'team/app:1.0': app}  # the pipeline already sent app
+            del pipeline['synced']['team/db:2']  # the pipeline has synced app only
             os.environ.update(MIRROR_LEDGER_TOKEN='token', MIRROR_LEDGER=url)
-            transfer = self.root / 'transfer'
-            transfer.mkdir()
             with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
-                self.assertEqual(self.cli('export', '-o', self.root / 'manual.tar'), 0)
-                self.assertEqual(self.tar_images(self.root / 'manual.tar'), [(f'{LOW}/team/db:2', 'team/db', '2')])
-                self.assertEqual(self.cli('send', self.root / 'manual.tar', '--target-directory', transfer), 0)
+                self.assertEqual(self.cli('export', '--all', '-o', self.root / 'manual.tar'), 0)
+                self.assertEqual(self.tar_images(self.root / 'manual.tar'), [(f'{LOW}/team/app:1.0', 'team/app', '1.0')])
+                self.assertIn('the pipeline has not synced it at this digest; name it to export it anyway: team/db:2',
+                              self.err.getvalue())
                 self.assertEqual(self.cli('sync'), 0)
         self.assertEqual({r[0] for r in requests}, {'GET'})
         self.assertEqual({r[1:] for r in requests}, {(url, 'token')})
         os.environ['MIRROR_LEDGER'] = url + '-missing'
         with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=mirror.urllib.error.HTTPError(
                 url, 404, 'Not Found', {}, None)):
-            self.assertEqual(self.cli('export'), 1)
+            self.assertEqual(self.cli('export', '--all'), 1)
 
     # Sync
 
@@ -478,41 +477,34 @@ class MirrorTest(MirrorCase):
             self.cli('pending')
             self.assertEqual(len(self.out.getvalue().splitlines()), 2)
 
-    # Export, send and import
+    # Export and import
 
-    def test_export_takes_what_is_new_since_the_last_send(self):
-        transfer = self.root / 'transfer'
-        transfer.mkdir()
+    def test_export_takes_named_images_or_every_synced_one_with_all(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
-            self.assertEqual(self.cli('export', '-o', self.root / 'none.tar'), 0)
+            with self.assertRaises(SystemExit) as usage:
+                self.cli('export', '-o', self.root / 'bare.tar')
+            self.assertEqual(usage.exception.code, 2)
+            self.assertIn('export needs images to copy', self.err.getvalue())
+            self.assertEqual(self.cli('export', '--all', '-o', self.root / 'none.tar'), 0)
             self.assertIn('not synced yet, run sync first: team/app:1.0', self.err.getvalue())
             self.assertFalse((self.root / 'none.tar').exists())
             self.cli('sync')
             first = self.root / 'first.tar'
-            self.assertEqual(self.cli('export', '-o', first), 0)
+            self.assertEqual(self.cli('export', '--all', '-o', first), 0)
             self.assertEqual(self.tar_images(first), [(f'{LOW}/team/app:1.0', 'team/app', '1.0'),
                                                       (f'{LOW}/team/db:2', 'team/db', '2')])
-            # Not sent yet: the next export takes the same images again.
-            self.assertEqual(self.cli('export', '-o', self.root / 'again.tar'), 0)
-            self.assertEqual(len(self.tar_images(self.root / 'again.tar')), 2)
-            self.assertEqual(self.cli('send', first, '--target-directory', transfer), 0)
-            self.assertEqual(json.loads(self.ledger.read_text())['sent'], {'team/app:1.0': app, 'team/db:2': db})
-            self.assertEqual(self.cli('export', '-o', self.root / 'quiet.tar'), 0)
-            self.assertIn('nothing new to export', self.err.getvalue())
-            self.assertIn(f'already sent at {db}, skipped (send again: --all or its name, in a pipeline MIRROR_RESEND_ALL or MIRROR_RESEND_IMAGES): team/db:2',
-                          self.err.getvalue())
-            self.assertFalse((self.root / 'quiet.tar').exists())
+            self.assertEqual(self.cli('export', '--all', '-o', self.root / 'again.tar'), 0)
+            self.assertEqual(len(self.tar_images(self.root / 'again.tar')), 2, 'export records nothing, so --all repeats')
             with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'True'}):
                 self.assertEqual(self.cli('export', '-o', self.root / 'env-all.tar'), 0)
             self.assertEqual(len(self.tar_images(self.root / 'env-all.tar')), 2)
             new = registry.image('app-1.1')
             self.catalog.write_text(f'docker.io/team/app:1.1@{new} team/app\ndocker.io/team/db:2@{db} team/db\n')
             self.cli('sync')
-            self.assertEqual(self.cli('export', '-o', self.root / 'delta.tar'), 0)
-            self.assertEqual(self.tar_images(self.root / 'delta.tar'), [(f'{LOW}/team/app:1.1', 'team/app', '1.1')])
             self.assertEqual(self.cli('export', '--all', '-o', self.root / 'all.tar'), 0)
-            self.assertEqual(len(self.tar_images(self.root / 'all.tar')), 2)
+            self.assertEqual(self.tar_images(self.root / 'all.tar'), [(f'{LOW}/team/app:1.1', 'team/app', '1.1'),
+                                                                     (f'{LOW}/team/db:2', 'team/db', '2')])
 
     def test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path(self):
         with Registry(self) as registry:
@@ -567,15 +559,18 @@ class MirrorTest(MirrorCase):
             self.assertTrue(seen[0][1].startswith(str(self.root / 'out' / '.mirror-staging-')))
             self.assertEqual(sorted(p.name for p in (self.root / 'out').iterdir()), ['x.tar', 'x.tar.sha256'])
         self.assertNotIn('TMPDIR', os.environ)
+        with Registry(self) as registry, mock.patch.dict(os.environ, {'MIRROR_STAGING_DIR': str(staging / 'work')}):
+            self.two_images(registry)
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(os.environ['TMPDIR'], str((staging / 'work').resolve()),
+                             'MIRROR_STAGING_DIR moves every command off the system /tmp, sync included')
 
     def test_import_pushes_digests_unchanged_skips_present_and_moves_a_tag_unless_no_clobber(self):
         with Registry(self) as registry:
             tar, digest = self.exported(registry)
             os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            record = self.root / 'imported.json'
-            self.assertEqual(self.cli('import', tar, '--record', record, '--rewrite-base-path', 'org-dev'), 0)
+            self.assertEqual(self.cli('import', tar, '--rewrite-base-path', 'org-dev'), 0)
             self.assertEqual(registry.tags['high.example.internal/org-dev/app:1.0'], digest)
-            self.assertEqual(json.loads(record.read_text()), [{'target': 'org-dev/app', 'tag': '1.0', 'digest': digest}])
             self.assertTrue(tar.exists())  # a named tar is kept
             with mock.patch.object(mirror, 'copy') as push:
                 self.assertEqual(self.cli('import', tar, '--rewrite-base-path', 'org-dev'), 0)
@@ -650,150 +645,9 @@ class MirrorTest(MirrorCase):
             self.assertEqual(self.cli('import', tar, '--no-checksum'), 1)  # present and wrong: refused
             sidecar.write_text(good)
 
-    def test_send_needs_one_destination_that_exists_and_writes_the_checksum_last(self):
-        with Registry(self) as registry:
-            tar, _ = self.exported(registry)
-        self.assertEqual(self.cli('send', tar, '--target-directory', self.root / 'not-mounted'), 1)
-        with self.assertRaises(SystemExit):
-            self.cli('send', tar, '--target-directory', self.root, '--s3-bucket', 'b')
-        transfer = self.root / 'transfer'
-        transfer.mkdir()
-        order = []
-        real = os.replace
-        with mock.patch.object(mirror.os, 'replace',
-                               side_effect=lambda a, b: (order.append((Path(a).name, Path(b).name)), real(a, b))):
-            self.assertEqual(self.cli('send', tar, '--target-directory', transfer), 0)
-        # Written under a hidden name, which NiFi ListFile and GetFile skip by default, then renamed.
-        self.assertEqual(order[-2:], [('.carry.tar.partial', 'carry.tar'),
-                                      ('.carry.tar.sha256.partial', 'carry.tar.sha256')])
-        self.assertEqual(sorted(p.name for p in transfer.iterdir()), ['carry.tar', 'carry.tar.sha256'])
-        tar.with_name('carry.tar.sha256').write_text('0' * 64 + '  carry.tar\n')
-        self.assertEqual(self.cli('send', tar, '--target-directory', transfer), 1)  # checked before anything is sent
-
-    def test_send_to_nifi_posts_the_tar_then_its_checksum_streamed_without_credentials_in_the_log(self):
-        with Registry(self) as registry:
-            tar, _ = self.exported(registry)
-        url = 'http://user:secret@nifi.example.internal:9099/contentListener'
-        with mock.patch.object(mirror, 'run', return_value=b'200') as call:
-            self.assertEqual(self.cli('send', tar, '--nifi-url', url), 0)
-        posted = [c.args for c in call.call_args_list]
-        self.assertEqual([args[args.index('--upload-file') + 1] for args in posted], [str(tar), str(tar) + '.sha256'])
-        headers = [posted[0][i + 1] for i, a in enumerate(posted[0]) if a == '--header']
-        for header in ('Filename: carry.tar', 'Content-Type: application/octet-stream', f'X-Sha256: {mirror.sha256(tar)}',
-                       'X-Artifact-Type: container-images', 'X-Artifact-Format: tar', 'Expect:'):
-            self.assertIn(header, headers)
-        self.assertIn('--http1.1', posted[0])
-        self.assertNotIn('--data-binary', posted[0])
-        self.assertIn('posted to NiFi: carry.tar -> http://nifi.example.internal:9099/contentListener', self.err.getvalue())
-        self.assertNotIn('secret', self.out.getvalue())
-
-    def test_send_flowfile_writes_one_package_with_the_http_attributes_and_import_reads_it(self):
-        with Registry(self) as registry:
-            tar, digest = self.exported(registry)
-            transfer = self.root / 'transfer'
-            transfer.mkdir()
-            self.assertEqual(self.cli('send', tar, '--target-directory', transfer, '--flowfile'), 0)
-            self.assertEqual([p.name for p in transfer.iterdir()], ['carry.tar.ffv3'])
-            unpacked = self.root / 'unpacked'
-            unpacked.mkdir()
-            # One FlowFile: the tar, its checksum an attribute, so the link carries one file.
-            self.assertEqual(mirror.read_flowfiles(transfer / 'carry.tar.ffv3', unpacked), [
-                (unpacked / 'carry.tar', {'filename': 'carry.tar', **mirror.attributes(tar, mirror.sha256(tar))})])
-            self.assertEqual(list(mirror.attributes(tar, '')), ['Filename', 'Content-Type', 'X-Sha256', 'X-Artifact-Type',
-                                                                'X-Artifact-Format'])
-            self.assertEqual((unpacked / 'carry.tar').read_bytes(), tar.read_bytes())
-            self.assertEqual(self.cli('send', tar, '--nifi-url', 'http://nifi.example.internal', '--flowfile'), 1)
-            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            self.assertEqual(self.cli('import', transfer), 0)
-            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
-            self.assertEqual(list(transfer.iterdir()), [])
-        # A bad package in the inbox stays put and does not hold up a good one behind it.
-        mirror.write_flowfiles(transfer / 'a-bad.ffv3', [(tar, {'filename': 'carry.tar', 'X-Sha256': '0' * 64})])
-        with Registry(self) as registry:
-            self.assertEqual(self.cli('send', tar, '--target-directory', transfer, '--flowfile'), 0)
-            registry.tags.clear()
-            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            self.assertEqual(self.cli('import', transfer), 1)
-            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
-        self.assertEqual([p.name for p in transfer.iterdir()], ['a-bad.ffv3'])
-        # The sender refuses a name the far side would refuse, and a failed write leaves nothing.
-        odd = tar.with_name('my carry.tar')
-        shutil.copyfile(tar, odd)
-        shutil.copyfile(tar.with_name('carry.tar.sha256'), odd.with_name('my carry.tar.sha256'))
-        os.environ['MIRROR_REGISTRY'] = LOW
-        self.assertEqual(self.cli('send', odd, '--target-directory', transfer, '--flowfile'), 1)
-        with self.assertRaises(OSError):
-            mirror.land(transfer / 'x.ffv3', lambda hidden: (hidden.write_bytes(b'half'), open('/nonexistent/x')))
-        self.assertEqual([p.name for p in transfer.iterdir()], ['a-bad.ffv3'])
-        huge = self.root / 'huge.ffv3'
-        huge.write_bytes(mirror.FLOWFILE_MAGIC + (1).to_bytes(2, 'big') + b'\xff\xff' + (1 << 30).to_bytes(4, 'big'))
-        with self.assertRaisesRegex(mirror.MirrorError, 'attribute of 1073741824 bytes'):
-            mirror.read_flowfiles(huge, unpacked)
-        evil = self.root / 'evil.ffv3'
-        mirror.write_flowfiles(evil, [(tar, {'filename': '../escape.tar'})])
-        with self.assertRaisesRegex(mirror.MirrorError, 'unsafe filename'):
-            mirror.read_flowfiles(evil, unpacked)
-        mirror.write_flowfiles(evil, [(tar, {'filename': 'carry.tar'})])
-        evil.write_bytes(evil.read_bytes()[:-5])
-        with self.assertRaisesRegex(mirror.MirrorError, 'truncated'):
-            mirror.read_flowfiles(evil, unpacked)
-
     def s3_env(self):
         os.environ.update({'MIRROR_S3_ENDPOINT': 'https://s3.example.internal:9000', 'AWS_ACCESS_KEY_ID': 'AKID',
                            'AWS_SECRET_ACCESS_KEY': 'secret', 'MIRROR_S3_PREFIX': 'mirror'})
-
-    def test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket(self):
-        self.s3_env()
-        bucket, calls, metadata = {}, [], {}
-
-        def urlopen(request, **_):
-            parts = mirror.urllib.parse.urlsplit(request.full_url)
-            calls.append((request.get_method(), parts.path, parts.query))
-            self.assertIn('AWS4-HMAC-SHA256 Credential=AKID/', request.headers['Authorization'])
-            self.assertIn('x-amz-content-sha256', request.headers['Authorization'])
-            key = mirror.urllib.parse.unquote(parts.path.split('/', 2)[2]) if parts.path.count('/') > 1 else ''
-            method = request.get_method()
-            if method == 'PUT':
-                bucket[key] = request.data.read()
-                metadata[key] = {k.lower()[len('x-amz-meta-'):]: v for k, v in request.headers.items()
-                                 if k.lower().startswith('x-amz-meta-')}
-                signed = request.headers['Authorization'].split('SignedHeaders=')[1].split(',')[0].split(';')
-                self.assertTrue({'content-type', *(f'x-amz-meta-{k}' for k in metadata[key])} <= set(signed))
-                metadata[key]['content-type'] = request.headers['Content-type']
-                self.assertEqual(request.headers['Content-length'], str(len(bucket[key])))
-            elif method == 'DELETE':
-                del bucket[key]
-            elif not key:
-                self.assertIn('list-type=2', parts.query)
-                self.assertIn('prefix=mirror%2F', parts.query)
-                items = ''.join(f'<Contents><Key>{k}</Key></Contents>' for k in sorted(bucket))
-                return io.BytesIO(f'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{items}'
-                                  '<IsTruncated>false</IsTruncated></ListBucketResult>'.encode())
-            else:
-                return io.BytesIO(bucket[key])
-            return io.BytesIO(b'')
-
-        with Registry(self) as registry, mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
-            tar, digest = self.exported(registry)
-            self.assertEqual(self.cli('send', tar, '--s3-bucket', 'transfer'), 0)
-            self.assertEqual(sorted(bucket), ['mirror/carry.tar', 'mirror/carry.tar.sha256'])
-            self.assertEqual([c[1] for c in calls], ['/transfer/mirror/carry.tar', '/transfer/mirror/carry.tar.sha256'])
-            # The HTTP header names and values; S3 keeps metadata names in lowercase.
-            self.assertEqual(metadata['mirror/carry.tar'],
-                             {k.lower(): v for k, v in mirror.attributes(tar, mirror.sha256(tar)).items()})
-            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            os.chdir(self.root)
-            self.assertEqual(self.cli('import', '--s3-bucket', 'transfer'), 0)
-            self.assertEqual(registry.tags['high.example.internal/team/app:1.0'], digest)
-            self.assertEqual(bucket, {})
-            # A .ffv3 in the bucket keeps the attribute names case for case.
-            os.environ['MIRROR_REGISTRY'] = LOW
-            self.assertEqual(self.cli('send', tar, '--s3-bucket', 'transfer', '--flowfile'), 0)
-            self.assertEqual(sorted(bucket), ['mirror/carry.tar.ffv3'])
-            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            self.assertEqual(self.cli('import', '--s3-bucket', 'transfer'), 0)
-            self.assertEqual(bucket, {})
-            self.assertEqual([p.name for p in self.root.glob('.mirror-staging-*')], [])
 
     # Catalog, add, platforms and promote
 
@@ -964,36 +818,6 @@ class MirrorTest(MirrorCase):
         self.assertEqual(mirror.transport_reference(reference),
                          'registry.example.internal:5000/team/image@sha256:' + 'a'*64)
 
-
-    def test_promote_copies_recorded_digests_from_dev_to_prod_and_verifies_both(self):
-        os.environ.update({'MIRROR_SOURCE_REGISTRY': 'dev.example.internal', 'MIRROR_REGISTRY': 'prod.example.internal',
-                           'MIRROR_SOURCE_REGISTRY_TLS_VERIFY': 'false'})
-        old, new, other = ('sha256:' + c * 64 for c in 'abc')
-        record = self.root / 'imported.json'
-        record.write_text(json.dumps([{'target': 'team/app', 'tag': '1.0', 'digest': old},
-                                      {'target': 'team/app', 'tag': '1.0', 'digest': new},
-                                      {'target': 'team/db', 'tag': '2', 'digest': other}]))
-        digests = {'docker://dev.example.internal/team/app@' + new: new, 'docker://prod.example.internal/team/app:1.0': new,
-                   'docker://dev.example.internal/team/db@' + other: other, 'docker://prod.example.internal/team/db:2': other}
-        with mock.patch.object(mirror, 'copy') as copied, mock.patch('builtins.print'), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=lambda ref, side: digests[ref]):
-            mirror.promote(record)
-        self.assertEqual([c.args for c in copied.call_args_list], [
-            ('docker://dev.example.internal/team/app@' + new, 'docker://prod.example.internal/team/app:1.0',
-             'MIRROR_SOURCE_REGISTRY', 'MIRROR_REGISTRY'),
-            ('docker://dev.example.internal/team/db@' + other, 'docker://prod.example.internal/team/db:2',
-             'MIRROR_SOURCE_REGISTRY', 'MIRROR_REGISTRY')])
-        digests['docker://prod.example.internal/team/db:2'] = old
-        with mock.patch.object(mirror, 'copy'), mock.patch('builtins.print'), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=lambda ref, side: digests[ref]), \
-                self.assertRaisesRegex(mirror.MirrorError, 'digest mismatch in MIRROR_REGISTRY after the copy'):
-            mirror.promote(record)
-        record.write_text(json.dumps([{'target': 'team/app', 'tag': '1.0', 'digest': 'latest'}]))
-        with self.assertRaisesRegex(mirror.MirrorError, 'invalid entry'):
-            mirror.promote(record)
-        os.environ['MIRROR_REGISTRY'] = 'dev.example.internal'
-        with self.assertRaisesRegex(mirror.MirrorError, 'same registry'):
-            mirror.promote(record)
 
     def test_platform_selection_picks_one_child_or_fails(self):
         child = {'digest': 'sha256:' + 'b'*64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}

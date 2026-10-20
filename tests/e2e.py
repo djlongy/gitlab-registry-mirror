@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Run sync, export, send and import against real registries through the normal CLI.
+"""Run sync, request, export and import against real registries through the normal CLI.
 
 Log in to both registries with skopeo first and set E2E_LOW_REGISTRY and E2E_HIGH_REGISTRY
 (E2E_TLS_VERIFY=false for plain HTTP). Use dedicated test registries: the test pushes uniquely
 named repositories under E2E_ORG (default mirror). It seeds two multi-platform OCI indexes into the
-low registry as sources, so nothing is pulled from the internet.
-
-With MIRROR_S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and E2E_S3_BUCKET set, it also sends
-through that bucket and imports from it.
+low registry as sources, so nothing is pulled from the internet. The webhook goes to a listener in
+this process, which records each request.
 """
 import gzip
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -86,6 +86,24 @@ def on_high(target, tag):
     return mirror.raw_digest(reference, 'MIRROR_REGISTRY'), len(raw.get('manifests', []))
 
 
+def listener():
+    """An HTTP endpoint on localhost standing in for the low NiFi's ListenHTTP: the bodies it received."""
+    received = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 (the name http.server calls)
+            received.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            self.send_response(202)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f'http://127.0.0.1:{server.server_port}/contentListener', received
+
+
 def tars(directory):
     return sorted(p for p in directory.glob('*.tar'))
 
@@ -112,10 +130,17 @@ if __name__ == '__main__':
         assert '0 tag(s) copied' in cli('low', 'sync'), 'a second sync copies nothing'
         checks.append('sync-idempotent')
 
-        cli('low', 'export', '-o', out / 'first.tar')
-        cli('low', 'send', out / 'first.tar', '--target-directory', transfer)
-        assert 'nothing new to export' in cli('low', 'export', '-o', out / 'none.tar')
-        checks.append('ledger-delta-after-send')
+        os.environ['MIRROR_REQUEST_URL'], requests = listener()
+        assert 'requested 1 image tag(s)' in cli('low', 'sync'), 'an image synced before the webhook was set is requested'
+        assert [i['repository'] for i in requests[0]['images']] == [target], requests
+        assert 'nothing new to request' in cli('low', 'sync')
+        assert 'requested 1 image tag(s)' in cli('low', 'request', f'{target}:1.0.0'), 'a named image is requested again'
+        assert len(requests) == 2
+        del os.environ['MIRROR_REQUEST_URL']
+        checks.append('webhook-requests-what-is-new-and-named-resends')
+
+        cli('low', 'export', '-o', out / 'bare.tar', fail='export needs images to copy')
+        cli('low', 'export', '--all', '-o', transfer / 'first.tar')
 
         cli('high', 'import', transfer)
         assert tars(transfer) == [] and not list(transfer.iterdir()), 'the inbox empties once imported'
@@ -126,15 +151,14 @@ if __name__ == '__main__':
         CATALOG.write_text('')
         cli('low', 'add', second_source, target)
         cli('low', 'sync')
-        cli('low', 'export', '-o', out / 'second.tar', '--rewrite-base-path', rebased.split('/')[0])
-        with tarfile.open(out / 'second.tar') as archive:
+        cli('low', 'export', '--all', '-o', transfer / 'second.tar', '--rewrite-base-path', rebased.split('/')[0])
+        with tarfile.open(transfer / 'second.tar') as archive:
             listed = json.load(archive.extractfile('./export.json'))['images']
         assert [(i['target'], i['tag']) for i in listed] == [(rebased, '1.0.1')], listed
-        cli('low', 'send', out / 'second.tar', '--target-directory', transfer)
         cli('high', 'import', transfer / 'second.tar')
         assert on_high(rebased, '1.0.1')[0] == mirror.catalog(CATALOG)[0]['digest']
         assert (transfer / 'second.tar').exists(), 'a tar named on its own is kept'
-        checks.append('delta-and-rewrite-base-path')
+        checks.append('rewrite-base-path')
 
         cli('high', 'import', transfer / 'second.tar')
         checks.append('reimport-is-a-no-op')
@@ -159,14 +183,6 @@ if __name__ == '__main__':
         cli('high', 'import', split)
         assert on_high(f'{target}-source', '1.0.0')[1] == 2
         checks.append('max-size-split')
-
-        bucket = os.environ.get('E2E_S3_BUCKET')
-        if bucket:
-            cli('low', 'export', '--all', '-o', out / 's3.tar')
-            cli('low', 'send', out / 's3.tar', '--s3-bucket', bucket)
-            assert 'imported 1 file(s)' in cli('high', 'import', '--s3-bucket', bucket)
-            assert 'nothing to import' in cli('high', 'import', '--s3-bucket', bucket)
-            checks.append('s3-send-and-import')
 
         assert not list(WORK.rglob('.mirror-staging-*')), 'staging directories are removed'
         checks.append('staging-removed')
