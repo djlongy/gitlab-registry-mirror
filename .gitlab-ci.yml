@@ -17,21 +17,11 @@ variables:
   MIRROR_SCAN: 'false'
   # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
-  # Two ways across, set either or both as project CI variables:
-  # - MIRROR_REQUEST_URL (+ MIRROR_REQUEST_TOKEN): sync posts a webhook request naming the images; the low
-  #   NiFi pulls them from MIRROR_REGISTRY itself.
-  # - A tar destination, one of: MIRROR_SEND_NIFI_URL (a ListenHTTP), MIRROR_SEND_S3_BUCKET (at
-  #   MIRROR_S3_ENDPOINT with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) or MIRROR_SEND_DIRECTORY (a
-  #   directory mounted on the runner, e.g. an NFS share).
-  # None set: sync only.
-  MIRROR_SEND_NIFI_URL: ''
-  MIRROR_SEND_S3_BUCKET: ''
-  MIRROR_SEND_DIRECTORY: ''
-  # true: send one NAME.tar.ffv3 (NiFi FlowFile v3: the tar, X-Sha256 and the other attributes) to
-  # MIRROR_SEND_S3_BUCKET or MIRROR_SEND_DIRECTORY instead of the tar and its .sha256.
-  MIRROR_SEND_FLOWFILE: 'false'
-  # Resend: Build > Pipelines > Run pipeline shows these two. Every pipeline already sends what is
-  # synced and not yet sent; these send images again, to the webhook and the tar destination alike.
+  # How images cross: set MIRROR_REQUEST_URL (and MIRROR_REQUEST_TOKEN) as project CI variables. sync then
+  # posts one webhook request naming every synced image not yet requested; the low NiFi pulls them from
+  # MIRROR_REGISTRY itself. Unset: sync only.
+  # Resend: Build > Pipelines > Run pipeline shows these two. Every pipeline already requests what is
+  # synced and not yet requested; these request images again.
   MIRROR_RESEND_IMAGES:
     value: ''
     description: >-
@@ -41,12 +31,10 @@ variables:
     value: 'false'
     options: ['false', 'true']
     description: 'true sends every synced image in images.txt again.'
-  # Split the export into tars of at most this size, e.g. 4GiB. Empty: one tar.
-  MIRROR_EXPORT_MAX_SIZE: ''
-  # A disk with room for the export while it is built. Empty: the job directory.
+  # A disk for skopeo's temporary files instead of the runner's /tmp, which is often small. Empty: /tmp.
   MIRROR_STAGING_DIR: ''
   # PEM file of extra CAs (or self-signed certificates) for a runner that does not already trust them.
-  # Every connection (registries, GitLab, S3, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
+  # Every connection (registries, GitLab, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
   MIRROR_CA_BUNDLE: ''
 
 verify:
@@ -84,9 +72,11 @@ verify:
       when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
-        - images.txt
-        - mirror.py
-        - .gitlab-ci.yml
+        paths:
+          - images.txt
+          - mirror.py
+          - .gitlab-ci.yml
+        compare_to: refs/heads/main
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
 
 # One CycloneDX SBOM per pending image, for the platform the mirror carries. Charts hold no packages.
@@ -143,8 +133,8 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A runner with python3, skopeo and curl. sync copies the catalog into MIRROR_REGISTRY; export and
-# send carry what is new as a tar when a destination is set. The ledger lives in the package registry.
+# A runner with python3, skopeo and curl. sync copies the catalog into MIRROR_REGISTRY and, with
+# MIRROR_REQUEST_URL, asks the low NiFi to carry what is new. The ledger lives in the package registry.
 # Merge-request validation runs elsewhere, without registry credentials.
 sync:
   stage: publish
@@ -166,18 +156,10 @@ sync:
     - python3 mirror.py login
     - python3 mirror.py sync
     - |
-      if [ -n "$MIRROR_REQUEST_URL" ] && [ -n "$MIRROR_RESEND_IMAGES" ]; then
+      if [ -n "$MIRROR_RESEND_IMAGES" ]; then
         printf '%s\n' "$MIRROR_RESEND_IMAGES" | python3 mirror.py request -T -
       fi
-    - |
-      set -- ${MIRROR_SEND_NIFI_URL:+--nifi-url "$MIRROR_SEND_NIFI_URL"} ${MIRROR_SEND_S3_BUCKET:+--s3-bucket "$MIRROR_SEND_S3_BUCKET"} ${MIRROR_SEND_DIRECTORY:+--target-directory "$MIRROR_SEND_DIRECTORY"}
-      if [ "$#" -eq 0 ]; then
-        echo "no MIRROR_SEND_NIFI_URL, MIRROR_SEND_S3_BUCKET or MIRROR_SEND_DIRECTORY: sync only"
-      else
-        printf '%s\n' "$MIRROR_RESEND_IMAGES" | python3 mirror.py export -o "export/container-images-$CI_PIPELINE_ID.tar" -T -
-        if ls export/*.tar >/dev/null 2>&1; then python3 mirror.py send export/*.tar "$@"; fi
-      fi
-    # Keep each sent image's SBOM and scan report, by digest, for audit.
+    # Keep each synced image's SBOM and scan report, by digest, for audit.
     - |
       for file in sbom/*.json; do
         [ -e "$file" ] || continue
@@ -187,7 +169,7 @@ sync:
         echo "kept: registry-mirror-sbom/$version/$base"
       done
   after_script:
-    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/export"
+    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
@@ -196,9 +178,6 @@ sync:
       when: never
     - if: '$MIRROR_REGISTRY == ""'
       when: never
-    - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
-    - if: '$CI_PIPELINE_SOURCE == "push"'
-      changes:
-        - images.txt
-        - mirror.py
-        - .gitlab-ci.yml
+    # Every push to the protected default branch: sync is idempotent and copies nothing that is there.
+    # A changes rule cannot work here: compare_to the default branch compares it with itself.
+    - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api|push)$/'

@@ -28,7 +28,7 @@ jobs:
           docker run -d --name high -p 127.0.0.1:15001:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
           curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15000/v2/
           curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15001/v2/
-      - name: Sync, export, send and import between real registries
+      - name: Sync, request, export and import between real registries
         env:
           E2E_LOW_REGISTRY: 127.0.0.1:15000
           E2E_HIGH_REGISTRY: 127.0.0.1:15001

@@ -64,7 +64,7 @@ class CliTest(MirrorCase):
             self.assertEqual(self.run_cli('-h'), 0)
             self.assertIn('registry-mirror sync', self.out.getvalue())
             self.assertNotIn('mirror.py', self.out.getvalue())
-            for command in ('sync', 'export', 'send', 'import', 'login', 'add', 'promote'):
+            for command in ('sync', 'request', 'export', 'import', 'login', 'add'):
                 self.out.truncate(0)
                 self.out.seek(0)
                 self.assertEqual(self.run_cli(command, '-h'), 0)
@@ -74,7 +74,7 @@ class CliTest(MirrorCase):
     def test_exit_codes_are_0_for_success_1_for_a_runtime_failure_and_2_for_a_usage_error(self):
         self.assertEqual(self.run_cli('pending'), 1, 'no catalog: a runtime failure')
         self.assertEqual(self.run_cli('import'), 2, 'import with no source is a usage error')
-        self.assertIn('import needs a tar, a directory or --s3-bucket', self.err.getvalue())
+        self.assertIn('import needs a tar or a directory', self.err.getvalue())
         self.assertIn('error:', self.err.getvalue(), 'argparse keeps its own usage-error prefix')
         self.assertEqual(self.run_cli('no-such-command'), 2)
         self.assertEqual(self.run_cli('sync', '--no-such-option'), 2)
@@ -112,12 +112,9 @@ class CliTest(MirrorCase):
             mirror.env_flag('FLAG')
 
     def test_an_unknown_boolean_is_a_usage_error_at_every_site(self):
-        tar = self.root / 'a.tar'
         cases = (('MIRROR_VERBOSE', ('pending',), {}),
-                 ('MIRROR_SEND_FLOWFILE', ('send', tar, '--target-directory', self.root), {}),
-                 ('MIRROR_REGISTRY_TLS_VERIFY', ('login',), {'MIRROR_REGISTRY_USERNAME': 'robot'}),
-                 ('MIRROR_S3_TLS_VERIFY', ('import', '--s3-bucket', 'b'), {'MIRROR_S3_ENDPOINT': 'https://s3.example.internal',
-                                                                    'AWS_ACCESS_KEY_ID': 'a', 'AWS_SECRET_ACCESS_KEY': 'b'}))
+                 ('MIRROR_RESEND_ALL', ('export', '-o', self.root / 'a.tar'), {}),
+                 ('MIRROR_REGISTRY_TLS_VERIFY', ('login',), {'MIRROR_REGISTRY_USERNAME': 'robot'}))
         self.catalog.write_text('')
         for name, args, extra in cases:
             self.err.truncate(0)
@@ -136,17 +133,10 @@ class CliTest(MirrorCase):
         with mock.patch.dict(os.environ, clear=True):
             self.assertEqual(self.run_cli('sync'), 1)
             self.assertIn('--registry or MIRROR_REGISTRY is required', self.err.getvalue())
-        record = self.root / 'imported.json'
-        digest = 'sha256:' + 'a' * 64
-        record.write_text(json.dumps([{'target': 'team/app', 'tag': '1.0', 'digest': digest}]))
-        with mock.patch.dict(os.environ, clear=True), mock.patch.object(mirror, 'copy') as copied, \
-                mock.patch.object(mirror, 'raw_digest', return_value=digest):
-            self.assertEqual(self.run_cli('promote', record), 1)
-            self.assertIn('--source-registry or MIRROR_SOURCE_REGISTRY is required', self.err.getvalue())
-            self.assertEqual(self.cli('--source-registry', 'dev.example.internal', '--registry', 'prod.example.internal',
-                                      'promote', record), 0)
-        self.assertEqual(copied.call_args.args[:2], (f'docker://dev.example.internal/team/app@{digest}',
-                                                     'docker://prod.example.internal/team/app:1.0'))
+        with mock.patch.dict(os.environ, clear=True):
+            self.catalog.write_text('')
+            self.assertEqual(self.cli('--source-registry', 'docker.io', 'list'), 0)
+            self.assertEqual(os.environ['MIRROR_SOURCE_REGISTRY'], 'docker.io', '--source-registry sets the variable login reads')
 
     def logged_in(self, *args, stdin=b'', **env):
         """Run login with skopeo mocked; returns (exit code, the skopeo command, the stdin it was given)."""
@@ -229,17 +219,6 @@ class CliTest(MirrorCase):
                      ('add', 'docker.io/a/b:1', 'team/b', '-T', listing), ('add', 'docker.io/a/b:1', 'team/b', '--prefix', 'x')):
             with self.subTest(args=args), mock.patch.object(mirror, 'resolve_entry', side_effect=AssertionError('no work')):
                 self.assertEqual(self.run_cli(*args), 2)
-
-    def test_send_target_directory_in_both_spellings_and_exactly_one_destination(self):
-        with Registry(self) as registry:
-            tar, _ = self.exported(registry)
-            for spelling in ('-t', '--target-directory'):
-                share = self.root / ('share' + spelling.strip('-'))
-                share.mkdir()
-                self.assertEqual(self.cli('send', tar, spelling, share), 0, spelling)
-                self.assertEqual(sorted(p.name for p in share.iterdir()), ['carry.tar', 'carry.tar.sha256'])
-            self.assertEqual(self.run_cli('send', tar), 2, 'no destination')
-            self.assertEqual(self.run_cli('send', tar, '-t', self.root, '--nifi-url', 'http://x'), 2, 'two destinations')
 
     def high_import(self, registry, *args):
         os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
@@ -360,7 +339,7 @@ class CliTest(MirrorCase):
             before = self.snapshot()
             for spelling in ('-n', '--dry-run'):
                 self.clear(self.out)
-                self.assertEqual(self.cli('export', spelling, '-o', self.root / 'carry.tar'), 0)
+                self.assertEqual(self.cli('export', '--all', spelling, '-o', self.root / 'carry.tar'), 0)
                 lines = self.out.getvalue().splitlines()
                 self.assertEqual(lines[0], 'would write: ' + str(self.root / 'carry.tar') + ' and carry.tar.sha256 (2 image tag(s))')
                 self.assertEqual(len(lines), 3)
@@ -369,40 +348,17 @@ class CliTest(MirrorCase):
             self.assertFalse([p for p in self.root.iterdir() if p.name.startswith('.mirror-staging')])
             self.clear(self.out)
             with mock.patch.object(mirror, 'groups', side_effect=lambda images, cap: [images[:1], images[1:]]):
-                self.assertEqual(self.cli('export', '-n', '-o', self.root / 'split.tar', '--max-size', '1'), 0)
+                self.assertEqual(self.cli('export', '--all', '-n', '-o', self.root / 'split.tar', '--max-size', '1'), 0)
             self.assertIn('split-001-of-002.tar', self.out.getvalue())
             self.assertIn('split-002-of-002.tar', self.out.getvalue())
             self.assertEqual(self.snapshot(), before)
-            self.assertEqual(self.cli('export', '-o', self.root / 'carry.tar'), 0, 'a real run still works afterwards')
+            self.assertEqual(self.cli('export', '--all', '-o', self.root / 'carry.tar'), 0, 'a real run still works afterwards')
+            self.assertEqual(self.run_cli('export', '-o', self.root / 'bare.tar'), 2, 'export names its images or takes --all')
+            self.assertIn('export needs images to copy', self.err.getvalue())
 
-    def test_dry_run_send_checks_the_tars_and_delivers_and_records_nothing(self):
-        with Registry(self) as registry:
-            self.two_images(registry)
-            self.cli('sync')
-            tar = self.root / 'carry.tar'
-            self.cli('export', '-o', tar)
-            share = self.root / 'share'
-            share.mkdir()
-            before = self.snapshot()
-            with mock.patch.object(mirror, 'deliver') as delivered, mock.patch.object(mirror, 'post') as posted:
-                for spelling in ('-n', '--dry-run'):
-                    self.clear(self.out)
-                    self.assertEqual(self.cli('send', tar, '-t', share, spelling), 0)
-                    self.assertEqual(self.out.getvalue(), f'would send: carry.tar and carry.tar.sha256 -> {share}\n')
-                self.assertEqual(self.cli('send', tar, '-t', share, '-n', '--flowfile'), 0)
-                self.assertIn('would send: carry.tar as carry.tar.ffv3', self.out.getvalue())
-                self.assertEqual(self.cli('send', tar, '--nifi-url', 'https://user:s3cret@nifi.example.internal/in', '-n'), 0)
-                self.assertNotIn('s3cret', self.out.getvalue() + self.err.getvalue())
-            delivered.assert_not_called()
-            posted.assert_not_called()
-            self.assertEqual(self.snapshot(), before, 'the ledger records no delivery')
-            tar.with_name('carry.tar.sha256').write_text('0' * 64 + '  carry.tar\n')
-            self.assertEqual(self.cli('send', tar, '-t', share, '-n'), 1, 'a dry run still refuses a bad checksum')
-
-    def test_dry_run_import_prints_the_plan_and_pushes_removes_and_records_nothing(self):
+    def test_dry_run_import_prints_the_plan_and_pushes_and_removes_nothing(self):
         inbox = self.root / 'inbox'
         inbox.mkdir()
-        record = self.root / 'imported.json'
         with Registry(self) as registry:
             tar, digest = self.exported(registry)
             for path in (tar, tar.with_name('carry.tar.sha256')):
@@ -412,7 +368,7 @@ class CliTest(MirrorCase):
             tags = dict(registry.tags)
             for spelling in ('-n', '--dry-run'):
                 self.clear(self.out)
-                self.assertEqual(self.cli('import', inbox, spelling, '--record', record), 0)
+                self.assertEqual(self.cli('import', inbox, spelling), 0)
                 self.assertEqual(self.out.getvalue().splitlines(), [
                     f'would push: high.example.internal/team/app:1.0@{digest}', f'would remove: {inbox}/carry.tar'])
             self.clear(self.out)
@@ -422,8 +378,7 @@ class CliTest(MirrorCase):
             self.clear(self.out)
             self.assertEqual(self.cli('import', inbox / 'carry.tar', '-n', '--rewrite-base-path', 'org'), 0)
             self.assertEqual(self.out.getvalue(), f'would push: high.example.internal/org/app:1.0@{digest}\n')
-            self.assertEqual((registry.tags, self.snapshot()), (tags, before), 'no push, no removal, no record')
-            self.assertFalse(record.exists())
+            self.assertEqual((registry.tags, self.snapshot()), (tags, before), 'no push, no removal')
             registry.tags['high.example.internal/team/app:1.0'] = 'sha256:' + 'b' * 64
             self.clear(self.out)
             self.assertEqual(self.cli('import', inbox / 'carry.tar', '-n'), 0)
@@ -435,20 +390,6 @@ class CliTest(MirrorCase):
             self.assertEqual(self.out.getvalue(), f'already there: high.example.internal/team/app:1.0@{digest}\n')
             self.assertEqual(self.cli('import', inbox), 0)
             self.assertEqual(list(inbox.iterdir()), [], 'the same run without the flag imports and empties the inbox')
-
-    def test_dry_run_import_reads_a_flowfile_package(self):
-        inbox = self.root / 'inbox'
-        inbox.mkdir()
-        with Registry(self) as registry:
-            tar, digest = self.exported(registry)
-            self.assertEqual(self.cli('send', tar, '-t', inbox, '--flowfile'), 0)
-            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
-            before = self.snapshot()
-            self.clear(self.out)
-            self.assertEqual(self.cli('import', inbox, '-n'), 0)
-            self.assertEqual(self.out.getvalue().splitlines(), [
-                f'would push: high.example.internal/team/app:1.0@{digest}', f'would remove: {inbox}/carry.tar.ffv3'])
-            self.assertEqual(self.snapshot(), before)
 
     def test_export_to_dash_streams_a_tar_that_import_accepts(self):
         class Stdout(io.StringIO):
@@ -469,7 +410,7 @@ class CliTest(MirrorCase):
             before = self.snapshot()
             stdout = Stdout()
             with mock.patch.object(sys, 'stdout', stdout):
-                self.assertEqual(self.cli('export', '-o', '-'), 0)
+                self.assertEqual(self.cli('export', '--all', '-o', '-'), 0)
             self.assertEqual(stdout.getvalue(), '', 'only the tar goes to stdout')
             self.assertIn('to stdout', self.err.getvalue())
             self.assertEqual(self.snapshot(), before, 'no tar, no .sha256 and no staging directory left on disk')
@@ -489,12 +430,12 @@ class CliTest(MirrorCase):
             for args, reason in ((('--max-size', '1GiB'), '--max-size'), (('--dry-run',), '--dry-run')):
                 broken = Stdout()
                 with mock.patch.object(sys, 'stdout', broken):
-                    self.assertEqual(self.run_cli('export', '-o', '-', *args), 2, reason)
+                    self.assertEqual(self.run_cli('export', '--all', '-o', '-', *args), 2, reason)
                 self.assertEqual(broken.buffer.getvalue(), b'')
             terminal = Stdout()
             terminal.tty = True
             with mock.patch.object(sys, 'stdout', terminal):
-                self.assertEqual(self.run_cli('export', '-o', '-'), 2)
+                self.assertEqual(self.run_cli('export', '--all', '-o', '-'), 2)
             self.assertIn('refusing to write a tar to a terminal', self.err.getvalue())
             self.assertEqual(terminal.buffer.getvalue(), b'')
 
@@ -542,23 +483,6 @@ class CliTest(MirrorCase):
             with mock.patch.dict(os.environ, {'MIRROR_STAGING_DIR': str(self.root / 'from-env')}):
                 self.assertEqual(self.cli('import', tar), 0)
             self.assertTrue((self.root / 'from-env').is_dir())
-
-    def test_promote_copies_from_the_source_registry_and_changes_the_path_with_either_option(self):
-        digest = 'sha256:' + 'a' * 64
-        record = self.root / 'imported.json'
-        record.write_text(json.dumps([{'target': 'team/sub/app', 'tag': '1.0', 'digest': digest}]))
-        base = ('--source-registry', 'dev.example.internal', '--registry', 'prod.example.internal')
-        for options, expected in (((), 'team/sub/app:1.0'), (('--rewrite-base-path', 'org'), 'org/sub/app:1.0'),
-                                  (('--strip-components', '2'), 'app:1.0')):
-            with mock.patch.object(mirror, 'copy') as copied, mock.patch.object(mirror, 'raw_digest', return_value=digest):
-                self.assertEqual(self.cli(*base, 'promote', record, *options), 0, options)
-            self.assertEqual(copied.call_args.args[:2], (f'docker://dev.example.internal/team/sub/app@{digest}',
-                                                         f'docker://prod.example.internal/{expected}'), options)
-        self.assertEqual(self.run_cli(*base, 'promote', record, '--rewrite-base-path', 'o', '--strip-components', '1'), 2)
-        with mock.patch.dict(os.environ, {'MIRROR_STRIP_COMPONENTS': '1'}), mock.patch.object(mirror, 'copy') as copied, \
-                mock.patch.object(mirror, 'raw_digest', return_value=digest):
-            self.assertEqual(self.cli(*base, 'promote', record), 0)
-        self.assertEqual(copied.call_args.args[1], 'docker://prod.example.internal/sub/app:1.0')
 
     def test_the_package_ledger_is_reached_with_the_ledger_token_project_and_api_url_variables(self):
         seen = []
@@ -615,7 +539,7 @@ COVERAGE = {
     'check files': 'test_list_prints_the_catalog_on_stdout_and_check_reads_files_or_stdin',
     'sync': 'test_sync_copies_by_digest_records_the_ledger_and_is_idempotent',
     'sync --dry-run': 'test_dry_run_sync_prints_the_copies_and_saves_nothing',
-    'export': 'test_export_takes_what_is_new_since_the_last_send',
+    'export': 'test_export_takes_named_images_or_every_synced_one_with_all',
     'request': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'request --files-from': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'request --all': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
@@ -623,35 +547,22 @@ COVERAGE = {
     'request images': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'export images': 'test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path',
     'export --files-from': 'test_files_from_names_images_in_files_and_stdin_and_repeats',
-    'export --all': 'test_export_takes_what_is_new_since_the_last_send',
+    'export --all': 'test_export_takes_named_images_or_every_synced_one_with_all',
     'export --output': 'test_export_to_dash_streams_a_tar_that_import_accepts',
     'export --max-size': 'test_max_size_splits_whole_images_into_several_tars_and_none_means_one',
     'export --staging-dir': 'test_staging_is_beside_the_tar_or_overridden_and_always_removed',
     'export --rewrite-base-path': 'test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path',
     'export --strip-components': 'test_strip_components_removes_n_segments_from_flag_or_environment_and_excludes_rewrite',
     'export --dry-run': 'test_dry_run_export_names_the_tars_and_writes_nothing',
-    'send': 'test_send_target_directory_in_both_spellings_and_exactly_one_destination',
-    'send tars': 'test_send_target_directory_in_both_spellings_and_exactly_one_destination',
-    'send --target-directory': 'test_send_target_directory_in_both_spellings_and_exactly_one_destination',
-    'send --nifi-url': 'test_send_to_nifi_posts_the_tar_then_its_checksum_streamed_without_credentials_in_the_log',
-    'send --s3-bucket': 'test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket',
-    'send --flowfile': 'test_send_flowfile_writes_one_package_with_the_http_attributes_and_import_reads_it',
-    'send --dry-run': 'test_dry_run_send_checks_the_tars_and_delivers_and_records_nothing',
     'import': 'test_import_pushes_digests_unchanged_skips_present_and_moves_a_tag_unless_no_clobber',
     'import sources': 'test_a_directory_is_an_inbox_and_imported_tars_leave_it',
-    'import --s3-bucket': 'test_s3_send_and_import_sign_path_style_requests_and_list_the_bucket',
     'import --keep': 'test_keep_in_both_spellings_leaves_the_inbox_alone',
     'import --no-clobber': 'test_no_clobber_refuses_the_whole_tar_before_any_push',
     'import --no-checksum': 'test_import_no_checksum_takes_a_tar_without_its_sha256_but_still_checks_one_that_is_there',
-    'import --record': 'test_import_pushes_digests_unchanged_skips_present_and_moves_a_tag_unless_no_clobber',
     'import --staging-dir': 'test_import_staging_dir_is_where_the_working_copy_goes_and_is_removed',
     'import --rewrite-base-path': 'test_import_pushes_digests_unchanged_skips_present_and_moves_a_tag_unless_no_clobber',
     'import --strip-components': 'test_strip_components_removes_n_segments_from_flag_or_environment_and_excludes_rewrite',
-    'import --dry-run': 'test_dry_run_import_prints_the_plan_and_pushes_removes_and_records_nothing',
-    'promote': 'test_promote_copies_from_the_source_registry_and_changes_the_path_with_either_option',
-    'promote record': 'test_promote_copies_from_the_source_registry_and_changes_the_path_with_either_option',
-    'promote --rewrite-base-path': 'test_promote_copies_from_the_source_registry_and_changes_the_path_with_either_option',
-    'promote --strip-components': 'test_promote_copies_from_the_source_registry_and_changes_the_path_with_either_option',
+    'import --dry-run': 'test_dry_run_import_prints_the_plan_and_pushes_and_removes_nothing',
 }
 
 
