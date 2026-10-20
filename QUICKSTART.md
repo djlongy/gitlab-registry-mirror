@@ -7,7 +7,7 @@
 1. Create a GitLab project from this repository.
 2. In **Settings > CI/CD > Variables**, scoped to environment `mirror-low` and masked: `MIRROR_REGISTRY`, `MIRROR_REGISTRY_USERNAME`, `MIRROR_REGISTRY_PASSWORD`, and `MIRROR_REQUEST_URL` (the low NiFi's ListenHTTP). Without `MIRROR_REQUEST_URL` the pipeline only syncs.
 3. Add images with `python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus`, or many at once with `add -T lists/base.txt --prefix team`, and merge `images.txt`.
-4. Each pipeline requests what is synced and not yet requested. To send a batch again, **Build > Pipelines > Run pipeline** and paste images (or `images.txt` lines) into `MIRROR_RESEND_IMAGES`, one per line; `MIRROR_RESEND_ALL=true` sends everything.
+4. Each pipeline sends what is synced and not yet sent; the ledger in the Package Registry records each send (digest, time, pipeline). To send a batch again, **Build > Pipelines > Run pipeline** and paste images (or `images.txt` lines) into `MIRROR_RESEND_IMAGES`, one per line; `MIRROR_RESEND_ALL=true` sends everything.
 5. The low NiFi's PlanRegistryTransfer must list every target path in Allowed Repositories (`team/*` covers a team), or it refuses the request.
 
 It works when the `sync` job log ends `requested N image tag(s)` and the image appears on the high registry.

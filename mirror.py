@@ -319,7 +319,8 @@ def tls_context(verify=True):
     return context
 
 
-# The ledger: what sync put in MIRROR_REGISTRY and what the webhook requested. In a GitLab CI job it is a file
+# The ledger: what sync put in MIRROR_REGISTRY and what was sent to NiFi, when and from which pipeline. In a
+# GitLab CI job it is a file
 # in the project's generic package registry, so nothing persists on the runner; elsewhere a local file.
 
 def ledger_location(path):
@@ -379,10 +380,12 @@ def load_ledger(location, low, create=True):
         if not create:
             return None
         progress(f"ledger: none at {shown}, starting a new one")
-        return {"registry": low, "synced": {}, "requested": {}, "platforms": {}}
+        return {"registry": low, "synced": {}, "sent": {}, "platforms": {}}
     ledger = json.loads(raw)
-    ledger.pop("sent", None)  # tar deliveries an older version recorded
-    for part in ("synced", "requested", "platforms"):
+    # Older ledgers kept a bare digest per tag, under "requested" (the webhook) or "sent" (tars).
+    ledger["sent"] = {key: {"digest": value} if isinstance(value, str) else value
+                      for key, value in {**ledger.get("sent", {}), **ledger.pop("requested", {})}.items()}
+    for part in ("synced", "platforms"):
         ledger.setdefault(part, {})
     if low and ledger.get("registry") != low:
         raise MirrorError(f"the ledger at {shown} belongs to {ledger.get('registry')}, not {low}; "
@@ -905,14 +908,14 @@ def named(text):
 
 def wanted_images(path, ledger_file, entries, files_from, everything):
     """What export or request takes: the named references, else every catalog image sync has put in
-    MIRROR_REGISTRY (everything), else those the ledger has not requested at that digest."""
+    MIRROR_REGISTRY (everything), else those the ledger has not sent at that digest."""
     entries = [name for text in entries for name in named(text)]
     entries += [name for file in files_from or () for _, text in list_lines(file) for name in named(text)]
     if entries:
         return [found for entry in entries for found in export_tags(entry)]
     low = registry("MIRROR_REGISTRY")
     ledger = load_ledger(ledger_file, low)
-    synced, requested = ledger["synced"], ledger["requested"]
+    synced, sent = ledger["synced"], ledger["sent"]
     found = []
     for image in catalog(path):
         record = synced.get(f"{image['target']}:{image['tag']}")
@@ -921,11 +924,13 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
                    if isinstance(ledger_file, str) else "run sync first")
             progress(f"not synced yet, {how}: {image['target']}:{image['tag']}")
             continue
-        if everything or requested.get(f"{image['target']}:{image['tag']}") != record["digest"]:
+        last = sent.get(f"{image['target']}:{image['tag']}") or {}
+        if everything or last.get("digest") != record["digest"]:
             found += [(low, image["target"], tag) for tag in record["tags"]]
         else:
-            # The ledger keys on target path and digest, not source: a new source at a requested digest is not.
-            progress(f"already requested at {record['digest']}, skipped (send again: --all or its name, in a pipeline MIRROR_RESEND_ALL or MIRROR_RESEND_IMAGES): "
+            # The ledger keys on target path and digest, not source: a new source at a sent digest is not sent.
+            when = f" on {last['time']}" if last.get("time") else ""
+            progress(f"already sent at {record['digest']}{when}, skipped (send again: --all or its name, in a pipeline MIRROR_RESEND_ALL or MIRROR_RESEND_IMAGES): "
                      f"{image['target']}:{image['tag']}")
     return found
 
@@ -1094,8 +1099,8 @@ def notify(low, images):
 
 def request(path, ledger_file, entries=(), files_from=None, everything=False, dry_run=False):
     """Ask the low NiFi, through MIRROR_REQUEST_URL, to carry images in MIRROR_REGISTRY: the named ones,
-    else every synced catalog image (everything), else those synced and not yet requested at that digest.
-    The ledger records them as requested once the POST succeeds."""
+    else every synced catalog image (everything), else those synced and not yet sent at that digest.
+    Once the POST succeeds the ledger records each as sent: its digest, the time and, in CI, the pipeline."""
     if not os.environ.get("MIRROR_REQUEST_URL", "").strip():
         raise MirrorError("request needs MIRROR_REQUEST_URL")
     low = registry("MIRROR_REGISTRY")
@@ -1117,7 +1122,10 @@ def request(path, ledger_file, entries=(), files_from=None, everything=False, dr
         return
     notify(low, images)
     ledger = load_ledger(ledger_file, low)
-    ledger["requested"].update({f"{i['repository']}:{i['tag']}": i["digest"] for i in images})
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pipeline = os.environ.get("CI_PIPELINE_URL", "")
+    ledger["sent"].update({f"{i['repository']}:{i['tag']}": {"digest": i["digest"], "time": when, "pipeline": pipeline}
+                           for i in images})
     save_ledger(ledger_file, ledger)
     progress(f"requested {len(images)} image tag(s) from {low}")
 
@@ -1483,13 +1491,13 @@ def build_parser():
 
     request_command = command(
         "request", "ask the low NiFi, through MIRROR_REQUEST_URL, to carry images from MIRROR_REGISTRY",
-        "  {prog} request                       # synced and not yet requested (sync does this itself)\n"
+        "  {prog} request                       # synced and not yet sent (sync does this itself)\n"
         "  {prog} request --all                 # every synced catalog image again\n"
         "  {prog} request team/app:v1 team/db   # a tag, every tag of a repository\n"
         "  {prog} request -T images.txt         # images.txt lines work: each names its target:tag\n"
         "  {prog} request -T - --dry-run        # paste lines on stdin, print the request, post nothing",
         "one POST, the same body and headers as the webhook sync sends. Names are references in\n"
-        "MIRROR_REGISTRY or images.txt lines; the ledger records what was requested.\n\n")
+        "MIRROR_REGISTRY or images.txt lines; the ledger records each image sent: digest, time, pipeline.\n\n")
     request_command.add_argument("images", nargs="*", help="repo:tag or repo in MIRROR_REGISTRY, or an images.txt line")
     request_command.add_argument("-T", "--files-from", type=Path, action="append", metavar="FILE",
                                  help="a file of references or images.txt lines, one per line; - is stdin")

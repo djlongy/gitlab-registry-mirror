@@ -18,10 +18,10 @@ variables:
   # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
   # How images cross: set MIRROR_REQUEST_URL (and MIRROR_REQUEST_TOKEN) as project CI variables. sync then
-  # posts one webhook request naming every synced image not yet requested; the low NiFi pulls them from
+  # posts one webhook request naming every synced image not yet sent; the low NiFi pulls them from
   # MIRROR_REGISTRY itself. Unset: sync only.
-  # Resend: Build > Pipelines > Run pipeline shows these two. Every pipeline already requests what is
-  # synced and not yet requested; these request images again.
+  # Resend: Build > Pipelines > Run pipeline shows these two. Every pipeline already sends what is
+  # synced and not yet sent; these send images again.
   MIRROR_RESEND_IMAGES:
     value: ''
     description: >-

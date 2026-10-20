@@ -249,9 +249,17 @@ class MirrorTest(MirrorCase):
         gitlab = FakeGitLab(self)
         with gitlab:
             ledger = mirror.load_ledger('gitlab', LOW)
-            ledger['requested']['team/app:1.0'] = 'sha256:' + 'a' * 64
+            ledger['sent']['team/app:1.0'] = {'digest': 'sha256:' + 'a' * 64, 'time': '2026-10-20T00:00:00Z', 'pipeline': ''}
             mirror.save_ledger('gitlab', ledger)
-            self.assertEqual(mirror.load_ledger('gitlab', LOW)['requested'], ledger['requested'])
+            self.assertEqual(mirror.load_ledger('gitlab', LOW)['sent'], ledger['sent'])
+
+    def test_an_older_ledger_moves_its_requested_and_tar_sent_digests_into_sent(self):
+        app, db = 'sha256:' + 'a' * 64, 'sha256:' + 'b' * 64
+        self.ledger.write_text(json.dumps({'registry': LOW, 'synced': {}, 'requested': {'team/app:1.0': app},
+                                           'sent': {'team/db:2': db}}))
+        ledger = mirror.load_ledger(self.ledger, LOW)
+        self.assertEqual(ledger['sent'], {'team/app:1.0': {'digest': app}, 'team/db:2': {'digest': db}})
+        self.assertNotIn('requested', ledger)
 
     def test_saving_the_ci_ledger_prunes_uploads_past_the_window_but_keeps_the_newest_two(self):
         gitlab = FakeGitLab(self)
@@ -389,13 +397,17 @@ class MirrorTest(MirrorCase):
             self.assertEqual(self.cli('sync'), 0)  # synced with no webhook set: nothing asked for yet
             code, sent = self.webhook(registry)
             self.assertEqual(len(sent[0][2]['images']), 2)
-            self.assertEqual(json.loads(self.ledger.read_text())['requested'], {'team/app:1.0': app, 'team/db:2': db})
-            code, sent = self.webhook(registry)  # every tag asked for already
+            ledger = json.loads(self.ledger.read_text())['sent']
+            self.assertEqual({k: v['digest'] for k, v in ledger.items()}, {'team/app:1.0': app, 'team/db:2': db})
+            self.assertRegex(ledger['team/app:1.0']['time'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+            code, sent = self.webhook(registry)  # every tag sent already
             self.assertEqual((code, sent), (0, []))
-            self.assertIn('already requested at', self.err.getvalue())
-            with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'yes'}):
+            self.assertIn(f"already sent at {app} on {ledger['team/app:1.0']['time']}", self.err.getvalue())
+            with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'yes', 'CI_PIPELINE_URL': 'https://git.example/p/9'}):
                 code, sent = self.webhook(registry)
             self.assertEqual(len(sent[0][2]['images']), 2)
+            self.assertEqual(json.loads(self.ledger.read_text())['sent']['team/db:2']['pipeline'], 'https://git.example/p/9',
+                             'a resend records its own pipeline')
             del os.environ['MIRROR_REQUEST_URL']
             with mock.patch.object(mirror, 'run', side_effect=AssertionError('no curl')):
                 mirror.notify(LOW, [{'repository': 'a', 'tag': '1', 'digest': 'sha256:0'}])  # unset: no post
