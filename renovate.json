@@ -2,23 +2,35 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "recreateWhen": "always",
+  "rebaseWhen": "behind-base-branch",
+  "description": "Rebased whenever main moves, so verify checks the merge request against the current catalog (a duplicate target can appear without a conflict). No hourly limit: the pin job starts Renovate so that a line without a digest gets its merge request now, not after the hour's quota.",
+  "prHourlyLimit": 0,
   "customManagers": [
     {
       "customType": "regex",
       "managerFilePatterns": ["/^images\\.txt$/"],
+      "description": "The digest is optional: a line written without one gets it in a pin merge request, and mirror.py skips the line until then. The template replaces the whole match, so the match is the source and the one space after it, and the target stays as it is.",
       "matchStrings": [
-        "(?:^|\\n)(?<depName>[^\\s#]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[0-9a-f]{64})[ \\t]+[^\\s#]+"
+        "(?m)^(?<depName>[^\\s#@]+):(?<currentValue>[^\\s@#:]+)(?:@(?<currentDigest>sha256:[0-9a-f]{64}))?[ \\t]"
       ],
+      "autoReplaceStringTemplate": "{{depName}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}} ",
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker"
     }
   ],
   "packageRules": [
-    {"matchManagers": ["custom.regex"], "pinDigests": true},
     {
-      "description": "Docker versioning offers only tags with the same suffix, and each gradata/stroom build has a new date in its suffix. Loose versioning compares the numbers, then the suffix numerically, so any tag that starts with a version is a candidate if the tag format changes.",
-      "matchDepNames": ["docker.io/gradata/stroom"],
-      "versioning": "loose"
+      "description": "Every images.txt change, pins and new versions alike, in one merge request: one branch per line would conflict with each other in the one shared file.",
+      "matchManagers": ["custom.regex"],
+      "pinDigests": true,
+      "groupName": "images.txt",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Docker versioning offers only tags with the same suffix, and each gradata/stroom build has a new date in its suffix. Loose versioning compares the numbers, then the suffix numerically, so any tag that starts with a version is a candidate if the tag format changes. Each gradata build is wanted as soon as it is published, so no release age applies.",
+      "matchDepNames": ["docker.io/gradata/**", "ghcr.io/gradata-systems/**"],
+      "versioning": "loose",
+      "minimumReleaseAge": "0 days"
     }
   ]
 }

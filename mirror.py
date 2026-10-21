@@ -158,8 +158,9 @@ def parse_image(source, target):
     return {"source": source, "target": target, "tag": match["tag"], "digest": source.partition("@")[2]}
 
 
-def catalog(path):
-    """Every image in the catalog. Every bad line is reported at once, by file and line number."""
+def catalog(path, unpinned=None):
+    """Every image in the catalog. Every bad line is reported at once, by file and line number. A line
+    with no digest yet is left out with a warning, and added to unpinned when given: Renovate pins it."""
     images, seen, problems = [], {}, []
     for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
@@ -169,6 +170,13 @@ def catalog(path):
         if len(fields) != 2:
             problems.append(f"{path.name} line {number}: expected 2 fields (source and target), found "
                             f"{len(fields)}: {line}")
+            continue
+        if "@" not in fields[0] and not image_problem(*fields, pinned=False):
+            if unpinned is None:
+                warn(f"{path.name} line {number}: {fields[0]} has no digest yet, skipped until Renovate's merge "
+                     f"request pins it (or {prog()} add writes it)")
+            else:
+                unpinned.append(fields[0])
             continue
         try:
             image = parse_image(*fields)
@@ -553,9 +561,9 @@ def resolve_entry(source, target):
     return image, tags
 
 
-def write_catalog(path, lines):
+def write_catalog(path, lines, drop=()):
     """Add catalog lines and keep the file sorted a to z by source. Leading comments stay at the
-    top; a comment directly above an entry moves with it."""
+    top; a comment directly above an entry moves with it. An entry whose fields are in drop goes."""
     header, groups, notes = [], [], []
     for raw in (path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []):
         text = raw.strip()
@@ -563,6 +571,8 @@ def write_catalog(path, lines):
             header.append(raw)
         elif text.startswith("#"):
             notes.append(raw)
+        elif text and tuple(text.split("#", 1)[0].split()) in drop:
+            notes = []
         elif text:
             groups.append((text, notes + [raw]))
             notes = []
@@ -575,7 +585,8 @@ def write_catalog(path, lines):
 
 def add_image(path, source, target):
     progress(f"checking {path}")
-    images = catalog(path) if path.exists() else []
+    unpinned = []
+    images = catalog(path, unpinned) if path.exists() else []
     progress(f"resolving {source} to the digest its tag points at now")
     image, tags = resolve_entry(source, target)
     progress(f"digest: {image['digest']}")
@@ -586,7 +597,8 @@ def add_image(path, source, target):
     shared = [f"{i['target']}:{i['tag']}" for i in images if i["digest"] == image["digest"]]
     if shared:
         progress(f"same digest as {', '.join(shared)}: the registry stores the image once and adds this tag")
-    write_catalog(path, [f"{image['source']} {target}"])
+    # A line written without its digest is the same image: the pinned line replaces it.
+    write_catalog(path, [f"{image['source']} {target}"], {(name, target) for name in unpinned if name == source})
     progress(f"added to {path.name}: {image['source']} {target}")
     host = os.environ.get("MIRROR_REGISTRY", "").strip().rstrip("/")
     progress(f"sync pushes it as {host + '/' if host else ''}{target}:{', :'.join(tags)}")
@@ -767,6 +779,11 @@ def sync(path, ledger_file, dry_run=False):
                 continue
             progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
                      + (f" (target has {observed})" if observed else ""))
+            if (ledger["sent"].get(key) or {}).get("digest") == transfer:
+                # The low registry lost what was sent, so the high one may have too: ask for it again. Saved
+                # before the copy, so a run that fails after it still asks next time.
+                del ledger["sent"][key]
+                save_ledger(ledger_file, ledger)
             if number:  # a version tag points at the image already in MIRROR_REGISTRY
                 copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
             else:
@@ -1536,7 +1553,9 @@ def build_parser():
     add.add_argument("-T", "--files-from", type=Path, action="append", metavar="FILE",
                      help="a file of image references, one per line, # comments; - is stdin; repeat for more files")
     add.add_argument("--prefix", help="with -T, the repository path the targets go under, e.g. team")
-    command("list", "validate and list the image catalog", "  {prog} list")
+    listing = command("list", "validate and list the image catalog",
+                      "  {prog} list\n  {prog} list --unpinned   # sources with no digest yet, for Renovate to pin")
+    listing.add_argument("--unpinned", action="store_true", help="list only the sources that have no digest yet")
     command("pending", "list catalog sources sync has not copied yet, one per line", "  {prog} pending")
     check = command("check", "fail when a Containerfile or manifest uses an image the catalog lacks",
                     "  {prog} check Containerfile\n  helm template chart/ | {prog} check -")
@@ -1609,6 +1628,11 @@ def main(argv=None):
                 add_files(args.catalog, args.files_from, args.prefix)
             else:
                 add_image(args.catalog, *args.operands)
+        elif args.command == "list" and args.unpinned:
+            unpinned = []
+            catalog(args.catalog, unpinned)
+            for source in unpinned:
+                print(source)
         elif args.command == "list":
             for image in catalog(args.catalog):
                 print(f"{image['source']} -> {image['target']}:{image['tag']}")

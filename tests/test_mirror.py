@@ -412,6 +412,17 @@ class MirrorTest(MirrorCase):
             with mock.patch.object(mirror, 'run', side_effect=AssertionError('no curl')):
                 mirror.notify(LOW, [{'repository': 'a', 'tag': '1', 'digest': 'sha256:0'}])  # unset: no post
 
+    def test_a_tag_copied_again_at_a_sent_digest_is_asked_for_again_even_after_a_failed_request(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(len(self.webhook(registry)[1][0][2]['images']), 2)
+            del registry.tags[f'{LOW}/team/db:2']  # the low registry lost it, so the high one may have too
+            code, sent = self.webhook(registry, error='curl: (7) Failed to connect')
+            self.assertEqual((code, sent), (0, []))
+            self.assertNotIn('team/db:2', json.loads(self.ledger.read_text())['sent'])
+            code, sent = self.webhook(registry)  # copied back already: only the ledger brings it back
+            self.assertEqual(sent[0][2]['images'], [{'repository': 'team/db', 'tag': '2', 'digest': db}])
+
     def test_request_names_images_txt_lines_or_references_and_refuses_another_registry(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
@@ -681,14 +692,14 @@ class MirrorTest(MirrorCase):
     def test_catalog_names_every_bad_line(self):
         path = self.root / 'images.txt'
         good = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64
-        path.write_text(f'# header\n{good} mirror/alpine\ndocker.io/prom/prometheus:v3 itis-dev/prom/prometheus\n'
+        path.write_text(f'# header\n{good} mirror/alpine\ndocker.io/prom/prometheus:v3@sha256:abc itis-dev/prom/prometheus\n'
                         f'{good} alpine\njust-one-field\n')
         with self.assertRaises(mirror.MirrorError) as caught:
             mirror.catalog(path)
         said = str(caught.exception)
         self.assertIn('has 3 invalid line(s)', said)
-        self.assertIn('images.txt line 3: source docker.io/prom/prometheus:v3 has no @sha256:<digest>', said)
-        self.assertIn('    docker.io/prom/prometheus:v3 itis-dev/prom/prometheus', said)
+        self.assertIn('images.txt line 3: digest sha256:abc is not sha256: followed by 64 lowercase hex', said)
+        self.assertIn('    docker.io/prom/prometheus:v3@sha256:abc itis-dev/prom/prometheus', said)
         self.assertIn('images.txt line 4: target alpine is not <org>/<repository>', said)
         self.assertIn('images.txt line 5: expected 2 fields (source and target), found 1', said)
         self.assertIn(f'{mirror.prog()} add <registry>/<repository>:<tag>', said)
@@ -702,11 +713,32 @@ class MirrorTest(MirrorCase):
         mirror.write_catalog(path, ['docker.io/library/busybox:1@sha256:' + 'b'*64 + ' mirror/busybox'])
         self.assertEqual(len(mirror.catalog(path)), 2)
 
+    def test_a_line_with_no_digest_waits_for_renovate_and_add_replaces_it(self):
+        path = self.root / 'images.txt'
+        good = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64 + ' mirror/alpine'
+        path.write_text(f'{good}\n# from the wiki\ndocker.io/prom/prometheus:v3.13.4 team-dev/prom/prometheus\n'
+                        'docker.io/prom/prometheus:v3.13.4 other/prometheus\n')
+        with mock.patch('sys.stderr', new=io.StringIO()) as err:
+            self.assertEqual([i['target'] for i in mirror.catalog(path)], ['mirror/alpine'])
+        self.assertIn("images.txt line 3: docker.io/prom/prometheus:v3.13.4 has no digest yet, skipped until Renovate's",
+                      err.getvalue())
+        unpinned = []
+        mirror.catalog(path, unpinned)
+        self.assertEqual(unpinned, ['docker.io/prom/prometheus:v3.13.4'] * 2)
+        image = json.dumps({'schemaVersion': 2, 'config': {'mediaType': 'application/vnd.oci.image.config.v1+json'},
+                            'layers': []}).encode()
+        pinned = 'sha256:' + hashlib.sha256(image).hexdigest()
+        with mock.patch.object(mirror, 'run', side_effect=[image]):
+            mirror.add_image(path, 'docker.io/prom/prometheus:v3.13.4', 'team-dev/prom/prometheus')
+        self.assertEqual(path.read_text().splitlines(), [
+            good, 'docker.io/prom/prometheus:v3.13.4 other/prometheus',
+            f'docker.io/prom/prometheus:v3.13.4@{pinned} team-dev/prom/prometheus'])
+
     def test_add_reports_a_bad_catalog_line_before_any_lookup(self):
         path = self.root / 'images.txt'
-        path.write_text('docker.io/prom/prometheus:v3 itis-dev/prom/prometheus\n')
+        path.write_text('docker.io/prom/prometheus:v3@sha256:abc itis-dev/prom/prometheus\n')
         with mock.patch.object(mirror, 'run') as lookup, \
-                self.assertRaisesRegex(mirror.MirrorError, 'images.txt line 1: source docker.io/prom/prometheus:v3 has no'):
+                self.assertRaisesRegex(mirror.MirrorError, 'images.txt line 1: digest sha256:abc is not'):
             mirror.add_image(path, 'docker.io/prom/prometheus:v3', 'itis-dev/prom/prometheus')
         lookup.assert_not_called()
 

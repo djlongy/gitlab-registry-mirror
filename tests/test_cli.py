@@ -290,6 +290,12 @@ class CliTest(MirrorCase):
         self.assertEqual(self.err.getvalue(), '')
         with self.with_stdin('FROM alpine:3.20\n'):
             self.assertEqual(self.cli('check', '-'), 0)
+        self.catalog.write_text(f'docker.io/library/alpine:3.20@sha256:{digest} team/alpine\n'
+                                'ghcr.io/org/tool:1.2 team/tool\n')
+        self.out.truncate(0)
+        self.out.seek(0)
+        self.assertEqual(self.cli('list', '--unpinned'), 0)  # what Renovate still has to pin
+        self.assertEqual(self.out.getvalue(), 'ghcr.io/org/tool:1.2\n')
         self.out.truncate(0)
         self.out.seek(0)
         with self.with_stdin('FROM busybox:1\n'):
@@ -518,6 +524,7 @@ class CliTest(MirrorCase):
 
 # Every command and option of the parser, with the test that fails when its name or behaviour breaks.
 COVERAGE = {
+    'list --unpinned': 'test_list_prints_the_catalog_on_stdout_and_check_reads_files_or_stdin',
     ' --catalog': 'test_catalog_and_ledger_options_choose_the_files',
     ' --ledger': 'test_catalog_and_ledger_options_choose_the_files',
     ' --registry': 'test_registry_and_source_registry_override_the_environment_and_are_required_when_neither_is_set',

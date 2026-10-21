@@ -43,11 +43,12 @@ python3 mirror.py import /media/usb/alpine.tar --rewrite-base-path team   # land
 export MIRROR_REGISTRY=registry.low.example.internal
 python3 mirror.py login
 python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus   # pins the digest in images.txt
+# No access to docker.io? Write "docker.io/prom/prometheus:v3.13.4 team/prometheus" and push: Renovate pins it
 export MIRROR_REQUEST_URL=https://nifi-low.example.internal/image-transfer-webhook
 python3 mirror.py sync              # copy images.txt into MIRROR_REGISTRY, then request what is new from NiFi
 ```
 
-The low NiFi pulls each requested image from `MIRROR_REGISTRY` and carries it to the high registry. The pipeline runs the same `sync`.
+The low NiFi pulls each requested image from `MIRROR_REGISTRY` and carries it to the high registry. The pipeline runs the same `sync`. A line pushed without its digest gets a Renovate merge request that pins it: setup in [docs/renovate-pinning.md](docs/renovate-pinning.md).
 
 ### Send a batch again
 
@@ -88,6 +89,7 @@ A flag wins over its variable.
 | Webhook | `MIRROR_REQUEST_URL`, `MIRROR_REQUEST_TOKEN`, `MIRROR_REQUEST_CA_BUNDLE` | none | Where `sync` and `request` post the request for NiFi to pull images. Unset: `sync` only copies. Token sent as `Authorization: Bearer` |
 | Resend | `MIRROR_RESEND_IMAGES`, `MIRROR_RESEND_ALL` | none, `false` | Send these images again, or every synced image, as [above](#send-a-batch-again). `MIRROR_RESEND_ALL` also applies to `sync`, `request` and `export` by hand |
 | Pipeline | `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `critical`, any runner | The Syft and Grype gate before `sync`, its threshold, the runner tag |
+| Pipeline | `MIRROR_RENOVATE_PROJECT`, `MIRROR_RENOVATE_REF` | none, `main` | The Renovate runner project the `pin` job starts for a line without a digest. See [docs/renovate-pinning.md](docs/renovate-pinning.md) |
 
 ## Preconditions
 
@@ -98,13 +100,13 @@ A flag wins over its variable.
 
 ## Behaviour
 
-- `images.txt` holds one reviewed source per line, pinned by digest, and the repository path it lands at on both sides. `add` writes it.
+- `images.txt` holds one reviewed source per line, pinned by digest, and the repository path it lands at on both sides. `add` writes it. A line without a digest is skipped with a warning until Renovate's merge request pins it.
 - `sync` is idempotent: a tag already at its digest is left alone. It records each copy in the ledger.
 - `export` reads registries and never changes the ledger. It takes named images or `-T` files exactly as named, or every synced catalog image with `--all`; with neither it refuses. Each image is copied whole by digest. `mirror.py export -h` lists the forms.
 - An export tar holds `export.json`, naming each image's source, target path, tag and digest, plus one `skopeo dir:` copy per image, with shared layers stored once. Its `.sha256` sits beside it. `export` writes each file under a hidden name and renames it when complete, so a watcher never takes half a file.
 - `import` treats a directory as an inbox: each tar is removed once imported, and one that fails stays put. It checks every image before the first push, moves an existing tag as `docker push` does (`--no-clobber` refuses the whole tar before any push), and verifies each digest after the push.
 - `--rewrite-base-path` and `--strip-components` change the path on whichever side you pass them. Pass them on one side only.
-- With `MIRROR_REQUEST_URL`, `sync` ends with a `request`: one post naming every synced tag the ledger does not yet record as sent at that digest, copied this run or not (everything with `MIRROR_RESEND_ALL`). JSON body `{"registry", "images": [{"repository", "tag", "digest"}], "references"}`, header `X-Artifact-Type: container-images-request`. A failed post is a warning and is not recorded, so the next `sync` sends it.
+- With `MIRROR_REQUEST_URL`, `sync` ends with a `request`: one post naming every synced tag the ledger does not yet record as sent at that digest, copied this run or not (everything with `MIRROR_RESEND_ALL`). JSON body `{"registry", "images": [{"repository", "tag", "digest"}], "references"}`, header `X-Artifact-Type: container-images-request`. A failed post is a warning and is not recorded, so the next `sync` sends it. A tag `sync` copies back at a digest already sent (deleted or expired in `MIRROR_REGISTRY`) leaves `sent`, so it is asked for again: the high registry may have lost it too.
 - The ledger (`registry-mirror-ledger/v2/ledger.json` in the project's Package Registry in CI) keeps `synced` (what `sync` copied) and `sent`: per tag, the digest last sent to NiFi, when, and the pipeline URL. GitLab keeps older uploads for `MIRROR_LEDGER_KEEP_DAYS` (7), always the newest two. `export` and `import` never read or change it.
 - HTTP 202 means NiFi took the request, not that it carries it: the low NiFi's PlanRegistryTransfer refuses a repository missing from its Allowed Repositories with the bulletin `Plan refused: <repo> is not in Allowed Repositories`. List every `images.txt` target path there (`org/*` covers an org).
 
