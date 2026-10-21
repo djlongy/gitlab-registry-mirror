@@ -36,6 +36,10 @@ variables:
   # PEM file of extra CAs (or self-signed certificates) for a runner that does not already trust them.
   # Every connection (registries, GitLab, NiFi) trusts it in addition to the system roots, never instead. Commit it under certs/, e.g. ./certs/ca-bundle.crt.
   MIRROR_CA_BUNDLE: ''
+  # The Renovate runner project (path or id), e.g. platform/renovate-runner. Set: a line in images.txt
+  # with no digest has the pin job start a Renovate run on this project, which opens the merge request
+  # that pins it. Empty: someone runs Renovate, or mirror.py add, by hand.
+  MIRROR_RENOVATE_PROJECT: ''
 
 verify:
   stage: verify
@@ -146,6 +150,7 @@ sync:
   needs:
     - job: verify
       artifacts: false
+      optional: true  # a pipeline without verify still syncs
     - job: scan
       artifacts: true
       optional: true  # absent unless MIRROR_SCAN=true
@@ -181,3 +186,36 @@ sync:
     # Every push to the protected default branch: sync is idempotent and copies nothing that is there.
     # A changes rule cannot work here: compare_to the default branch compares it with itself.
     - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api|push)$/'
+
+# A line written without a digest (no proxy needed to write it) is pinned by Renovate in a merge request;
+# sync skips it until that is merged. The runner project lists this project in its job token allowlist.
+pin:
+  stage: publish
+  image: $PYTHON_IMAGE
+  tags: [$MIRROR_JOB_TAG]
+  needs:
+    - job: verify
+      artifacts: false
+      optional: true
+  script:
+    - python3 mirror.py list --unpinned | tee unpinned.txt
+    - |
+      if [ ! -s unpinned.txt ]; then
+        echo "every images.txt line is pinned"
+        exit 0
+      fi
+      project=$(printf %s "$MIRROR_RENOVATE_PROJECT" | sed 's|/|%2F|g')
+      # The CA file the runner trusts for GitLab, as the ledger uses: a shell runner may not have it system wide.
+      set -- ${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"}
+      curl "$@" --fail --silent --show-error --output /dev/null --request POST --form "token=$CI_JOB_TOKEN" \
+        --form "ref=${MIRROR_RENOVATE_REF:-main}" --form "variables[RENOVATE_REPOSITORIES]=$CI_PROJECT_PATH" \
+        "${MIRROR_GITLAB_API_URL:-$CI_API_V4_URL}/projects/$project/trigger/pipeline"
+      echo "asked $MIRROR_RENOVATE_PROJECT to run Renovate on $CI_PROJECT_PATH; it opens the merge request that pins these"
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      when: never
+    - if: '$MIRROR_RENOVATE_PROJECT == null'
+      when: never
+    - if: '$MIRROR_RENOVATE_PROJECT == ""'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api|push)$/'
