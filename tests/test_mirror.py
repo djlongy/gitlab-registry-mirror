@@ -412,6 +412,17 @@ class MirrorTest(MirrorCase):
             with mock.patch.object(mirror, 'run', side_effect=AssertionError('no curl')):
                 mirror.notify(LOW, [{'repository': 'a', 'tag': '1', 'digest': 'sha256:0'}])  # unset: no post
 
+    def test_a_tag_copied_again_at_a_sent_digest_is_asked_for_again_even_after_a_failed_request(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.assertEqual(len(self.webhook(registry)[1][0][2]['images']), 2)
+            del registry.tags[f'{LOW}/team/db:2']  # the low registry lost it, so the high one may have too
+            code, sent = self.webhook(registry, error='curl: (7) Failed to connect')
+            self.assertEqual((code, sent), (0, []))
+            self.assertNotIn('team/db:2', json.loads(self.ledger.read_text())['sent'])
+            code, sent = self.webhook(registry)  # copied back already: only the ledger brings it back
+            self.assertEqual(sent[0][2]['images'], [{'repository': 'team/db', 'tag': '2', 'digest': db}])
+
     def test_request_names_images_txt_lines_or_references_and_refuses_another_registry(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)

@@ -767,6 +767,11 @@ def sync(path, ledger_file, dry_run=False):
                 continue
             progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
                      + (f" (target has {observed})" if observed else ""))
+            if (ledger["sent"].get(key) or {}).get("digest") == transfer:
+                # The low registry lost what was sent, so the high one may have too: ask for it again. Saved
+                # before the copy, so a run that fails after it still asks next time.
+                del ledger["sent"][key]
+                save_ledger(ledger_file, ledger)
             if number:  # a version tag points at the image already in MIRROR_REGISTRY
                 copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
             else:
