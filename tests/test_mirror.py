@@ -546,6 +546,14 @@ class MirrorTest(MirrorCase):
             with self.assertRaises(mirror.MirrorError):
                 mirror.rebase('team/app', 'Bad Org')
 
+    def test_copy_retries_long_enough_to_outlast_a_quay_blob_lock(self):
+        with mock.patch.object(mirror, 'run') as run:
+            mirror.copy('docker://a.example.com/x/y@sha256:' + '0' * 64, 'dir:/tmp/out')
+            self.assertIn('--retry-times=7', run.call_args.args)
+            with mock.patch.dict(os.environ, {'MIRROR_RETRY_TIMES': '2'}):
+                mirror.copy('docker://a.example.com/x/y@sha256:' + '0' * 64, 'dir:/tmp/out')
+            self.assertIn('--retry-times=2', run.call_args.args)
+
     def test_export_from_source_reads_upstream_at_the_pin_and_lands_at_the_target(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
