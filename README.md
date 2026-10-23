@@ -97,6 +97,7 @@ A flag wins over its variable.
 | Optional | `MIRROR_CA_BUNDLE` | system roots | PEM of extra CAs, trusted by every connection on top of the system roots and `certs.d` |
 | Optional | `MIRROR_PLATFORM` | all platforms | `sync` copies one platform, e.g. `linux/amd64`. Quay refuses Windows manifests, so set it for images with Windows children |
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` | Ledger file, or the pipeline ledger's `https://` URL (read only). `MIRROR_LEDGER_TOKEN`, `MIRROR_LEDGER_PROJECT` and `MIRROR_GITLAB_API_URL` reach the CI ledger from outside a job |
+| Optional | `MIRROR_RETRY_TIMES` | `7` | How often skopeo retries a failed copy step, 1, 2, 4 ... s apart. The default waits 127 s, past Quay's 503 `UNAVAILABLE` ("The blob is temporarily locked"), which lasts while its garbage collector holds a new blob's lock, up to 120 s |
 | Optional | `MIRROR_STAGING_DIR` | `/tmp`, and beside the tar | A large disk for every command's temporary files (skopeo's included) and the `export` and `import` working copy, instead of a small `/tmp`. `--staging-dir` for one `export` or `import` |
 | Optional | `MIRROR_EXPORT_MAX_SIZE` | one tar | `export --max-size` |
 | Optional | `MIRROR_REWRITE_BASE_PATH`, `MIRROR_STRIP_COMPONENTS` | none | Change the path on `export` or `import`: swap the first segment, or drop the first N (an integer). The NiFi processors keep their own boolean Strip Base Path property |

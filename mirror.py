@@ -307,7 +307,9 @@ def transport_reference(source):
 
 
 def copy(source, destination, source_side=None, destination_side=None):
-    args = ["skopeo", "copy", "--all", "--preserve-digests", "--retry-times=3"]
+    # Quay answers 503 UNAVAILABLE while its garbage collector holds a new blob's BLOB_DELETE lock, up to
+    # 120 s. skopeo backs off 1, 2, 4 ... s, so 7 retries wait 127 s and outlast it.
+    args = ["skopeo", "copy", "--all", "--preserve-digests", f"--retry-times={os.environ.get('MIRROR_RETRY_TIMES') or 7}"]
     if source.startswith("docker://"):
         args += options(source_side, "src-", source)
     if destination.startswith("docker://"):
