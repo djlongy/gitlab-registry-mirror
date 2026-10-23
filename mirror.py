@@ -952,31 +952,60 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
     return found
 
 
+def source_images(path, entries, files_from, everything):
+    """images.txt lines read from their source registry, never MIRROR_REGISTRY: each lands at its target path
+    and digest. A source without a target lands at its path without the host; one without a digest is
+    exported at the digest its tag has now."""
+    if everything:
+        return [{**SOURCE.fullmatch(i["source"].partition("@")[0]).groupdict(), "digest": i["digest"], "target": i["target"]}
+                for i in catalog(path)]
+    lines = [" ".join(entries)] + [text for file in files_from or () for _, text in list_lines(file)]
+    images = []
+    for fields in (line.split() for line in lines):
+        while fields:
+            source = fields.pop(0)
+            target = fields.pop(0) if fields and not re.match(rf"(?:{HOST})/", fields[0]) else None
+            name, _, digest = source.partition("@")
+            match = SOURCE.fullmatch(name)
+            if not match:
+                raise MirrorError(f"--from-source takes <registry>/<repository>:<tag>[@sha256:<digest>] [<target>], "
+                                  f"not {source!r}")
+            problem = image_problem(source, target or match["repo"], pinned=bool(digest))
+            if problem:
+                raise MirrorError(problem)
+            images.append({**match.groupdict(), "target": target or match["repo"],
+                           "digest": digest or raw_digest(f"docker://{name}", side_of(name))})
+    return images
+
+
 def export(path, ledger_file, entries=(), files_from=None, everything=False, output=None, max_size=None,
-           staging=None, base=None, dry_run=False):
+           staging=None, base=None, dry_run=False, from_source=False):
     """Copy images out of a registry into tar files, each with a .sha256 beside it. Bytes and digests are
     unchanged: every image is a skopeo dir: copy, which keeps a Docker manifest list as it is.
 
-    Takes the named images, or every synced catalog image with everything. Reads registries only and
-    changes nothing, the ledger included. Returns the tars written.
+    Takes the named images, or every synced catalog image with everything. With from_source the names are
+    images.txt lines (everything: the whole catalog), read from their source registry at their pinned digest,
+    so MIRROR_REGISTRY and the ledger are never read. Reads registries only and changes nothing, the ledger
+    included. Returns the tars written.
     With output "-" the one finished tar is written to stdout instead, with no .sha256 (the reader checksums
     the stream) and every message on stderr.
     """
     to_stdout = str(output) == "-"
     if not (entries or files_from or everything):
         raise UsageError("export needs images to copy: name them, give -T FILE, or --all for every synced catalog image")
-    wanted = wanted_images(path, ledger_file, entries, files_from, everything)
-    if not wanted:
+    if from_source:
+        images = source_images(path, entries, files_from, everything)
+    else:
+        images = [{"host": host, "repo": repository, "tag": tag,
+                   "digest": raw_digest(f"docker://{host}/{repository}:{tag}", side_of(host))}
+                  for host, repository, tag in dict.fromkeys(wanted_images(path, ledger_file, entries, files_from, everything))]
+    if not images:
         progress("nothing to export")
         return []
     output = Path(datetime.now(timezone.utc).strftime("container-images-%Y%m%dT%H%M%SZ.tar") if to_stdout or not output
                   else output)
     if output.suffix != ".tar":
         raise MirrorError(f"{output}: the output must end in .tar")
-    images = []
-    for host, repository, tag in dict.fromkeys(wanted):
-        digest = raw_digest(f"docker://{host}/{repository}:{tag}", side_of(host))
-        images.append({"host": host, "repo": repository, "tag": tag, "digest": digest})
     batches = groups(images, max_size)
     names = [output] if len(batches) == 1 else [
         output.with_name(f"{output.stem}-{n:03d}-of-{len(batches):03d}.tar") for n in range(1, len(batches) + 1)]
@@ -1011,7 +1040,7 @@ def write_export(tar, images, staging, base, to_stdout=False):
             if "sha256:" + sha256(layout / name / "manifest.json") != image["digest"]:
                 raise MirrorError(f"digest changed during export: {image['host']}/{image['repo']}:{image['tag']}")
             share_blobs(layout, seen)
-            target = rebase(image["repo"], base)
+            target = rebase(image.get("target") or image["repo"], base)
             entries.append({"dir": name, "source": f"{image['host']}/{image['repo']}:{image['tag']}",
                             "target": target, "tag": image["tag"], "digest": image["digest"]})
             progress(f"exported: {image['host']}/{image['repo']}:{image['tag']}@{image['digest']}"
@@ -1443,11 +1472,16 @@ def build_parser():
         "  {prog} export team/app --rewrite-base-path new-org-dev  # team/app lands as new-org-dev/app\n"
         "  {prog} export team/app --strip-components 1    # team/prom/prometheus lands as prom/prometheus\n"
         "  {prog} export --all --dry-run                  # the images and tar names; nothing is written\n"
+        "  {prog} export --from-source -T images.txt -o carry.tar   # straight from upstream, MIRROR_REGISTRY unused\n"
+        "  {prog} export --from-source ghcr.io/org/app:1.0 org-dev/org/app   # one images.txt line\n"
         "  {prog} export team/app:v1 -o - | tee carry.tar | sha256sum   # the tar on stdout, messages on stderr",
         "which images (one of them is required):\n"
         "  names, -T      exactly those references; repo:tag reads MIRROR_REGISTRY, host/repo:tag that host,\n"
         "                 repo with no tag every tag, an images.txt line its target:tag; no ledger check\n"
         "  --all          every catalog image sync has put in MIRROR_REGISTRY\n"
+        "  --from-source  names and -T lines are images.txt lines (source [target]), --all the whole catalog,\n"
+        "                 copied from the source registry at the pinned digest and landing at the target path;\n"
+        "                 MIRROR_REGISTRY and the ledger are never read\n"
         "each image is copied whole by digest (every platform, as the registry holds it). export only reads\n"
         "registries and never changes the ledger.\n\n"
         "what it writes:\n"
@@ -1473,6 +1507,9 @@ def build_parser():
     export_command.add_argument("--max-size", type=size, default=os.environ.get("MIRROR_EXPORT_MAX_SIZE") or None, metavar="SIZE",
                                 help="split into tars of at most this size, e.g. 4GiB or 500MB (or MIRROR_EXPORT_MAX_SIZE; "
                                      "K M G T and KiB MiB GiB TiB are powers of 1024, KB MB GB TB of 1000; default one tar)")
+    export_command.add_argument("--from-source", action="store_true",
+                                help="read images.txt lines (source [target]) from their upstream registry at the "
+                                     "pinned digest, landing at the target path; MIRROR_REGISTRY is never used")
     staging_flag(export_command)
     base_flag(export_command)
     dry_flag(export_command, "the images and the tar names")
@@ -1618,7 +1655,7 @@ def main(argv=None):
                     args.dry_run)
         elif args.command == "export":
             export(args.catalog, ledger_file, args.images, args.files_from, args.all or env_flag("MIRROR_RESEND_ALL"), args.output, args.max_size,
-                   args.staging_dir, base, args.dry_run)
+                   args.staging_dir, base, args.dry_run, args.from_source)
         elif args.command == "import":
             import_all(args.sources, args.staging_dir, args.no_clobber, base, args.keep, args.no_checksum, args.dry_run)
         elif args.command == "login":

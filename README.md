@@ -36,6 +36,20 @@ python3 mirror.py import /media/usb/alpine.tar --rewrite-base-path team   # land
 - Each image is copied whole, every platform its tag holds.
 - `-o -` writes the tar to stdout with no `.sha256`; checksum the stream yourself: `export -o - | tee alpine.tar | sha256sum`.
 
+### Bypass the low registry
+
+```sh
+# Low side: images.txt lines straight from upstream, at their pinned digest, no MIRROR_REGISTRY or ledger
+python3 mirror.py export --from-source -T images.txt -o carry.tar        # chosen lines, any list file
+python3 mirror.py export --from-source --all -o catalog.tar              # the whole catalog
+python3 mirror.py export --from-source ghcr.io/org/app:1.0 org-dev/org/app -o app.tar   # one line
+
+# High side, as above
+python3 mirror.py import /media/usb/carry.tar                            # lands as org-dev/org/app:1.0
+```
+
+- Each line is `source [target]`, as in `images.txt`. A source without a target lands at its path without the host. A source without `@sha256:` is exported at the digest its tag has now.
+
 ### Mirror the catalog
 
 ```sh

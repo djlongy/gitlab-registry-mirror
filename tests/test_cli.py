@@ -555,6 +555,7 @@ COVERAGE = {
     'export images': 'test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path',
     'export --files-from': 'test_files_from_names_images_in_files_and_stdin_and_repeats',
     'export --all': 'test_export_takes_named_images_or_every_synced_one_with_all',
+    'export --from-source': 'test_export_from_source_reads_upstream_at_the_pin_and_lands_at_the_target',
     'export --output': 'test_export_to_dash_streams_a_tar_that_import_accepts',
     'export --max-size': 'test_max_size_splits_whole_images_into_several_tars_and_none_means_one',
     'export --staging-dir': 'test_staging_is_beside_the_tar_or_overridden_and_always_removed',
