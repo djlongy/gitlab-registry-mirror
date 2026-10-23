@@ -546,6 +546,25 @@ class MirrorTest(MirrorCase):
             with self.assertRaises(mirror.MirrorError):
                 mirror.rebase('team/app', 'Bad Org')
 
+    def test_export_from_source_reads_upstream_at_the_pin_and_lands_at_the_target(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            registry.tags['docker.io/team/db:2'] = db  # a source named without its digest is read at its tag
+            with mock.patch.dict(os.environ, {'MIRROR_REGISTRY': ''}):
+                tar = self.root / 'all.tar'
+                self.assertEqual(self.cli('export', '--from-source', '--all', '-o', tar), 0)
+                self.assertEqual(self.tar_images(tar), [('docker.io/team/app:1.0', 'team/app', '1.0'),
+                                                        ('docker.io/team/db:2', 'team/db', '2')])
+                line = self.root / 'line.txt'
+                line.write_text(f'docker.io/team/app:1.0@{app} org-dev/team/app\n')
+                self.assertEqual(self.cli('export', '--from-source', '-T', line, 'docker.io/team/db:2',
+                                          '-o', self.root / 'some.tar'), 0)
+                self.assertEqual(self.tar_images(self.root / 'some.tar'),
+                                 [('docker.io/team/db:2', 'team/db', '2'),
+                                  ('docker.io/team/app:1.0', 'org-dev/team/app', '1.0')])
+                self.assertEqual(self.cli('export', '--from-source', 'team/app:1.0', '-o', self.root / 'bad.tar'), 1)
+                self.assertIn('--from-source takes', self.err.getvalue())
+
     def test_max_size_splits_whole_images_into_several_tars_and_none_means_one(self):
         with Registry(self) as registry, mock.patch.object(mirror, 'image_bytes', side_effect=[3, 3, 9]):
             for name in ('a', 'b', 'c'):
