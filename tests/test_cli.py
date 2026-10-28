@@ -542,6 +542,8 @@ COVERAGE = {
     'add --prefix': 'test_add_takes_one_image_or_files_from_with_a_prefix_and_never_both',
     'list': 'test_list_prints_the_catalog_on_stdout_and_check_reads_files_or_stdin',
     'pending': 'test_pending_lists_what_sync_has_not_copied',
+    'pending --all': 'test_pending_all_lists_every_source_and_fetches_the_kept_sboms',
+    'pending --sbom-dir': 'test_pending_all_lists_every_source_and_fetches_the_kept_sboms',
     'check': 'test_list_prints_the_catalog_on_stdout_and_check_reads_files_or_stdin',
     'check files': 'test_list_prints_the_catalog_on_stdout_and_check_reads_files_or_stdin',
     'sync': 'test_sync_copies_by_digest_records_the_ledger_and_is_idempotent',

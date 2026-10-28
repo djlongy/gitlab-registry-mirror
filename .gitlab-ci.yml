@@ -13,8 +13,17 @@ variables:
   SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
   GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
   GRYPE_FAIL_ON: 'critical'
-  # true adds the Syft SBOM and Grype scan before sync; sync waits for them.
+  # true adds the Syft SBOM and Grype scan before sync; sync waits for them. Grype needs its database:
+  # grype.anchore.io through the proxy, or a copy you host (GRYPE_DB_UPDATE_URL). See docs/scanning.md.
   MIRROR_SCAN: 'false'
+  # The check for a newer Grype release only adds an error line where toolbox-data.anchore.io is blocked.
+  GRYPE_CHECK_FOR_APP_UPDATE: 'false'
+  MIRROR_RESCAN:
+    value: 'false'
+    options: ['false', 'true']
+    description: >-
+      true scans every image in images.txt against today's vulnerability database, from the SBOMs sync
+      kept, and syncs nothing. For a nightly schedule of its own.
   # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
   # How images cross: set MIRROR_REQUEST_URL (and MIRROR_REQUEST_TOKEN) as project CI variables. sync then
@@ -49,30 +58,36 @@ verify:
   script:
     - python3 mirror.py list
     - python3 -m unittest discover -s tests -v
-    # What sync copies next; sbom and scan check exactly these. The job token reads the ledger.
-    - python3 mirror.py pending > pending.txt
+    # What sync copies next; sbom and scan check exactly these, or every image on a rescan. The job token
+    # reads the ledger, and the SBOMs sync kept, so Syft makes only the missing ones.
+    - |
+      if [ "$MIRROR_RESCAN" = true ]; then python3 mirror.py pending --all --sbom-dir sbom > pending.txt
+      elif [ "$MIRROR_SCAN" = true ]; then python3 mirror.py pending --sbom-dir sbom > pending.txt
+      else python3 mirror.py pending > pending.txt; fi
     - cat pending.txt
   artifacts:
-    paths: [pending.txt]
+    paths: [pending.txt, sbom/]
     expire_in: 1 week
 
 .gate: &gate
   stage: verify
   tags: [$MIRROR_JOB_TAG]
   # A docker executor runs the job in the scanner's image; a shell executor has only podman, so
-  # run_image starts the same image through it. Grype's database goes in the job directory.
+  # run_image starts the same image through it, with every GRYPE_ and SYFT_ variable. Grype's database
+  # goes in the job directory.
   before_script:
     - |
+      export GRYPE_DB_CACHE_DIR="$PWD/.grype-db"
       run_image() {
         image=$1; binary=$2; shift 2
         if [ -x "$binary" ]; then "$binary" "$@"
-        else podman run --rm --user 0 -v "$PWD:$PWD:z" -w "$PWD" -e GRYPE_DB_CACHE_DIR="$PWD/.grype-db" \
+        else podman run --rm --user 0 -v "$PWD:$PWD:z" -w "$PWD" -e 'GRYPE_*' -e 'SYFT_*' \
           --entrypoint "$binary" "$image" "$@"; fi
       }
   after_script:
     - rm -rf .grype-db
   rules:
-    - if: '$MIRROR_SCAN != "true"'
+    - if: '$MIRROR_SCAN != "true" && $MIRROR_RESCAN != "true"'
       when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
@@ -83,7 +98,8 @@ verify:
         compare_to: refs/heads/main
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
 
-# One CycloneDX SBOM per pending image, for the platform the mirror carries. Charts hold no packages.
+# One CycloneDX SBOM per pending image digest, for the platform the mirror carries, unless verify brought
+# the one sync kept. Charts hold no packages.
 sbom:
   <<: *gate
   image:
@@ -97,12 +113,18 @@ sbom:
       while read -r source; do
         name="${source%@*}"; digest="${source#*@}"; reference="${name%:*}@$digest"
         file="sbom/$(echo "$digest" | tr : -).cdx.json"
+        if [ -e "$file" ]; then
+          echo "sbom: $source has $file already"
+          continue
+        fi
         echo "sbom: $source"
         if ! run_image "$SYFT_IMAGE" /syft scan "registry:$reference" --platform "${MIRROR_PLATFORM:-linux/amd64}" \
             -o "cyclonedx-json=$file" 2> syft.err; then
           rm -f "$file"
           if grep -q 'application/vnd.cncf.helm' syft.err; then
             echo "chart, no packages to list: $source"
+          elif [ "$MIRROR_RESCAN" = true ]; then  # scan the rest; scan fails on this list at the end
+            cat syft.err; echo "$source" >> sbom/missing.txt
           else
             cat syft.err; failed=1
           fi
@@ -123,6 +145,15 @@ scan:
       user: root  # the image runs as uid 65532, which cannot write the job's checkout
   needs: [sbom]
   script:
+    # One database download for every SBOM, and a clear stop when it cannot be had.
+    - |
+      if ! run_image "$GRYPE_IMAGE" /grype db update; then
+        echo "no vulnerability database from ${GRYPE_DB_UPDATE_URL:-https://grype.anchore.io/databases}:" \
+          "allow it through the proxy or host a copy, see docs/scanning.md"
+        exit 1
+      fi
+      run_image "$GRYPE_IMAGE" /grype db status
+      export GRYPE_DB_AUTO_UPDATE=false
     - |
       failed=0
       for file in sbom/*.cdx.json; do
@@ -131,6 +162,9 @@ scan:
         run_image "$GRYPE_IMAGE" /grype "sbom:$file" --only-fixed --fail-on "$GRYPE_FAIL_ON" -o table \
           -o "json=${file%.cdx.json}.grype.json" || failed=1
       done
+      if [ -s sbom/missing.txt ]; then
+        echo "not scanned, no SBOM could be made:"; cat sbom/missing.txt; failed=1
+      fi
       exit "$failed"
   artifacts:
     when: always
@@ -149,7 +183,7 @@ sync:
   resource_group: registry-mirror
   needs:
     - job: verify
-      artifacts: false
+      artifacts: true  # pending.txt names the image each SBOM belongs to
       optional: true  # a pipeline without verify still syncs
     - job: scan
       artifacts: true
@@ -169,14 +203,38 @@ sync:
       for file in sbom/*.json; do
         [ -e "$file" ] || continue
         base=$(basename "$file"); version=${base%%.*}
-        curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" \
+        curl ${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"} --fail --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" \
           "${MIRROR_GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/registry-mirror-sbom/$version/$base"
         echo "kept: registry-mirror-sbom/$version/$base"
       done
+    # With DTRACK_URL (and a masked DTRACK_API_KEY with BOM_UPLOAD and PROJECT_CREATION_UPLOAD), each image's
+    # SBOM also goes to Dependency-Track as project <repository>, version <tag>@<digest>. A failure only warns.
+    - |
+      if [ -n "$DTRACK_URL" ] && [ -s pending.txt ]; then
+        while read -r source; do
+          name="${source%@*}"; digest="${source#*@}"; file="sbom/$(echo "$digest" | tr : -).cdx.json"
+          [ -e "$file" ] || continue
+          case "${name##*/}" in
+            *:*) repository="${name%:*}"; tag="${name##*:}" ;;
+            *) repository="$name"; tag="untagged" ;;
+          esac
+          repository="${repository#*/}"  # without the registry host
+          if curl --fail-with-body --silent --show-error --output /dev/null --request POST \
+              --header "X-Api-Key: $DTRACK_API_KEY" --form autoCreate=true --form "projectName=$repository" \
+              --form "projectVersion=$tag@$digest" --form "bom=@$file" "${DTRACK_URL%/}/api/v1/bom"; then
+            echo "Dependency-Track: $repository $tag"
+          else
+            echo "Dependency-Track upload failed for $source; its SBOM is kept in the package registry"
+          fi
+        done < pending.txt
+      fi
   after_script:
     - rm -rf "$CI_PROJECT_DIR/.registry-auth.json"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
+      when: never
+    - if: '$MIRROR_RESCAN == "true"'  # a rescan reports only
       when: never
     # A project without a target registry is the source repository, not a deployment: nothing to sync.
     - if: '$MIRROR_REGISTRY == null'
@@ -212,7 +270,7 @@ pin:
         "${MIRROR_GITLAB_API_URL:-$CI_API_V4_URL}/projects/$project/trigger/pipeline"
       echo "asked $MIRROR_RENOVATE_PROJECT to run Renovate on $CI_PROJECT_PATH; it opens the merge request that pins these"
   rules:
-    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $MIRROR_RESCAN == "true"'
       when: never
     - if: '$MIRROR_RENOVATE_PROJECT == null'
       when: never

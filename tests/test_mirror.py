@@ -500,6 +500,36 @@ class MirrorTest(MirrorCase):
             self.cli('pending')
             self.assertEqual(len(self.out.getvalue().splitlines()), 2)
 
+    def test_pending_all_lists_every_source_and_fetches_the_kept_sboms(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            self.cli('sync')
+            self.out.truncate(0)
+            self.out.seek(0)
+            sboms = self.root / 'sbom'
+            sboms.mkdir()
+            (sboms / f"{db.replace(':', '-')}.cdx.json").write_text('made earlier')
+            kept = {f"{app.replace(':', '-')}.cdx.json": b'{"bomFormat": "CycloneDX"}'}
+            seen = []
+
+            def request(method, data=None, url=None):
+                seen.append(url)
+                return kept.get(url.rsplit('/', 1)[1])
+
+            env = {'CI_API_V4_URL': 'https://git.example.internal/api/v4', 'CI_PROJECT_ID': '7'}
+            with mock.patch.dict(os.environ, env), mock.patch.object(mirror, 'package_request', side_effect=request):
+                self.assertEqual(self.cli('pending', '--all', '--sbom-dir', sboms), 0)
+            self.assertEqual(self.out.getvalue().splitlines(), [f'docker.io/team/app:1.0@{app}', f'docker.io/team/db:2@{db}'])
+            name = f"{app.replace(':', '-')}"
+            self.assertEqual(seen, [f'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-sbom/{name}/{name}.cdx.json'],
+                             'an SBOM already in the directory is not fetched again')
+            self.assertEqual((sboms / f'{name}.cdx.json').read_bytes(), b'{"bomFormat": "CycloneDX"}')
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                    mirror, 'package_request', side_effect=mirror.MirrorError('GET x: HTTP 403')):
+                (sboms / f'{name}.cdx.json').unlink()
+                self.assertEqual(self.cli('pending', '--all', '--sbom-dir', sboms), 0, 'no access: Syft makes it')
+            self.assertIn('kept SBOM not read, Syft makes it again: GET x: HTTP 403', self.err.getvalue())
+
     # Export and import
 
     def test_export_takes_named_images_or_every_synced_one_with_all(self):
