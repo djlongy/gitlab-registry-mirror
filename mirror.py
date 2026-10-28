@@ -36,6 +36,7 @@ MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.dock
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
+SBOM_PACKAGE = "registry-mirror-sbom"  # the sync job keeps each image's SBOM and scan report here, by digest
 LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "registry-mirror-ledger", "v2", "ledger.json"
 EXPORT_INDEX = "export.json"
 VERSION = "0.1.0"
@@ -806,14 +807,40 @@ def sync(path, ledger_file, dry_run=False):
     return changed
 
 
-def pending(path, ledger_file):
-    """Catalog sources not yet in MIRROR_REGISTRY at their current digest: what sync copies next."""
-    # The verify job runs outside the mirror-low environment, so it may not see MIRROR_REGISTRY.
-    ledger = load_ledger(ledger_file, os.environ.get("MIRROR_REGISTRY", "").strip().rstrip("/"), create=False) or {}
-    synced = ledger.get("synced", {})
+def pending(path, ledger_file, everything=False, sbom_dir=None):
+    """Catalog sources not yet in MIRROR_REGISTRY at their current digest: what sync copies next, or every
+    source (everything). With sbom_dir, each one's SBOM the sync job kept is downloaded there first."""
+    synced = {}
+    if not everything:  # the verify job runs outside the mirror-low environment, so it may not see MIRROR_REGISTRY
+        ledger = load_ledger(ledger_file, os.environ.get("MIRROR_REGISTRY", "").strip().rstrip("/"), create=False) or {}
+        synced = ledger.get("synced", {})
     for image in catalog(path):
-        if (synced.get(f"{image['target']}:{image['tag']}") or {}).get("pin") != pin(image):
+        if everything or (synced.get(f"{image['target']}:{image['tag']}") or {}).get("pin") != pin(image):
+            if sbom_dir:
+                kept_sbom(image["digest"], sbom_dir)
             print(image["source"])
+
+
+def kept_sbom(digest, directory):
+    """Download the SBOM the sync job kept for digest into directory, unless it is there already. The sbom
+    job then makes only the missing ones. Not kept, or no access: nothing, and Syft makes it."""
+    name = f"{digest.replace(':', '-')}.cdx.json"
+    file = Path(directory) / name
+    if file.exists():
+        return
+    api = (os.environ.get("MIRROR_GITLAB_API_URL") or os.environ.get("CI_API_V4_URL") or "").rstrip("/")
+    project = os.environ.get("CI_PROJECT_ID", "")
+    if not (api and project):
+        return
+    try:
+        raw = package_request("GET", url=f"{api}/projects/{project}/packages/generic/{SBOM_PACKAGE}/{name.split('.')[0]}/{name}")
+    except MirrorError as error:
+        warn(f"kept SBOM not read, Syft makes it again: {error}")
+        return
+    if raw:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(raw)
+        progress(f"kept SBOM: {file}")
 
 
 SIZE_UNITS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4,
@@ -1595,7 +1622,11 @@ def build_parser():
     listing = command("list", "validate and list the image catalog",
                       "  {prog} list\n  {prog} list --unpinned   # sources with no digest yet, for Renovate to pin")
     listing.add_argument("--unpinned", action="store_true", help="list only the sources that have no digest yet")
-    command("pending", "list catalog sources sync has not copied yet, one per line", "  {prog} pending")
+    waiting = command("pending", "list catalog sources sync has not copied yet, one per line",
+                      "  {prog} pending\n  {prog} pending --all --sbom-dir sbom   # every source, for a rescan")
+    waiting.add_argument("--all", action="store_true", help="every catalog source, synced or not")
+    waiting.add_argument("--sbom-dir", type=Path, metavar="DIR",
+                         help="download into DIR each listed image's SBOM that the sync job kept")
     check = command("check", "fail when a Containerfile or manifest uses an image the catalog lacks",
                     "  {prog} check Containerfile\n  helm template chart/ | {prog} check -")
     check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
@@ -1676,7 +1707,7 @@ def main(argv=None):
             for image in catalog(args.catalog):
                 print(f"{image['source']} -> {image['target']}:{image['tag']}")
         elif args.command == "pending":
-            pending(args.catalog, ledger_file)
+            pending(args.catalog, ledger_file, args.all, args.sbom_dir)
         else:
             check_catalog(args.catalog, args.files)
         return 0
