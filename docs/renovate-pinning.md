@@ -5,7 +5,14 @@ and push it.
 
 ```text
 docker.io/library/alpine:3.20.3 mirror/library/alpine
+https://charts.jetstack.io/cert-manager:v1.15.0 charts/cert-manager
 ```
+
+The second line is a chart in a classic Helm repository: Renovate pins it to the `.tgz` digest in the
+repository's `index.yaml`.
+
+A line without a digest is pinned at the version written. Renovate offers newer versions only once it
+is pinned, so a new line never arrives at a version nobody asked for.
 
 `sync` skips a line with no digest and warns about it. The `pin` job starts a Renovate run on this
 project. Renovate looks the digest up through its own proxy and opens one merge request, **Update

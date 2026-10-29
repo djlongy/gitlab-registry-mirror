@@ -6,6 +6,7 @@ import argparse
 import atexit
 import functools
 import hashlib
+import io
 import json
 import os
 import re
@@ -27,6 +28,8 @@ TAG = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 DIGEST = r"sha256:[0-9a-f]{64}"
 HOST = r"(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::[0-9]+)?|[a-z0-9-]+:[0-9]+"  # a dot, a port or localhost
 SOURCE = re.compile(rf"(?P<host>{HOST})/(?P<repo>[a-z0-9._/-]+):(?P<tag>{TAG})")
+# A chart in a classic Helm repository: the URL helm repo add takes, a slash, the chart name and its version.
+CHART_SOURCE = re.compile(rf"(?P<url>https?://[^\s@#]+)/(?P<chart>[A-Za-z0-9][A-Za-z0-9._-]*):(?P<tag>{TAG})")
 TARGET = re.compile(r"[a-z0-9][a-z0-9_-]*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)+")
 REFERENCE = re.compile(rf"(?:(?P<host>{HOST})/)?(?P<repo>[a-z0-9._/-]+?)(?::(?P<tag>{TAG}))?")
 IMAGE_CONFIGS = ("application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json")
@@ -39,6 +42,7 @@ CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "applicat
 SBOM_PACKAGE = "registry-mirror-sbom"  # the sync job keeps each image's SBOM and scan report here, by digest
 LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "registry-mirror-ledger", "v2", "ledger.json"
 EXPORT_INDEX = "export.json"
+DOWNLOAD_LIMIT = 512 << 20  # a Helm repository index or chart; the largest public indexes are tens of MiB
 VERSION = "0.1.0"
 
 
@@ -132,12 +136,16 @@ def image_problem(source, target, pinned=True):
     """What is wrong with a source and target pair, in words a first-time user can act on, or None."""
     name, separator, digest = source.partition("@")
     match = SOURCE.fullmatch(name)
-    if not re.match(rf"(?:{HOST})/", name):
+    if re.match(r"https?://", name):
+        if not CHART_SOURCE.fullmatch(name):
+            return (f"chart source {name} is not <Helm repository URL>/<chart>:<version>, for example "
+                    "https://charts.jetstack.io/cert-manager:v1.15.0")
+    elif not re.match(rf"(?:{HOST})/", name):
         return f"source {name} has no registry host; give the full reference, for example {normalise(name)}"
-    if not match:
+    elif not match:
         return (f"source {name} is not <registry>/<repository>:<tag>; the repository is lowercase and the tag "
                 "comes after a colon")
-    if any(part in ("", ".", "..") for part in match["repo"].split("/")):
+    elif any(part in ("", ".", "..") for part in match["repo"].split("/")):
         return f"source {name} has an empty, . or .. part in its repository path"
     if pinned and not separator:
         return f"source {name} has no @sha256:<digest>; {prog()} add looks the digest up and writes the line"
@@ -155,8 +163,12 @@ def parse_image(source, target):
     problem = image_problem(source, target)
     if problem:
         raise MirrorError(problem)
-    match = SOURCE.fullmatch(source.partition("@")[0])
+    match = source_match(source.partition("@")[0])
     return {"source": source, "target": target, "tag": match["tag"], "digest": source.partition("@")[2]}
+
+
+def source_match(name):
+    return SOURCE.fullmatch(name) or CHART_SOURCE.fullmatch(name)
 
 
 def catalog(path, unpinned=None):
@@ -550,6 +562,9 @@ def resolve_entry(source, target):
     problem = image_problem(source, target, pinned=False)
     if problem:
         raise MirrorError(problem)
+    if CHART_SOURCE.fullmatch(name):
+        raise MirrorError(f"{name} is a Helm repository chart; write the line in images.txt without a digest "
+                          "and Renovate pins it")
     raw = run("skopeo", "inspect", "--raw", *options(side_of(source), reference=source), "docker://" + transport_reference(source))
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
@@ -723,6 +738,110 @@ def app_version(reference, side):
     return next((v for v in found if v and re.fullmatch(TAG, v)), "")
 
 
+class Redirects(urllib.request.HTTPRedirectHandler):
+    """Remembers where a download was sent, so a refusal names the host a proxy allowlist needs."""
+
+    def __init__(self):
+        self.last = None
+
+    def redirect_request(self, request, response, code, message, headers, url):
+        # Without the query: a release download is redirected to a URL signed for a few minutes.
+        self.last = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
+        say(f"+ redirected to {self.last}")
+        return super().redirect_request(request, response, code, message, headers, url)
+
+
+def download(url):
+    say(f"+ GET {url}")
+    redirects = Redirects()
+    # build_opener keeps the default handlers, HTTPS_PROXY and NO_PROXY among them.
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=tls_context()), redirects)
+    # Some chart hosts refuse Python's default User-Agent (charts.jetstack.io answers 403).
+    request = urllib.request.Request(url, headers={"User-Agent": f"gitlab-registry-mirror/{VERSION}"})
+    try:
+        with opener.open(request, timeout=600) as response:
+            data = response.read(DOWNLOAD_LIMIT + 1)
+    except (urllib.error.URLError, OSError) as error:
+        where = f"GET {url}" + (f" (redirected to {redirects.last})" if redirects.last else "")
+        host = urllib.parse.urlsplit(redirects.last or url).hostname or ""
+        proxy = urllib.request.getproxies().get(urllib.parse.urlsplit(url).scheme)
+        if proxy and not urllib.request.proxy_bypass(host):
+            where += f" through proxy {re.sub(r'://[^/@]+@', '://', proxy)}"
+        reason = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else getattr(error, "reason", error)
+        raise MirrorError(f"{where}: {reason}") from error
+    if len(data) > DOWNLOAD_LIMIT:
+        raise MirrorError(f"GET {url}: larger than {DOWNLOAD_LIMIT >> 20} MiB")
+    return data
+
+
+def chart_url(index, digest):
+    """The first URL of the index.yaml entry whose digest is digest. helm repo index writes block YAML: each
+    entry is a list item with its keys, digest and urls among them, indented alike."""
+    lines = index.splitlines()
+    hexdigest = digest.removeprefix("sha256:")
+    found = next((n for n, line in enumerate(lines)
+                  if re.fullmatch(rf"\s*(?:- )?digest: *['\"]?{hexdigest}['\"]?\s*", line)), None)
+    if found is None:
+        raise MirrorError(f"the Helm repository index lists no chart with digest {digest}")
+    keys = len(lines[found]) - len(lines[found].lstrip(" -"))
+    start = found
+    while start and not lines[start].startswith(" " * (keys - 2) + "- "):
+        start -= 1
+    end = found + 1
+    while end < len(lines) and (not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip()) >= keys):
+        end += 1
+    urls = re.search(r"^\s*(?:- )?urls:\s*\n\s*- ['\"]?([^'\"\s]+)", "\n".join(lines[start:end]), re.M)
+    if not urls:
+        raise MirrorError(f"the Helm repository index entry with digest {digest} has no urls")
+    return urls[1]
+
+
+def chart_metadata(tarball):
+    """The Chart.yaml fields helm push puts in the chart's OCI config."""
+    with tarfile.open(fileobj=io.BytesIO(tarball)) as archive:
+        member = next((m for m in archive.getmembers() if m.isfile() and re.fullmatch(r"[^/]+/Chart\.yaml", m.name)), None)
+        if member is None:
+            raise MirrorError("the chart tarball has no <chart>/Chart.yaml")
+        text = archive.extractfile(member).read().decode()
+    fields = re.findall(r"^(apiVersion|name|version|appVersion|type|kubeVersion): *['\"]?(.*?)['\"]?\s*$", text, re.M)
+    return dict(fields)
+
+
+@functools.cache
+def chart_layout(source):
+    """A Helm repository chart as an OCI layout holding it the way helm push does, and its manifest digest.
+    The repository's index.yaml gives the chart's URL, and the tarball must match the pinned digest. The same
+    tarball always gives the same manifest digest."""
+    match, digest = CHART_SOURCE.fullmatch(source.partition("@")[0]), source.partition("@")[2]
+    repository = match["url"] + "/"
+    url = urllib.parse.urljoin(repository, chart_url(download(repository + "index.yaml").decode(), digest))
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https") or not urllib.parse.urlsplit(url).netloc:
+        raise MirrorError(f"the Helm repository index gives {url} for {digest}; only an http(s) URL is fetched")
+    tarball = download(url)
+    if "sha256:" + hashlib.sha256(tarball).hexdigest() != digest:
+        raise MirrorError(f"{url} does not match the pinned digest {digest}")
+    layout = Path(tempfile.mkdtemp(prefix="mirror-chart-"))
+    atexit.register(shutil.rmtree, layout, ignore_errors=True)
+    (layout / "blobs/sha256").mkdir(parents=True)
+
+    def blob(data, media_type):
+        name = hashlib.sha256(data).hexdigest()
+        (layout / "blobs/sha256" / name).write_bytes(data)
+        return {"mediaType": media_type, "digest": "sha256:" + name, "size": len(data)}
+
+    def encode(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    config = blob(encode(chart_metadata(tarball)), CHART_CONFIG)
+    manifest = blob(encode({"schemaVersion": 2, "mediaType": MANIFESTS[0], "config": config,
+                            "layers": [blob(tarball, CHART_LAYERS[0])]}), MANIFESTS[0])
+    reference = {**manifest, "annotations": {"org.opencontainers.image.ref.name": match["tag"]}}
+    (layout / "index.json").write_bytes(encode({"schemaVersion": 2, "manifests": [reference]}))
+    (layout / "oci-layout").write_bytes(encode({"imageLayoutVersion": "1.0.0"}))
+    progress(f"chart {url} checked against {digest}")
+    return layout, manifest["digest"]
+
+
 def pin(image):
     """What the ledger records per catalog tag: the approved digest and the platform choice."""
     return f"{image['digest']} {os.environ.get('MIRROR_PLATFORM', '').strip()}".strip()
@@ -752,6 +871,8 @@ def sync(path, ledger_file, dry_run=False):
         cached = known.get(lookup)
         if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
             transfer, tags = cached
+        elif CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+            transfer, tags = chart_layout(image["source"])[1], [image["tag"]]
         else:
             transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
             tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
@@ -789,6 +910,8 @@ def sync(path, ledger_file, dry_run=False):
                 save_ledger(ledger_file, ledger)
             if number:  # a version tag points at the image already in MIRROR_REGISTRY
                 copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
+            elif CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+                copy(f"oci:{chart_layout(image['source'])[0]}:{image['tag']}", destination, None, "MIRROR_REGISTRY")
             else:
                 copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "MIRROR_REGISTRY")
             if raw_digest(destination, "MIRROR_REGISTRY") != transfer:
@@ -809,8 +932,10 @@ def sync(path, ledger_file, dry_run=False):
 
 def pending(path, ledger_file, everything=False, sbom_dir=None):
     """Catalog sources not yet in MIRROR_REGISTRY at their current digest: what sync copies next, or every
-    source (everything). With sbom_dir, each one's SBOM the sync job kept is downloaded there first."""
-    synced = {}
+    source (everything). With sbom_dir, each one's SBOM the sync job kept is downloaded there first. Each Helm
+    repository chart sync copies next is downloaded and checked now, so a merge request fails on a chart its
+    pin or a proxy allowlist would stop, not the sync after the merge."""
+    synced, failed = {}, []
     if not everything:  # the verify job runs outside the mirror-low environment, so it may not see MIRROR_REGISTRY
         ledger = load_ledger(ledger_file, os.environ.get("MIRROR_REGISTRY", "").strip().rstrip("/"), create=False) or {}
         synced = ledger.get("synced", {})
@@ -818,7 +943,14 @@ def pending(path, ledger_file, everything=False, sbom_dir=None):
         if everything or (synced.get(f"{image['target']}:{image['tag']}") or {}).get("pin") != pin(image):
             if sbom_dir:
                 kept_sbom(image["digest"], sbom_dir)
+            if not everything and CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+                try:
+                    chart_layout(image["source"])
+                except MirrorError as error:
+                    failed.append(str(error))
             print(image["source"])
+    if failed:
+        raise MirrorError(f"{len(failed)} chart(s) sync cannot download:\n  " + "\n  ".join(failed))
 
 
 def kept_sbom(digest, directory):
@@ -948,7 +1080,7 @@ def named(text):
     MIRROR_REGISTRY, anything else is references separated by spaces."""
     fields = text.split()
     if len(fields) == 2 and not image_problem(*fields, pinned=False):
-        return [f"{fields[1]}:{SOURCE.fullmatch(fields[0].partition('@')[0])['tag']}"]
+        return [f"{fields[1]}:{source_match(fields[0].partition('@')[0])['tag']}"]
     return fields
 
 
@@ -986,8 +1118,14 @@ def source_images(path, entries, files_from, everything):
     and digest. A source without a target lands at its path without the host; one without a digest is
     exported at the digest its tag has now."""
     if everything:
-        return [{**SOURCE.fullmatch(i["source"].partition("@")[0]).groupdict(), "digest": i["digest"], "target": i["target"]}
-                for i in catalog(path)]
+        images = []
+        for i in catalog(path):
+            match = SOURCE.fullmatch(i["source"].partition("@")[0])
+            if match:
+                images.append({**match.groupdict(), "digest": i["digest"], "target": i["target"]})
+            else:
+                warn(f"{i['source']}: a Helm repository chart, skipped; export it from MIRROR_REGISTRY after sync")
+        return images
     lines = [" ".join(entries)] + [text for file in files_from or () for _, text in list_lines(file)]
     images = []
     for fields in (line.split() for line in lines):

@@ -64,6 +64,22 @@ python3 mirror.py sync              # copy images.txt into MIRROR_REGISTRY, then
 
 The low NiFi pulls each requested image from `MIRROR_REGISTRY` and carries it to the high registry. The pipeline runs the same `sync`. A line pushed without its digest gets a Renovate merge request that pins it: setup in [docs/renovate-pinning.md](docs/renovate-pinning.md).
 
+### Add a Helm chart
+
+Write the chart the way its install page names it, with no digest, and merge: Renovate pins it.
+
+```text
+# OCI chart: the oci:// reference without oci://
+registry-1.docker.io/bitnamicharts/redis:22.0.7 charts/redis
+# Chart in a classic Helm repository: the URL from "helm repo add", a slash, the chart name
+https://charts.jetstack.io/cert-manager:v1.15.0 charts/cert-manager
+```
+
+- Renovate pins a line at the version written, a chart to the sha256 of its `.tgz` as the repository's `index.yaml` lists it. Newer versions come in later merge requests, once the line is pinned.
+- Behind a download proxy, set `HTTPS_PROXY` and `NO_PROXY` (GitLab, `MIRROR_REGISTRY`) as project variables, and `MIRROR_CA_BUNDLE` when the proxy inspects TLS. The allowlist needs the repository host for `index.yaml` and the host of each `.tgz`, plus where that redirects: GitHub release charts end at `release-assets.githubusercontent.com`. Renovate needs only the first, so `verify` downloads and checks every chart not yet synced: a blocked host fails the merge request with the URL to allowlist, not the sync after it.
+- `sync` downloads the `.tgz`, checks it against that digest and pushes it to `MIRROR_REGISTRY` as an OCI chart: `helm pull oci://<registry>/charts/cert-manager --version v1.15.0`. From there it crosses like any image.
+- `add` and `export --from-source` take OCI charts only.
+
 ### Send a batch again
 
 Every run requests only what is new. To send chosen images again, open **Build > Pipelines > Run pipeline** and paste them into `MIRROR_RESEND_IMAGES`, one per line: `team/app:v1`, `team/app` (every tag) or `images.txt` lines as they are. `MIRROR_RESEND_ALL=true` sends every synced image. By hand: `python3 mirror.py request -T batch.txt`.
@@ -117,7 +133,7 @@ A flag wins over its variable.
 
 ## Behaviour
 
-- `images.txt` holds one reviewed source per line, pinned by digest, and the repository path it lands at on both sides. `add` writes it. A line without a digest is skipped with a warning until Renovate's merge request pins it.
+- `images.txt` holds one reviewed source per line (an image, an OCI chart or a Helm repository chart), pinned by digest, and the repository path it lands at on both sides. `add` writes it. A line without a digest is skipped with a warning until Renovate's merge request pins it.
 - `sync` is idempotent: a tag already at its digest is left alone. It records each copy in the ledger.
 - `export` reads registries and never changes the ledger. It takes named images or `-T` files exactly as named, or every synced catalog image with `--all`; with neither it refuses. Each image is copied whole by digest. `mirror.py export -h` lists the forms.
 - An export tar holds `export.json`, naming each image's source, target path, tag and digest, plus one `skopeo dir:` copy per image, with shared layers stored once. Its `.sha256` sits beside it. `export` writes each file under a hidden name and renames it when complete, so a watcher never takes half a file.

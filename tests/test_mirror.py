@@ -121,8 +121,11 @@ class Registry:
         return self.tags[name]
 
     def copy(self, source, destination, *_sides):
-        digest = self.digest(source) if source.startswith('docker://') else \
-            'sha256:' + hashlib.sha256(Path(source[4:], 'manifest.json').read_bytes()).hexdigest()
+        if source.startswith('oci:'):  # a Helm repository chart's layout
+            digest = json.loads(Path(source[4:].rsplit(':', 1)[0], 'index.json').read_text())['manifests'][0]['digest']
+        else:
+            digest = self.digest(source) if source.startswith('docker://') else \
+                'sha256:' + hashlib.sha256(Path(source[4:], 'manifest.json').read_bytes()).hexdigest()
         if destination.startswith('dir:'):
             Path(destination[4:]).mkdir(parents=True)
             Path(destination[4:], 'manifest.json').write_bytes(self.manifests[digest])
@@ -1124,6 +1127,62 @@ class MirrorTest(MirrorCase):
             self.assertEqual(mirror.platform_digest('docker://up/chart@sha256:' + 'd'*64, 'sha256:' + 'd'*64, 'MIRROR_SOURCE_REGISTRY'),
                              'sha256:' + 'd'*64)
         self.assertEqual(call.call_count, 1)
+
+    def test_a_helm_repository_chart_is_pinned_by_its_tarball_and_synced_as_an_oci_chart(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:gz') as tar:
+            text = b'apiVersion: v2\nname: demo\ndescription: >\n  folded\nversion: 1.2.0\nappVersion: "4.5"\n'
+            info = tarfile.TarInfo('demo/Chart.yaml')
+            info.size = len(text)
+            tar.addfile(info, io.BytesIO(text))
+        tarball = archive.getvalue()
+        digest = 'sha256:' + hashlib.sha256(tarball).hexdigest()
+        index = ('apiVersion: v1\nentries:\n  demo:\n  - apiVersion: v2\n    digest: ' + 'a' * 64 + '\n    urls:\n'
+                 '    - https://elsewhere.example.internal/demo-1.3.0.tgz\n    version: 1.3.0\n'
+                 '  - annotations:\n      category: x\n    created: "2026-01-01"\n    digest: ' + digest[7:] +
+                 '\n    name: demo\n    urls:\n    - charts/demo-1.2.0.tgz\n    version: 1.2.0\n')
+        self.assertEqual(mirror.chart_url(index, digest), 'charts/demo-1.2.0.tgz')
+        with self.assertRaisesRegex(mirror.MirrorError, 'no chart with digest'):
+            mirror.chart_url(index, 'sha256:' + 'b' * 64)
+        self.assertEqual(mirror.chart_metadata(tarball),
+                         {'apiVersion': 'v2', 'name': 'demo', 'version': '1.2.0', 'appVersion': '4.5'})
+        files = {'https://charts.example.internal/stable/index.yaml': index.encode(),
+                 'https://charts.example.internal/stable/charts/demo-1.2.0.tgz': tarball}
+        source = 'https://charts.example.internal/stable/demo:1.2.0'
+        self.catalog.write_text(f'{source} team/charts/demo\n')
+        unpinned = []
+        self.assertEqual(mirror.catalog(self.catalog, unpinned), [])
+        self.assertEqual(unpinned, [source])  # Renovate pins it
+        self.catalog.write_text(f'{source}@{digest} team/charts/demo\n')
+        self.addCleanup(mirror.chart_layout.cache_clear)
+        with Registry(self) as registry, mock.patch.object(mirror, 'download', side_effect=files.__getitem__) as got:
+            self.assertEqual(self.cli('sync'), 0)
+            transfer = mirror.chart_layout(f'{source}@{digest}')[1]
+            self.assertEqual(registry.tags, {f'{LOW}/team/charts/demo:1.2.0': transfer})
+            mirror.chart_layout.cache_clear()
+            self.assertEqual(self.cli('sync'), 0)  # the ledger remembers the manifest: nothing downloaded again
+            self.assertEqual(got.call_count, 2)
+        mirror.chart_layout.cache_clear()
+        self.ledger.unlink()
+        with mock.patch.object(mirror, 'download', side_effect=files.__getitem__) as got:
+            mirror.pending(self.catalog, self.ledger)  # verify checks a chart sync copies next
+        self.assertEqual(got.call_count, 2)
+        mirror.chart_layout.cache_clear()
+        files['https://charts.example.internal/stable/charts/demo-1.2.0.tgz'] = tarball + b'changed'
+        with mock.patch.object(mirror, 'download', side_effect=files.__getitem__), \
+                self.assertRaisesRegex(mirror.MirrorError, '1 chart.s. sync cannot download'):
+            mirror.pending(self.catalog, self.ledger)
+        with mock.patch.object(mirror, 'download', side_effect=files.__getitem__), \
+                self.assertRaisesRegex(mirror.MirrorError, 'does not match the pinned digest'):
+            mirror.chart_layout(f'{source}@{digest}')
+        files['https://charts.example.internal/stable/index.yaml'] = index.replace('charts/demo-1.2.0.tgz', 'file:///etc/passwd').encode()
+        with mock.patch.object(mirror, 'download', side_effect=files.__getitem__), \
+                self.assertRaisesRegex(mirror.MirrorError, 'only an http'):
+            mirror.chart_layout(f'{source}@{digest}')
+        with self.assertRaisesRegex(mirror.MirrorError, 'Renovate pins it'):
+            mirror.resolve_entry(source, 'team/charts/demo')
+        self.assertIn('is not <Helm repository URL>/<chart>:<version>',
+                      mirror.image_problem('https://charts.example.internal/:1', 'team/charts/demo'))
 
     def test_check_finds_images_the_mirror_lacks(self):
         digest = 'sha256:' + 'e'*64
