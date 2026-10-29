@@ -1,6 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": [
+    "config:recommended"
+  ],
   "recreateWhen": "always",
   "rebaseWhen": "behind-base-branch",
   "description": "Rebased whenever main moves, so verify checks the merge request against the current catalog (a duplicate target can appear without a conflict). No hourly limit: the pin job starts Renovate so that a line without a digest gets its merge request now, not after the hour's quota.",
@@ -8,27 +10,70 @@
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^images\\.txt$/"],
-      "description": "The digest is optional: a line written without one gets it in a pin merge request, and mirror.py skips the line until then. The template replaces the whole match, so the match is the source and the one space after it, and the target stays as it is.",
+      "managerFilePatterns": [
+        "/^images\\.txt$/"
+      ],
+      "description": "The digest is optional: a line written without one gets it in a pin merge request, and mirror.py skips the line until then. The template replaces the whole match, so the match is the source and the one space after it, and the target stays as it is. The registry host comes first, so a Helm repository URL (https://) is left to the next manager.",
       "matchStrings": [
-        "(?m)^(?<depName>[^\\s#@]+):(?<currentValue>[^\\s@#:]+)(?:@(?<currentDigest>sha256:[0-9a-f]{64}))?[ \\t]"
+        "(?m)^(?<depName>[^\\s#@:/]+(?::\\d+)?/[^\\s#@:]+):(?<currentValue>[^\\s@#:]+)(?:@(?<currentDigest>sha256:[0-9a-f]{64}))?[ \\t]"
       ],
       "autoReplaceStringTemplate": "{{depName}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}} ",
       "datasourceTemplate": "docker",
-      "versioningTemplate": "docker"
+      "versioningTemplate": "docker",
+      "depTypeTemplate": "{{#if currentDigest}}pinned{{else}}unpinned{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^images\\.txt$/"
+      ],
+      "description": "A chart in a classic Helm repository: the repository URL, a slash, the chart name, a colon and the version. The custom.helm-repository datasource pins it to the sha256 of the chart's .tgz, which the repository's index.yaml lists.",
+      "matchStrings": [
+        "(?m)^(?<packageName>https?://[^\\s#@]+/(?<depName>[^/\\s#@:]+)):(?<currentValue>[^\\s@#:]+)(?:@(?<currentDigest>sha256:[0-9a-f]{64}))?[ \\t]"
+      ],
+      "autoReplaceStringTemplate": "{{{packageName}}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}} ",
+      "datasourceTemplate": "custom.helm-repository",
+      "depTypeTemplate": "{{#if currentDigest}}pinned{{else}}unpinned{{/if}}"
     }
   ],
+  "customDatasources": {
+    "helm-repository": {
+      "description": "Every version of one chart in a Helm repository's index.yaml, each with its .tgz digest. Renovate's own helm datasource gives no digest for the current version, so a new line would never be pinned.",
+      "defaultRegistryUrlTemplate": "{{{replace '/[^/]+$' '/index.yaml' packageName}}}",
+      "format": "yaml",
+      "transformTemplates": [
+        "{\"releases\": [$lookup(entries, '{{{replace '^.*/' '' packageName}}}').{\"version\": version, \"digest\": 'sha256:' & digest}]}"
+      ]
+    }
+  },
   "packageRules": [
     {
       "description": "Every images.txt change, pins and new versions alike, in one merge request: one branch per line would conflict with each other in the one shared file.",
-      "matchManagers": ["custom.regex"],
+      "matchManagers": [
+        "custom.regex"
+      ],
       "pinDigests": true,
       "groupName": "images.txt",
       "separateMajorMinor": false
     },
     {
+      "description": "A line written without a digest is pinned at the version written, never moved to a newer one in the same merge request. Version updates start once it is pinned.",
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "enabled": false,
+      "matchDepTypes": [
+        "unpinned"
+      ]
+    },
+    {
       "description": "Docker versioning offers only tags with the same suffix, and each gradata/stroom build has a new date in its suffix. Loose versioning compares the numbers, then the suffix numerically, so any tag that starts with a version is a candidate if the tag format changes. Each gradata build is wanted as soon as it is published, so no release age applies.",
-      "matchDepNames": ["docker.io/gradata/**", "ghcr.io/gradata-systems/**"],
+      "matchDepNames": [
+        "docker.io/gradata/**",
+        "ghcr.io/gradata-systems/**"
+      ],
       "versioning": "loose",
       "minimumReleaseAge": "0 days"
     }
