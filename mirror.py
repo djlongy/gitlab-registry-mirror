@@ -8,7 +8,9 @@ import functools
 import hashlib
 import io
 import json
+import math
 import os
+import random
 import re
 import shutil
 import ssl
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +47,9 @@ LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "registry-mirror-ledger", "v2", "l
 EXPORT_INDEX = "export.json"
 DOWNLOAD_LIMIT = 512 << 20  # a Helm repository index or chart; the largest public indexes are tens of MiB
 VERSION = "0.1.0"
+# Docker Hub's pull limit: 429 with errcode TOOMANYREQUESTS, which skopeo prints as "toomanyrequests: ...".
+RATE_LIMITED = re.compile(r"toomanyrequests|too many requests", re.IGNORECASE)
+rate_limit_deadline = None  # set by the first rate-limited command: the whole run waits at most this long
 
 
 class MirrorError(Exception):
@@ -208,6 +214,17 @@ def catalog(path, unpinned=None):
     return images
 
 
+def rate_limit_wait():
+    text = os.environ.get("MIRROR_RATE_LIMIT_WAIT", "").strip() or "900"
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = -1
+    if not math.isfinite(seconds) or seconds < 0:
+        raise UsageError(f"MIRROR_RATE_LIMIT_WAIT={text!r} is not a number of seconds")
+    return seconds
+
+
 def say(message):
     if env_flag("MIRROR_VERBOSE"):
         # A URL may carry credentials, as --nifi-url can: never print them.
@@ -219,10 +236,29 @@ def run(*args, live=False):
     progress) goes straight to stderr instead."""
     say("+ " + " ".join(args))
     shown = live and env_flag("MIRROR_VERBOSE")
-    result = subprocess.run(args, stdout=sys.stderr if shown else subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if result.returncode:
-        raise MirrorError(f"{args[0]} {args[1]} failed: {result.stderr.decode(errors='replace')[-500:].strip()}")
-    return result.stdout
+    # skopeo already waits out a registry's Retry-After a few times before it gives up on a 429 and never
+    # prints the header. Past that, back off 15, 30, 60 ... 300 s with jitter, until MIRROR_RATE_LIMIT_WAIT
+    # seconds after the run's first rate limit, so later images fail fast instead of each waiting it out.
+    global rate_limit_deadline
+    attempt = 0
+    while True:
+        result = subprocess.run(args, stdout=sys.stderr if shown else subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        errors = result.stderr.decode(errors="replace")
+        if not result.returncode:
+            return result.stdout
+        if not RATE_LIMITED.search(errors):
+            break
+        if rate_limit_deadline is None:
+            rate_limit_deadline = time.monotonic() + rate_limit_wait()
+        backoff = min(300, 15 * 2 ** attempt)
+        delay = backoff / 2 + random.uniform(0, backoff / 2)
+        attempt += 1
+        if time.monotonic() + delay > rate_limit_deadline:
+            errors += f" (still rate limited after {attempt} attempt(s); MIRROR_RATE_LIMIT_WAIT is spent)"
+            break
+        warn(f"{args[0]} {args[1]} rate limited; attempt {attempt + 1} in {delay:.0f} s")
+        time.sleep(delay)
+    raise MirrorError(f"{args[0]} {args[1]} failed: {errors[-500:].strip()}")
 
 
 # Credentials come from skopeo's default auth file, written by `skopeo login` or
@@ -856,78 +892,86 @@ def sync(path, ledger_file, dry_run=False):
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
     ledger = load_ledger(ledger_file, low)
-    loaded = json.dumps(ledger, sort_keys=True)
     known, platforms = ledger.get("platforms", {}), {}
     platform = os.environ.get("MIRROR_PLATFORM", "").strip()
     # A tag a catalog entry pins, or pinned before its line was removed, is never a version tag.
     pinned = ledger.setdefault("pinned", [])
+    loaded = json.dumps(ledger, sort_keys=True)  # a run that changes nothing, failed images included, saves nothing
     catalog_tags = {f"{i['target']}:{i['tag']}" for i in images} | set(pinned)
-    copied, changed = 0, []
+    copied, changed, failed = 0, [], []
     for image in images:
         key = f"{image['target']}:{image['tag']}"
-        source = transport_reference(image["source"])  # by digest: a moved source tag changes nothing
-        # Remember each platform and version-tag choice, so an unchanged image needs no source request.
-        lookup = f"{image['digest']} {platform} {image['tag']}"
-        cached = known.get(lookup)
-        if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
-            transfer, tags = cached
-        elif CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
-            transfer, tags = chart_layout(image["source"])[1], [image["tag"]]
-        else:
-            transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
-            tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
-        if tags != ["latest"]:  # a latest image with no version yet is asked again next run
-            platforms[lookup] = [transfer, tags]
-        for tag in tags[1:]:
-            if f"{image['target']}:{tag}" in catalog_tags:
-                warn(f"{key} reports version {tag}, which images.txt pins or once pinned; not tagging it")
-        tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
-        if key not in pinned:
-            # Recorded before the first copy, so a run that fails after it still protects the tag.
-            pinned.append(key)
-            if not dry_run:
-                save_ledger(ledger_file, ledger)
-        for number, tag in enumerate(tags):
-            destination = f"docker://{low}/{image['target']}:{tag}"
-            try:
-                observed = raw_digest(destination, "MIRROR_REGISTRY")
-            except MirrorError as error:  # missing, deleted or expired: copy it; a real fault fails the copy
-                observed = None
-                say(f"not readable in MIRROR_REGISTRY, copying: {error}")
-            if observed == transfer:
-                progress(f"already in MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
-                continue
-            if dry_run:
-                print(f"would copy: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}")
-                copied += 1
-                continue
-            progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
-                     + (f" (target has {observed})" if observed else ""))
-            if (ledger["sent"].get(key) or {}).get("digest") == transfer:
-                # The low registry lost what was sent, so the high one may have too: ask for it again. Saved
-                # before the copy, so a run that fails after it still asks next time.
-                del ledger["sent"][key]
-                save_ledger(ledger_file, ledger)
-            if number:  # a version tag points at the image already in MIRROR_REGISTRY
-                copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
+        try:
+            source = transport_reference(image["source"])  # by digest: a moved source tag changes nothing
+            # Remember each platform and version-tag choice, so an unchanged image needs no source request.
+            lookup = f"{image['digest']} {platform} {image['tag']}"
+            cached = known.get(lookup)
+            if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
+                transfer, tags = cached
             elif CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
-                copy(f"oci:{chart_layout(image['source'])[0]}:{image['tag']}", destination, None, "MIRROR_REGISTRY")
+                transfer, tags = chart_layout(image["source"])[1], [image["tag"]]
             else:
-                copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "MIRROR_REGISTRY")
-            if raw_digest(destination, "MIRROR_REGISTRY") != transfer:
-                raise MirrorError(f"digest mismatch in MIRROR_REGISTRY: {image['target']}:{tag}")
-            progress(f"pushed to MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
-            copied += 1
-            changed.append({"repository": image["target"], "tag": tag, "digest": transfer})
-        ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
+                transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
+                tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
+            if tags != ["latest"]:  # a latest image with no version yet is asked again next run
+                platforms[lookup] = [transfer, tags]
+            for tag in tags[1:]:
+                if f"{image['target']}:{tag}" in catalog_tags:
+                    warn(f"{key} reports version {tag}, which images.txt pins or once pinned; not tagging it")
+            tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
+            if key not in pinned:
+                # Recorded before the first copy, so a run that fails after it still protects the tag.
+                pinned.append(key)
+                if not dry_run:
+                    save_ledger(ledger_file, ledger)
+            for number, tag in enumerate(tags):
+                destination = f"docker://{low}/{image['target']}:{tag}"
+                try:
+                    observed = raw_digest(destination, "MIRROR_REGISTRY")
+                except MirrorError as error:  # missing, deleted or expired: copy it; a real fault fails the copy
+                    observed = None
+                    say(f"not readable in MIRROR_REGISTRY, copying: {error}")
+                if observed == transfer:
+                    progress(f"already in MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
+                    continue
+                if dry_run:
+                    print(f"would copy: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}")
+                    copied += 1
+                    continue
+                progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
+                         + (f" (target has {observed})" if observed else ""))
+                if (ledger["sent"].get(key) or {}).get("digest") == transfer:
+                    # The low registry lost what was sent, so the high one may have too: ask for it again. Saved
+                    # before the copy, so a run that fails after it still asks next time.
+                    del ledger["sent"][key]
+                    save_ledger(ledger_file, ledger)
+                if number:  # a version tag points at the image already in MIRROR_REGISTRY
+                    copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
+                elif CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+                    copy(f"oci:{chart_layout(image['source'])[0]}:{image['tag']}", destination, None, "MIRROR_REGISTRY")
+                else:
+                    copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "MIRROR_REGISTRY")
+                if raw_digest(destination, "MIRROR_REGISTRY") != transfer:
+                    raise MirrorError(f"digest mismatch in MIRROR_REGISTRY: {image['target']}:{tag}")
+                progress(f"pushed to MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
+                copied += 1
+                changed.append({"repository": image["target"], "tag": tag, "digest": transfer})
+            ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
+        except UsageError:
+            raise
+        except MirrorError as error:  # one image that still fails after retries does not stop the rest
+            fail(f"{key}: {error}; continuing with the rest")
+            failed.append(f"{key}: {error}")
     ledger["platforms"] = platforms
     if json.dumps(ledger, sort_keys=True) != loaded and not dry_run:
         save_ledger(ledger_file, ledger)
     if dry_run:
         progress(f"dry run: {copied} tag(s) of {len(images)} image(s) would be copied into {low}, nothing changed")
-        return []
-    progress(f"synced {len(images)} image(s) into {low}: {copied} tag(s) copied, the rest already there")
-    return changed
+    else:
+        progress(f"synced {len(images) - len(failed)} image(s) into {low}: {copied} tag(s) copied, the rest already there")
+    if failed:
+        raise MirrorError(f"{len(failed)} of {len(images)} image(s) not synced:\n  " + "\n  ".join(failed))
+    return [] if dry_run else changed
 
 
 def pending(path, ledger_file, everything=False, sbom_dir=None):
@@ -1813,14 +1857,17 @@ def main(argv=None):
             os.environ["TMPDIR"] = str(Path(work).resolve())
         ca_files("MIRROR_REQUEST_CA_BUNDLE")
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
+        rate_limit_wait()  # a bad value fails now, not at the first rate limit halfway through a sync
         ledger_file = ledger_location(args.catalog)
         if args.command == "sync":
-            sync(args.catalog, ledger_file, args.dry_run)
-            if os.environ.get("MIRROR_REQUEST_URL", "").strip() and not args.dry_run:
-                try:  # what sync synced and no webhook has asked for yet, or everything with MIRROR_RESEND_ALL
-                    request(args.catalog, ledger_file, everything=env_flag("MIRROR_RESEND_ALL"))
-                except (MirrorError, OSError) as error:
-                    warn(f"webhook not delivered: {error}")
+            try:
+                sync(args.catalog, ledger_file, args.dry_run)
+            finally:  # an image that failed fails the job, after the rest are asked for
+                if os.environ.get("MIRROR_REQUEST_URL", "").strip() and not args.dry_run:
+                    try:  # what sync synced and no webhook has asked for yet, or everything with MIRROR_RESEND_ALL
+                        request(args.catalog, ledger_file, everything=env_flag("MIRROR_RESEND_ALL"))
+                    except (MirrorError, OSError) as error:
+                        warn(f"webhook not delivered: {error}")
         elif args.command == "request":
             request(args.catalog, ledger_file, args.images, args.files_from, args.all or env_flag("MIRROR_RESEND_ALL"),
                     args.dry_run)

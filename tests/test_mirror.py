@@ -587,6 +587,69 @@ class MirrorTest(MirrorCase):
                 mirror.copy('docker://a.example.com/x/y@sha256:' + '0' * 64, 'dir:/tmp/out')
             self.assertIn('--retry-times=2', run.call_args.args)
 
+    def rate_limited(self, *results):
+        """Run skopeo inspect through run() against scripted results, on a clock only time.sleep moves."""
+        clock = [0.0]
+        with mock.patch.object(mirror, 'rate_limit_deadline', None), \
+                mock.patch.object(mirror.subprocess, 'run', side_effect=results) as ran, \
+                mock.patch.object(mirror.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(mirror.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)) as slept:
+            try:
+                return mirror.run('skopeo', 'inspect', 'docker://docker.io/library/x:1'), ran, slept
+            except mirror.MirrorError as error:
+                return error, ran, slept
+
+    # What skopeo 1.24 prints once its own Retry-After waits run out.
+    LIMITED = mock.Mock(returncode=1, stdout=b'', stderr=b'fetching manifest 1 in docker.io/library/x: pinging container '
+                        b'registry docker.io: toomanyrequests: You have reached your pull rate limit.')
+
+    def test_a_rate_limit_is_waited_out_then_succeeds(self):
+        result, ran, slept = self.rate_limited(self.LIMITED, self.LIMITED, mock.Mock(returncode=0, stdout=b'{}', stderr=b''))
+        self.assertEqual(result, b'{}')
+        self.assertEqual(ran.call_count, 3)
+        first, second = (c.args[0] for c in slept.call_args_list)
+        self.assertTrue(7.5 <= first <= 15 and 15 <= second <= 30, 'backoff doubles, with jitter')
+        result, ran, slept = self.rate_limited(mock.Mock(returncode=1, stdout=b'', stderr=b'manifest unknown'))
+        self.assertIsInstance(result, mirror.MirrorError)
+        slept.assert_not_called()  # any other failure is not retried here
+
+    def test_a_persistent_rate_limit_gives_up_once_the_wait_budget_is_spent(self):
+        os.environ['MIRROR_RATE_LIMIT_WAIT'] = '600'
+        result, ran, slept = self.rate_limited(*[self.LIMITED] * 50)
+        self.assertIsInstance(result, mirror.MirrorError)
+        self.assertIn('toomanyrequests', str(result))
+        self.assertIn('MIRROR_RATE_LIMIT_WAIT is spent', str(result))
+        self.assertLessEqual(sum(c.args[0] for c in slept.call_args_list), 600)
+        self.assertTrue(all(c.args[0] <= 300 for c in slept.call_args_list), 'each backoff is capped')
+        self.assertLess(ran.call_count, 50)
+        for bad in ('abc', 'inf', 'nan', '-1'):
+            with mock.patch.dict(os.environ, {'MIRROR_RATE_LIMIT_WAIT': bad}), self.assertRaises(SystemExit):
+                self.cli('list')  # refused before any work, as a usage error
+
+    def test_sync_finishes_the_other_images_and_fails_at_the_end_naming_the_one_that_failed(self):
+        with Registry(self) as registry:
+            app, db = self.two_images(registry)
+            real = registry.copy
+
+            def limited(source, destination, *sides):
+                if 'team/app' in source:
+                    raise mirror.MirrorError('skopeo copy failed: toomanyrequests: You have reached your pull rate limit')
+                real(source, destination, *sides)
+            with mock.patch.object(mirror, 'copy', side_effect=limited):
+                self.assertEqual(self.cli('sync'), 1)
+            self.assertEqual(registry.tags, {f'{LOW}/team/db:2': db})
+            ledger = json.loads(self.ledger.read_text())
+            self.assertEqual(list(ledger['synced']), ['team/db:2'])
+            self.assertIn('1 of 2 image(s) not synced:\n  team/app:1.0: skopeo copy failed: toomanyrequests',
+                          self.err.getvalue())
+            self.assertEqual(self.cli('sync'), 0)  # the next run copies what the last one missed
+            self.assertEqual(registry.tags[f'{LOW}/team/app:1.0'], app)
+            with mock.patch.object(mirror, 'copy', side_effect=mirror.UsageError('bad setting')) as copied:
+                del registry.tags[f'{LOW}/team/app:1.0'], registry.tags[f'{LOW}/team/db:2']
+                with self.assertRaises(SystemExit):
+                    self.cli('sync')
+            self.assertEqual(copied.call_count, 1, 'a usage error stops sync at the first image')
+
     def test_export_from_source_reads_upstream_at_the_pin_and_lands_at_the_target(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
