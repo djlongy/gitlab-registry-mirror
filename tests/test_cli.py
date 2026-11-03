@@ -549,6 +549,8 @@ COVERAGE = {
     'sync': 'test_sync_copies_by_digest_records_the_ledger_and_is_idempotent',
     'sync --dry-run': 'test_dry_run_sync_prints_the_copies_and_saves_nothing',
     'export': 'test_export_takes_named_images_or_every_synced_one_with_all',
+    'verify-provenance': 'test_sync_with_a_platform_pushes_provenance_that_request_export_import_and_verify_provenance_carry',
+    'verify-provenance images': 'test_sync_with_a_platform_pushes_provenance_that_request_export_import_and_verify_provenance_carry',
     'request': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'request --files-from': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',
     'request --all': 'test_request_names_images_txt_lines_or_references_and_refuses_another_registry',

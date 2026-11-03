@@ -104,7 +104,7 @@ class Registry:
     """A fake pair of registries: tags to digests, and the manifest bytes skopeo would copy."""
 
     def __init__(self, test):
-        self.tags, self.manifests, self.test = {}, {}, test
+        self.tags, self.manifests, self.blobs, self.test = {}, {}, {}, test
 
     def image(self, name):
         raw = json.dumps({'schemaVersion': 2, 'name': name}).encode()
@@ -121,8 +121,11 @@ class Registry:
         return self.tags[name]
 
     def copy(self, source, destination, *_sides):
-        if source.startswith('oci:'):  # a Helm repository chart's layout
-            digest = json.loads(Path(source[4:].rsplit(':', 1)[0], 'index.json').read_text())['manifests'][0]['digest']
+        if source.startswith('oci:'):  # a Helm repository chart's or a provenance image's layout
+            layout = Path(source[4:].rsplit(':', 1)[0])
+            digest = json.loads((layout / 'index.json').read_text())['manifests'][0]['digest']
+            self.blobs.update({'sha256:' + b.name: b.read_bytes() for b in (layout / 'blobs/sha256').iterdir()})
+            self.manifests[digest] = self.blobs[digest]
         else:
             digest = self.digest(source) if source.startswith('docker://') else \
                 'sha256:' + hashlib.sha256(Path(source[4:], 'manifest.json').read_bytes()).hexdigest()
@@ -130,6 +133,10 @@ class Registry:
             Path(destination[4:]).mkdir(parents=True)
             Path(destination[4:], 'manifest.json').write_bytes(self.manifests[digest])
             Path(destination[4:], 'f' * 64).write_bytes(b'shared layer')
+            manifest = json.loads(self.manifests[digest])
+            for item in [manifest.get('config') or {}, *manifest.get('layers', [])]:
+                if item.get('digest') in self.blobs:
+                    Path(destination[4:], item['digest'][7:]).write_bytes(self.blobs[item['digest']])
         else:
             self.tags[destination.removeprefix('docker://')] = digest
 
@@ -985,6 +992,125 @@ class MirrorTest(MirrorCase):
         self.assertEqual(mirror.transport_reference(reference),
                          'registry.example.internal:5000/team/image@sha256:' + 'a'*64)
 
+
+    # Provenance of a platform image
+
+    def platform_index(self, registry):
+        """An upstream amd64 and arm64 index pinned in images.txt; skopeo inspect --raw reads the fake registry."""
+        amd, arm = registry.image('app amd64'), registry.image('app arm64')
+        index = json.dumps({'schemaVersion': 2, 'mediaType': mirror.INDEXES[0], 'manifests': [
+            {'mediaType': mirror.MANIFESTS[0], 'digest': amd, 'platform': {'os': 'linux', 'architecture': 'amd64'}},
+            {'mediaType': mirror.MANIFESTS[0], 'digest': arm, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
+        pinned = 'sha256:' + hashlib.sha256(index).hexdigest()
+        registry.manifests[pinned] = index
+        self.catalog.write_text(f'docker.io/team/app:1.0@{pinned} team/app\n')
+        os.environ['MIRROR_PLATFORM'] = 'linux/amd64'
+        upstream = []
+
+        def run(*args):
+            upstream.append(args[-1])
+            return registry.manifests[args[-1].rsplit('@', 1)[1]]
+        return pinned, amd, arm, mock.patch.object(mirror, 'run', side_effect=run), upstream
+
+    def test_sync_with_a_platform_pushes_provenance_that_request_export_import_and_verify_provenance_carry(self):
+        with Registry(self) as registry:
+            pinned, amd, arm, skopeo, upstream = self.platform_index(registry)
+            proof = 'sha256-' + amd[7:] + '.prov'
+            with skopeo:
+                self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(registry.tags[f'{LOW}/team/app:1.0'], amd)
+            record = json.loads(self.ledger.read_text())['synced']['team/app:1.0']
+            self.assertEqual(record['pin'], f'{pinned} linux/amd64', 'the ledger keeps the upstream index digest')
+            self.assertEqual(record['provenance'], registry.tags[f'{LOW}/team/app:{proof}'])
+            upstream.clear()
+            with skopeo, mock.patch.object(mirror, 'copy') as again:
+                self.assertEqual(self.cli('sync'), 0)
+            again.assert_not_called()
+            self.assertEqual(upstream, [], 'an unchanged image reads nothing upstream')
+            # request carries the provenance with its image, by catalog or by name, and once sent only when it changes.
+            os.environ['MIRROR_REQUEST_URL'] = 'https://nifi.example.internal/contentListener'
+            for args in (['request', '--dry-run'], ['request', 'team/app:1.0', '--dry-run']):
+                self.out.truncate(0)
+                self.out.seek(0)
+                self.assertEqual(self.cli(*args), 0)
+                self.assertEqual(self.out.getvalue().splitlines(), [
+                    f'would request: {LOW}/team/app:1.0@{amd}', f'would request: {LOW}/team/app:{proof}@{record["provenance"]}'])
+            ledger = json.loads(self.ledger.read_text())
+            ledger['sent'] = {'team/app:1.0': {'digest': amd}}  # sent before provenance existed
+            self.ledger.write_text(json.dumps(ledger))
+            self.assertEqual(mirror.wanted_images(self.catalog, self.ledger, (), None, False), [(LOW, 'team/app', proof)])
+            # export and import carry it; import checks it before the first push.
+            tar = self.root / 'carry.tar'
+            self.assertEqual(self.cli('export', '--all', '-o', tar), 0)
+            self.assertEqual([i[2] for i in self.tar_images(tar)], ['1.0', proof])
+            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', tar), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/app:' + proof], record['provenance'])
+            # verify-provenance reads only the high registry: the image is the amd64 child of the pinned index.
+            upstream.clear()
+            self.assertEqual(self.cli('verify-provenance'), 0)
+            self.assertEqual(self.cli('verify-provenance', 'team/app:1.0'), 0)
+            self.assertIn(f'is the linux/amd64 image of docker.io/team/app:1.0@{pinned}', self.err.getvalue())
+            self.assertEqual(upstream, [])
+            registry.tags['high.example.internal/team/app:1.0'] = arm  # a tag moved to an image with no provenance
+            self.assertEqual(self.cli('verify-provenance', 'team/app:1.0'), 1)
+            self.assertIn(f'no provenance image team/app:sha256-{arm[7:]}.prov', self.err.getvalue())
+            registry.tags['high.example.internal/team/app:1.0'] = amd
+            self.catalog.write_text(f'docker.io/team/app:1.0@sha256:{"e" * 64} team/app\n')  # images.txt pins another index
+            self.assertEqual(self.cli('verify-provenance'), 1)
+            self.assertIn('but images.txt pins sha256:' + 'e' * 64, self.err.getvalue())
+            registry.tags['high.example.internal/team/app:1.0'] = 'sha256:' + 'e' * 64  # crossed whole
+            self.assertEqual(self.cli('verify-provenance'), 0)
+
+    def test_provenance_proves_only_the_platform_image_of_the_index_it_hashes_to(self):
+        amd, arm = 'sha256:' + 'b' * 64, 'sha256:' + 'c' * 64
+        index = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': amd, 'platform': {'os': 'linux', 'architecture': 'amd64'}},
+            {'digest': arm, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
+        pinned = 'sha256:' + hashlib.sha256(index).hexdigest()
+        source = f'docker.io/team/app:1.0@{pinned}'
+
+        def directory(index=index, source=source, digest=amd, platform='linux/amd64'):
+            """A provenance image as skopeo copies it to dir:"""
+            layout, root = mirror.provenance_layout(index, source, digest, platform)
+            copied = Path(tempfile.mkdtemp(dir=self.root))
+            for item in (layout / 'blobs/sha256').iterdir():
+                shutil.copyfile(item, copied / ('manifest.json' if 'sha256:' + item.name == root else item.name))
+            return copied, root
+
+        good, root = directory()
+        self.assertEqual(mirror.check_provenance(good, amd)['source'], source)
+        self.assertEqual(directory()[1], root, 'the same index and image always give the same provenance digest')
+        manifest = json.loads((good / 'manifest.json').read_text())
+        config = json.loads((good / manifest['config']['digest'][7:]).read_text())
+        # An ordinary amd64 image: NiFi Platform Selection linux/amd64 and every registry take it.
+        self.assertEqual((config['os'], config['architecture']), ('linux', 'amd64'))
+        self.assertTrue(mirror.runnable(manifest))
+        for case, (copied, _), digest, error in (
+                ('another image', (good, root), arm, 'names sha256:b+, not sha256:c'),
+                ('index edited', directory(index=index.replace(b'amd64', b'AMD64')), amd, 'does not hash to'),
+                ('wrong platform', directory(digest=arm), arm, 'lists no linux/amd64 image'),
+                ('not listed', directory(digest='sha256:' + 'd' * 64), 'sha256:' + 'd' * 64, 'lists no linux/amd64 image')):
+            with self.subTest(case), self.assertRaisesRegex(mirror.MirrorError, error):
+                mirror.check_provenance(copied, digest)
+        layer = good / manifest['layers'][0]['digest'][7:]
+        layer.write_bytes(b'x' + layer.read_bytes()[1:])
+        with self.assertRaisesRegex(mirror.MirrorError, 'matching its digest'):
+            mirror.check_provenance(good, amd)
+
+    def test_import_refuses_a_tar_whose_provenance_does_not_prove_its_image(self):
+        with Registry(self) as registry:
+            pinned, amd, arm, skopeo, _ = self.platform_index(registry)
+            with skopeo:
+                self.assertEqual(self.cli('sync'), 0)
+            proof = 'sha256-' + amd[7:] + '.prov'
+            registry.tags[f'{LOW}/team/app:sha256-{arm[7:]}.prov'] = registry.tags[f'{LOW}/team/app:{proof}']
+            tar = self.root / 'forged.tar'
+            self.assertEqual(self.cli('export', f'team/app:sha256-{arm[7:]}.prov', '-o', tar), 0)
+            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
+            self.assertEqual(self.cli('import', tar), 1)
+            self.assertIn(f'names {amd}, not {arm}', self.err.getvalue())
+            self.assertFalse([t for t in registry.tags if t.startswith('high.')], 'a refusal pushes nothing')
 
     def test_platform_selection_picks_one_child_or_fails(self):
         child = {'digest': 'sha256:' + 'b'*64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}

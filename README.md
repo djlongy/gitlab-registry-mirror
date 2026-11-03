@@ -99,6 +99,7 @@ Global flags go before the command: `--catalog FILE` (default `images.txt`), `--
 | `export IMAGE...` or `export --all` | low | Writes the named images, or every synced catalog image, to `NAME.tar` and `NAME.tar.sha256` | `--all`, `-T FILE` (`images.txt` lines work), `-o NAME.tar` or `-o -`, `--max-size SIZE`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
 | `request [IMAGE...]` | low | POSTs one webhook request to `MIRROR_REQUEST_URL` naming images in `MIRROR_REGISTRY` for the low NiFi to carry: what is synced and not yet requested, `--all`, or the names given (references or `images.txt` lines) | `--all`, `-T FILE` (`-` is stdin), `-n` |
 | `import SOURCE...` | high | Pushes the images in tars, or every tar in a directory, into `MIRROR_REGISTRY` | `-k`, `--no-clobber`, `--no-checksum`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
+| `verify-provenance [IMAGE...]` | high | Checks each named image in `MIRROR_REGISTRY`, else each catalog image, offline: pinned at its own digest, or its `.prov` image's index hashes to the digest `images.txt` pins and lists the image for its platform. Exits 1 on any mismatch | none |
 
 ## Environment
 
@@ -111,7 +112,7 @@ A flag wins over its variable.
 | Optional | `MIRROR_SOURCE_REGISTRY` (`--source-registry`), `MIRROR_SOURCE_REGISTRY_USERNAME`, `MIRROR_SOURCE_REGISTRY_PASSWORD` | none | An upstream registry `sync` copies from, such as `docker.io`, for `login` to store credentials for |
 | Optional | `MIRROR_REGISTRY_TLS_VERIFY`, `MIRROR_SOURCE_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
 | Optional | `MIRROR_CA_BUNDLE` | system roots | PEM of extra CAs, trusted by every connection on top of the system roots and `certs.d` |
-| Optional | `MIRROR_PLATFORM` | all platforms | `sync` copies one platform, e.g. `linux/amd64`. Quay refuses Windows manifests, so set it for images with Windows children |
+| Optional | `MIRROR_PLATFORM` | all platforms | `sync` copies one platform, e.g. `linux/amd64`. Quay refuses Windows manifests, so set it for images with Windows children. The upstream index then stays behind, so `sync` also pushes a provenance image beside each one, tag `sha256-<image digest hex>.prov`, holding the index's exact bytes and the source reference. `request`, `export` and `import` carry it with its image, `import` checks it first, and `verify-provenance` checks it on the high side |
 | Optional | `MIRROR_LEDGER` | package registry in CI, else `.mirror-ledger.json` | Ledger file, or the pipeline ledger's `https://` URL (read only). `MIRROR_LEDGER_TOKEN`, `MIRROR_LEDGER_PROJECT` and `MIRROR_GITLAB_API_URL` reach the CI ledger from outside a job |
 | Optional | `MIRROR_RETRY_TIMES` | `7` | How often skopeo retries a failed copy step, 1, 2, 4 ... s apart. The default waits 127 s, past Quay's 503 `UNAVAILABLE` ("The blob is temporarily locked"), which lasts while its garbage collector holds a new blob's lock, up to 120 s |
 | Optional | `MIRROR_RATE_LIMIT_WAIT` | `900` | Seconds a run keeps retrying a rate-limited registry (Docker Hub `toomanyrequests`), from its first rate limit, with a jittered backoff capped at 300 s. `0` turns it off. `sync` reports an image that still fails, finishes the rest, then fails |

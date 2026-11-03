@@ -184,6 +184,27 @@ if __name__ == '__main__':
         assert on_high(f'{target}-source', '1.0.0')[1] == 2
         checks.append('max-size-split')
 
+        # One platform: the amd64 image crosses with a provenance image holding the upstream index.
+        platform = target + '-amd64'
+        CATALOG.write_text('')
+        cli('low', 'add', first_source, platform)
+        os.environ['MIRROR_PLATFORM'] = 'linux/amd64'
+        os.environ['MIRROR_REQUEST_URL'], requests = listener()
+        cli('low', 'sync')
+        image = mirror.raw_digest(f"docker://{REGISTRIES['low']}/{platform}:1.0.0", 'MIRROR_REGISTRY')
+        proof = 'sha256-' + image[7:] + '.prov'
+        assert [i['tag'] for i in requests[0]['images']] == ['1.0.0', proof], requests
+        del os.environ['MIRROR_REQUEST_URL']
+        cli('low', 'export', '--all', '-o', out / 'platform.tar')
+        cli('high', 'import', out / 'platform.tar')
+        assert on_high(platform, '1.0.0') == (image, 0), 'one platform image, not the index'
+        assert 'is the linux/amd64 image of' in cli('high', 'verify-provenance', f'{platform}:1.0.0')
+        mirror.copy(f"docker://{REGISTRIES['high']}/{target}:1.0.1", f"docker://{REGISTRIES['high']}/{platform}:1.0.0",
+                    'MIRROR_REGISTRY', 'MIRROR_REGISTRY')
+        cli('high', 'verify-provenance', f'{platform}:1.0.0', fail='no provenance image')
+        del os.environ['MIRROR_PLATFORM']
+        checks.append('platform-provenance')
+
         assert not list(WORK.rglob('.mirror-staging-*')), 'staging directories are removed'
         checks.append('staging-removed')
         print(json.dumps({'status': 'passed', 'checks': checks}, indent=2))
