@@ -131,10 +131,11 @@ if __name__ == '__main__':
         checks.append('sync-idempotent')
 
         os.environ['MIRROR_REQUEST_URL'], requests = listener()
-        assert 'requested 1 image tag(s)' in cli('low', 'sync'), 'an image synced before the webhook was set is requested'
-        assert [i['repository'] for i in requests[0]['images']] == [target], requests
+        assert 'requested 2 image tag(s)' in cli('low', 'sync'), 'an image synced before the webhook was set is requested'
+        assert [(i['repository'], i['tag']) for i in requests[0]['images']] == [
+            (target, '1.0.0'), (target, mirror.digest_tag('1.0.0', mirror.catalog(CATALOG)[0]['digest']))], requests
         assert 'nothing new to request' in cli('low', 'sync')
-        assert 'requested 1 image tag(s)' in cli('low', 'request', f'{target}:1.0.0'), 'a named image is requested again'
+        assert 'requested 2 image tag(s)' in cli('low', 'request', f'{target}:1.0.0'), 'a named image is requested again'
         assert len(requests) == 2
         del os.environ['MIRROR_REQUEST_URL']
         checks.append('webhook-requests-what-is-new-and-named-resends')
@@ -154,7 +155,8 @@ if __name__ == '__main__':
         cli('low', 'export', '--all', '-o', transfer / 'second.tar', '--rewrite-base-path', rebased.split('/')[0])
         with tarfile.open(transfer / 'second.tar') as archive:
             listed = json.load(archive.extractfile('./export.json'))['images']
-        assert [(i['target'], i['tag']) for i in listed] == [(rebased, '1.0.1')], listed
+        assert [(i['target'], i['tag']) for i in listed] == [
+            (rebased, '1.0.1'), (rebased, mirror.digest_tag('1.0.1', mirror.catalog(CATALOG)[0]['digest']))], listed
         cli('high', 'import', transfer / 'second.tar')
         assert on_high(rebased, '1.0.1')[0] == mirror.catalog(CATALOG)[0]['digest']
         assert (transfer / 'second.tar').exists(), 'a tar named on its own is kept'
@@ -184,6 +186,22 @@ if __name__ == '__main__':
         assert on_high(f'{target}-source', '1.0.0')[1] == 2
         checks.append('max-size-split')
 
+        # Upstream rebuilds a tag: the tag moves on both sides and the old image keeps its digest tag.
+        moved = target + '-moved'
+        old, new = (mirror.raw_digest('docker://' + s, 'MIRROR_REGISTRY') for s in (first_source, second_source))
+        CATALOG.write_text(f"{first_source.rsplit(':', 1)[0]}:1.0.0@{old} {moved}\n")
+        cli('low', 'sync')
+        cli('low', 'export', '--all', '-o', out / 'before.tar')
+        cli('high', 'import', out / 'before.tar')
+        CATALOG.write_text(f"{first_source.rsplit(':', 1)[0]}:1.0.0@{new} {moved}\n")
+        cli('low', 'sync')
+        cli('low', 'export', '--all', '-o', out / 'after.tar')
+        cli('high', 'import', out / 'after.tar')
+        assert on_high(moved, '1.0.0')[0] == new
+        assert on_high(moved, mirror.digest_tag('1.0.0', old))[0] == old, 'the old image stays tagged'
+        assert on_high(moved, mirror.digest_tag('1.0.0', new))[0] == new
+        checks.append('moved-tag-keeps-digest-tag')
+
         # One platform: the amd64 image crosses with a provenance image holding the upstream index.
         platform = target + '-amd64'
         CATALOG.write_text('')
@@ -193,7 +211,7 @@ if __name__ == '__main__':
         cli('low', 'sync')
         image = mirror.raw_digest(f"docker://{REGISTRIES['low']}/{platform}:1.0.0", 'MIRROR_REGISTRY')
         proof = 'sha256-' + image[7:] + '.prov'
-        assert [i['tag'] for i in requests[0]['images']] == ['1.0.0', proof], requests
+        assert [i['tag'] for i in requests[0]['images']] == ['1.0.0', mirror.digest_tag('1.0.0', image), proof], requests
         del os.environ['MIRROR_REQUEST_URL']
         cli('low', 'export', '--all', '-o', out / 'platform.tar')
         cli('high', 'import', out / 'platform.tar')

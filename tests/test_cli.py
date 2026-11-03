@@ -322,14 +322,16 @@ class CliTest(MirrorCase):
                 self.clear(self.out)
                 self.assertEqual(self.cli('sync', spelling), 0)
                 self.assertEqual(sorted(self.out.getvalue().splitlines()),
-                                 sorted(f'would copy: docker.io/team/{n.split(":")[0]}@{registry.image(n.split(":")[0])} -> {LOW}/team/{n}'
-                                        for n in ('app:1.0', 'db:2')))
+                                 sorted([*(f'would copy: docker.io/team/{n.split(":")[0]}@{registry.image(n.split(":")[0])} -> {LOW}/team/{n}'
+                                        for n in ('app:1.0', 'db:2')),
+                                         *(f'would copy: docker.io/team/{n.split(":")[0]}@{registry.image(n.split(":")[0])} -> '
+                                           f'{LOW}/team/{n}-{registry.image(n.split(":")[0])[7:19]}' for n in ('app:1.0', 'db:2'))]))
                 self.assertEqual(registry.tags, {}, 'nothing was copied')
                 self.assertEqual(self.snapshot(), before, 'no ledger was saved')
                 self.assertFalse(self.ledger.exists())
                 webhook.assert_not_called()
                 self.assertEqual(self.cli('sync'), 0)
-                self.assertEqual(len(registry.tags), 2, 'the same run without the flag does copy')
+                self.assertEqual(len(registry.tags), 4, 'the same run without the flag does copy')
                 self.clear(self.out)
                 saved = self.ledger.read_bytes()
                 self.assertEqual(self.cli('sync', spelling), 0)
@@ -347,8 +349,8 @@ class CliTest(MirrorCase):
                 self.clear(self.out)
                 self.assertEqual(self.cli('export', '--all', spelling, '-o', self.root / 'carry.tar'), 0)
                 lines = self.out.getvalue().splitlines()
-                self.assertEqual(lines[0], 'would write: ' + str(self.root / 'carry.tar') + ' and carry.tar.sha256 (2 image tag(s))')
-                self.assertEqual(len(lines), 3)
+                self.assertEqual(lines[0], 'would write: ' + str(self.root / 'carry.tar') + ' and carry.tar.sha256 (4 image tag(s))')
+                self.assertEqual(len(lines), 5)
                 self.assertTrue(lines[1].startswith(f'  {LOW}/team/app:1.0@sha256:'))
             self.assertEqual(self.snapshot(), before)
             self.assertFalse([p for p in self.root.iterdir() if p.name.startswith('.mirror-staging')])
@@ -424,12 +426,13 @@ class CliTest(MirrorCase):
             carried.write_bytes(stdout.buffer.getvalue())
             digest = mirror.sha256(carried)  # what `| tee carry.tar | sha256sum` would print
             self.assertEqual(digest, mirror.hashlib.sha256(stdout.buffer.getvalue()).hexdigest())
-            self.assertEqual(sorted(i[2] for i in self.tar_images(carried)), ['1.0', '2'])
+            self.assertEqual(len(self.tar_images(carried)), 4)
             os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
             self.assertEqual(self.run_cli('import', carried), 1, 'no .sha256 came with the stream')
             self.assertEqual(self.cli('import', carried, '--no-checksum'), 0)
-            self.assertEqual(sorted(t for t in registry.tags if t.startswith('high.example.internal/')),
-                             ['high.example.internal/team/app:1.0', 'high.example.internal/team/db:2'])
+            self.assertEqual(sorted(t.split(':')[1] for t in registry.tags if t.startswith('high.example.internal/')),
+                             sorted([mirror.digest_tag(t, registry.image(n)) for n, t in (('app', '1.0'), ('db', '2'))]
+                                    + ['1.0', '2']))
             carried.with_name('carried.tar.sha256').write_text(f'{digest}  carried.tar\n')
             self.assertEqual(self.cli('import', carried), 0, 'with the checksum the reader computed, import checks it too')
             os.environ['MIRROR_REGISTRY'] = LOW

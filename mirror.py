@@ -897,6 +897,12 @@ def provenance_tag(digest):
     return digest.replace(":", "-") + ".prov"
 
 
+def digest_tag(tag, digest):
+    """tag-<first 12 hex of digest>: a tag that never moves, so the image stays tagged, and safe from garbage
+    collection, after its source tag moves. Cut to fit the 128-character tag limit."""
+    return f"{tag[:115]}-{digest[7:19]}"
+
+
 def provenance_layout(index, source, digest, platform):
     """The provenance image for digest, the platform image of the upstream index at source
     (registry/repo:tag@sha256:...), whose exact bytes are index: an OCI layout and its digest."""
@@ -970,13 +976,16 @@ def push_provenance(image, transfer, low, ledger, dry_run):
     return digest
 
 
-def provenance_of(host, repository, tag):
-    """[(host, repository, its provenance tag)] when the image at tag has a provenance image beside it, else []."""
+def companions(host, repository, tag):
+    """[(host, repository, tag)] for the digest tag and provenance image beside the image at tag, those present."""
     if PROVENANCE_TAG.fullmatch(tag):
         return []
     digest = present_digest(f"docker://{host}/{repository}:{tag}", side_of(host))
-    proof = digest and provenance_tag(digest)
-    return [(host, repository, proof)] if proof and present_digest(f"docker://{host}/{repository}:{proof}", side_of(host)) else []
+    if not digest:
+        return []
+    pinned, proof = digest_tag(tag, digest), provenance_tag(digest)
+    return ([(host, repository, pinned)] * (present_digest(f"docker://{host}/{repository}:{pinned}", side_of(host)) == digest)
+            + [(host, repository, proof)] * bool(present_digest(f"docker://{host}/{repository}:{proof}", side_of(host))))
 
 
 def verify_provenance(path, entries):
@@ -1061,6 +1070,8 @@ def sync(path, ledger_file, dry_run=False):
                 if f"{image['target']}:{tag}" in catalog_tags:
                     warn(f"{key} reports version {tag}, which images.txt pins or once pinned; not tagging it")
             tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
+            if not CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+                tags += [digest_tag(t, transfer) for t in tags]  # after the cache: a synced image gains them next run
             if key not in pinned:
                 # Recorded before the first copy, so a run that fails after it still protects the tag.
                 pinned.append(key)
@@ -1082,10 +1093,10 @@ def sync(path, ledger_file, dry_run=False):
                     continue
                 progress(f"copying: {source.split('@')[0]}@{transfer} -> {low}/{image['target']}:{tag}"
                          + (f" (target has {observed})" if observed else ""))
-                if (ledger["sent"].get(key) or {}).get("digest") == transfer:
+                if (ledger["sent"].get(f"{image['target']}:{tag}") or {}).get("digest") == transfer:
                     # The low registry lost what was sent, so the high one may have too: ask for it again. Saved
                     # before the copy, so a run that fails after it still asks next time.
-                    del ledger["sent"][key]
+                    del ledger["sent"][f"{image['target']}:{tag}"]
                     save_ledger(ledger_file, ledger)
                 if number:  # a version tag points at the image already in MIRROR_REGISTRY
                     copy(f"docker://{low}/{image['target']}@{transfer}", destination, "MIRROR_REGISTRY", "MIRROR_REGISTRY")
@@ -1200,19 +1211,23 @@ def image_bytes(reference, side):
 
 
 def groups(images, cap):
-    """Split images into tars of at most cap bytes, in order. An image larger than cap goes alone."""
+    """Split images into tars of at most cap bytes, in order. An image larger than cap goes alone. Another tag of
+    an image already in the tar (a digest tag) costs nothing: its blobs are stored once."""
     if not cap:
         return [images]
-    found, total = [[]], 0
+    found, total, held = [[]], 0, set()
     for image in images:
-        need = image_bytes(f"docker://{image['host']}/{image['repo']}@{image['digest']}", side_of(image["host"]))
+        key = (image["host"], image["repo"], image["digest"])
+        need = 0 if key in held else image_bytes(f"docker://{image['host']}/{image['repo']}@{image['digest']}",
+                                                 side_of(image["host"]))
         if need > cap:
             progress(f"{image['host']}/{image['repo']}:{image['tag']} is {need} bytes, over --max-size: it goes in a tar of its own")
-        if found[-1] and total + need > cap:
+        if need and found[-1] and total + need > cap:
             found.append([])
-            total = 0
+            total, held = 0, set()
         found[-1].append(image)
         total += need
+        held.add(key)
     return found
 
 
@@ -1280,7 +1295,7 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
     entries += [name for file in files_from or () for _, text in list_lines(file) for name in named(text)]
     if entries:
         found = [found for entry in entries for found in export_tags(entry)]
-        return found + [proof for image in found for proof in provenance_of(*image)]
+        return [each for image in found for each in (image, *companions(*image))]  # companions share their image's tar
     low = registry("MIRROR_REGISTRY")
     ledger = load_ledger(ledger_file, low)
     synced, sent = ledger["synced"], ledger["sent"]
@@ -1293,7 +1308,9 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
             progress(f"not synced yet, {how}: {image['target']}:{image['tag']}")
             continue
         last = sent.get(f"{image['target']}:{image['tag']}") or {}
-        tags = record["tags"] if everything or last.get("digest") != record["digest"] else []
+        # Per tag, so a tag added to an image already sent (a digest tag, a version) is sent on its own.
+        tags = [t for t in record["tags"]
+                if everything or (sent.get(f"{image['target']}:{t}") or {}).get("digest") != record["digest"]]
         proof = provenance_tag(record["digest"])  # sent with its image, and again whenever it changes
         if record.get("provenance") and (tags or (sent.get(f"{image['target']}:{proof}") or {}).get("digest") != record["provenance"]):
             tags = [*tags, proof]
