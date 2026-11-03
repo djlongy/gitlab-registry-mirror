@@ -59,10 +59,23 @@ Choose one source:
    GRYPE_DB_UPDATE_URL=https://github.com/example-org/grype-db-mirror/releases/latest/download/listing.json
    ```
 
-   Grype resolves the archive next to the listing (`releases/latest/download/<archive>`). The upstream
-   `latest.json` does not work from a release: GitHub replaces `:` in asset names with `.`, so its `path`
-   names a file the release does not have. A mirror that syncs hourly, as that one does, serves a new
-   build at most about 1 hour after Anchore's daily publish (06:53 to 07:47 UTC).
+   Grype resolves the archive next to the listing (`releases/latest/download/<archive>`). Use a listing
+   whose `path` is the asset name: GitHub replaces `:` in asset names with `.`, so Anchore's own
+   `latest.json` names a file the release does not have. A mirror that syncs hourly, as that one does,
+   serves a new build at most about 1 hour after Anchore's daily publish (06:53 to 07:47 UTC).
+
+   Behind an allowlist proxy, allow exactly these hosts on port 443 (`CONNECT`):
+
+   | Host | Why |
+   |---|---|
+   | `github.com` | The listing and the archive URL. Both answer with a redirect |
+   | `release-assets.githubusercontent.com` | Where GitHub redirects release downloads |
+   | The registry in `SYFT_IMAGE` and `GRYPE_IMAGE` | The scanner images (see [Runner tools](#runner-tools)). Also allow its blob storage host if it redirects layer downloads there |
+
+   `grype.anchore.io` is not needed. Set `GRYPE_CHECK_FOR_APP_UPDATE=false` and
+   `SYFT_CHECK_FOR_APP_UPDATE=false`, or each run also tries Anchore's release check (see
+   [Closed networks: update checks](#closed-networks-update-checks)). Set `HTTPS_PROXY` on the runner.
+   On a shell runner, podman passes the proxy variables into the scanner container by default.
 3. **A copy inside a closed network.** Copy two files across, from Anchore or from the GitHub mirror,
    and serve them without authentication.
    1. On a machine that can reach the source, download the listing and the archive it names, and check
