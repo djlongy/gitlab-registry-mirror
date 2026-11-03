@@ -856,7 +856,19 @@ def chart_layout(source):
     tarball = download(url)
     if "sha256:" + hashlib.sha256(tarball).hexdigest() != digest:
         raise MirrorError(f"{url} does not match the pinned digest {digest}")
-    layout = Path(tempfile.mkdtemp(prefix="mirror-chart-"))
+    found = oci_layout((canonical(chart_metadata(tarball)), CHART_CONFIG), [(tarball, CHART_LAYERS[0])], match["tag"])
+    progress(f"chart {url} checked against {digest}")
+    return found
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def oci_layout(config, layers, tag):
+    """An OCI layout holding one image manifest, tagged tag, and the manifest's digest. config and each layer
+    are (bytes, media type). The same bytes always give the same digest."""
+    layout = Path(tempfile.mkdtemp(prefix="mirror-layout-"))
     atexit.register(shutil.rmtree, layout, ignore_errors=True)
     (layout / "blobs/sha256").mkdir(parents=True)
 
@@ -865,17 +877,147 @@ def chart_layout(source):
         (layout / "blobs/sha256" / name).write_bytes(data)
         return {"mediaType": media_type, "digest": "sha256:" + name, "size": len(data)}
 
-    def encode(value):
-        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-    config = blob(encode(chart_metadata(tarball)), CHART_CONFIG)
-    manifest = blob(encode({"schemaVersion": 2, "mediaType": MANIFESTS[0], "config": config,
-                            "layers": [blob(tarball, CHART_LAYERS[0])]}), MANIFESTS[0])
-    reference = {**manifest, "annotations": {"org.opencontainers.image.ref.name": match["tag"]}}
-    (layout / "index.json").write_bytes(encode({"schemaVersion": 2, "manifests": [reference]}))
-    (layout / "oci-layout").write_bytes(encode({"imageLayoutVersion": "1.0.0"}))
-    progress(f"chart {url} checked against {digest}")
+    manifest = blob(canonical({"schemaVersion": 2, "mediaType": MANIFESTS[0], "config": blob(*config),
+                               "layers": [blob(*layer) for layer in layers]}), MANIFESTS[0])
+    reference = {**manifest, "annotations": {"org.opencontainers.image.ref.name": tag}}
+    (layout / "index.json").write_bytes(canonical({"schemaVersion": 2, "manifests": [reference]}))
+    (layout / "oci-layout").write_bytes(canonical({"imageLayoutVersion": "1.0.0"}))
     return layout, manifest["digest"]
+
+
+# With MIRROR_PLATFORM, sync copies one image out of an upstream index, and the index, whose digest images.txt
+# pins, never crosses. A provenance image beside it, tagged after the image's digest, carries the index's exact
+# bytes and the source reference, so the far side can check offline that the image is that platform of that index.
+# It is an ordinary single-layer image of that platform, so every registry and NiFi Platform Selection take it.
+PROVENANCE_TAG = re.compile(r"sha256-([0-9a-f]{64})\.prov")
+PROVENANCE_FILES = ("provenance.json", "index.json")
+
+
+def provenance_tag(digest):
+    return digest.replace(":", "-") + ".prov"
+
+
+def provenance_layout(index, source, digest, platform):
+    """The provenance image for digest, the platform image of the upstream index at source
+    (registry/repo:tag@sha256:...), whose exact bytes are index: an OCI layout and its digest."""
+    record = json.dumps({"source": source, "platform": platform, "digest": digest}, indent=2, sort_keys=True).encode()
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, data in zip(PROVENANCE_FILES, (record, index)):
+            member = tarfile.TarInfo(name)  # time 0, owner root: the same input gives the same digest
+            member.size, member.mode = len(data), 0o444
+            tar.addfile(member, io.BytesIO(data))
+    layer = archive.getvalue()
+    os_name, architecture, *variant = platform.split("/")
+    config = {"architecture": architecture, "os": os_name, **({"variant": variant[0]} if variant else {}),
+              "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(layer).hexdigest()]}}
+    return oci_layout((canonical(config), IMAGE_CONFIGS[0]), [(layer, "application/vnd.oci.image.layer.v1.tar")], "prov")
+
+
+def check_provenance(directory, digest):
+    """The record of the provenance image in directory (a skopeo dir: copy), once it proves digest is the
+    platform image of the upstream index it names: the index's bytes hash to the digest in its source
+    reference and list digest for its platform. Raises otherwise."""
+    try:
+        layers = json.loads((directory / "manifest.json").read_bytes()).get("layers") or []
+        layer = directory / str(layers[0].get("digest"))[7:] if len(layers) == 1 else None
+        if not layer or not layer.is_file() or "sha256:" + sha256(layer) != layers[0]["digest"]:
+            raise MirrorError("not a provenance image: it needs one layer, present and matching its digest")
+        with tarfile.open(layer, "r:") as tar:
+            files = {m.name: tar.extractfile(m).read() for m in tar if m.isfile() and m.name in PROVENANCE_FILES}
+        record, index = json.loads(files["provenance.json"]), files["index.json"]
+        children = json.loads(index).get("manifests") or []
+        source, platform = str(record["source"]), str(record["platform"])
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError, tarfile.TarError) as error:
+        raise MirrorError(f"not a provenance image: {error!r}") from error
+    upstream = source.rpartition("@")[2]
+    if record.get("digest") != digest:
+        raise MirrorError(f"the provenance names {record.get('digest')}, not {digest}")
+    if "sha256:" + hashlib.sha256(index).hexdigest() != upstream:
+        raise MirrorError(f"the upstream index it carries does not hash to {upstream}, the digest of {source}")
+    want = dict(zip(("os", "architecture", "variant"), platform.split("/")))
+    # An index entry may leave out its platform; sync then chose the child by its config.
+    if not any(isinstance(c, dict) and c.get("digest") == digest
+               and {k: (c.get("platform") or want).get(k) for k in want} == want for c in children):
+        raise MirrorError(f"the upstream index {upstream} lists no {platform} image {digest}")
+    return record
+
+
+def push_provenance(image, transfer, low, ledger, dry_run):
+    """Put the provenance image for transfer, the platform image sync took from image's upstream index, beside
+    it in MIRROR_REGISTRY, and return its digest. Upstream is read only when the tag is not where the ledger
+    says."""
+    key = f"{image['target']}:{provenance_tag(transfer)}"
+    destination = f"docker://{low}/{key}"
+    known = (ledger["synced"].get(f"{image['target']}:{image['tag']}") or {}).get("provenance")
+    present = present_digest(destination, "MIRROR_REGISTRY")
+    if known and present == known:
+        progress(f"already in MIRROR_REGISTRY: {low}/{key}@{present}")
+        return present
+    index = fetch_manifest("docker://" + transport_reference(image["source"]))
+    layout, digest = provenance_layout(index, image["source"], transfer, os.environ["MIRROR_PLATFORM"].strip())
+    if present == digest:
+        return digest
+    if dry_run:
+        print(f"would copy: provenance of {image['source']} -> {low}/{key}")
+        return known
+    progress(f"copying: provenance of {image['source']} -> {low}/{key}")
+    ledger["sent"].pop(key, None)  # new, or lost in MIRROR_REGISTRY and so maybe on the high side: ask again
+    copy(f"oci:{layout}:prov", destination, None, "MIRROR_REGISTRY")
+    if raw_digest(destination, "MIRROR_REGISTRY") != digest:
+        raise MirrorError(f"digest mismatch in MIRROR_REGISTRY: {key}")
+    progress(f"pushed to MIRROR_REGISTRY: {low}/{key}@{digest}")
+    return digest
+
+
+def provenance_of(host, repository, tag):
+    """[(host, repository, its provenance tag)] when the image at tag has a provenance image beside it, else []."""
+    if PROVENANCE_TAG.fullmatch(tag):
+        return []
+    digest = present_digest(f"docker://{host}/{repository}:{tag}", side_of(host))
+    proof = digest and provenance_tag(digest)
+    return [(host, repository, proof)] if proof and present_digest(f"docker://{host}/{repository}:{proof}", side_of(host)) else []
+
+
+def verify_provenance(path, entries):
+    """Check each named image in MIRROR_REGISTRY, else each catalog image, against its provenance image, offline:
+    one that images.txt pins at its own digest crossed whole; any other must have a provenance image proving
+    it is the platform image of its upstream index, and that index must be the one images.txt pins, when it
+    names the image."""
+    registry("MIRROR_REGISTRY")
+    pins = {f"{i['target']}:{i['tag']}": i for i in catalog(path)} if path.exists() else {}
+    names = [name for text in entries for name in named(text)] or [
+        key for key, i in pins.items() if not CHART_SOURCE.fullmatch(i["source"].partition("@")[0])]
+    if not names:
+        raise UsageError("verify-provenance needs images: name them, or give --catalog images.txt")
+    checked_images, failed = 0, []
+    for host, repository, tag in dict.fromkeys(found for name in names for found in export_tags(name)):
+        if PROVENANCE_TAG.fullmatch(tag):
+            continue
+        reference = f"{host}/{repository}:{tag}"
+        checked_images += 1
+        try:
+            digest = raw_digest(f"docker://{reference}", side_of(host))
+            pinned = (pins.get(f"{repository}:{tag}") or {}).get("digest")
+            if digest == pinned:
+                progress(f"verified: {reference}@{digest} is the image images.txt pins, whole")
+                continue
+            proof = f"docker://{host}/{repository}:{provenance_tag(digest)}"
+            if not present_digest(proof, side_of(host)):
+                raise MirrorError(f"no provenance image {repository}:{provenance_tag(digest)} for {digest}")
+            with tempfile.TemporaryDirectory(prefix="mirror-provenance-") as scratch:
+                copy(proof, f"dir:{scratch}/copy", side_of(host))
+                record = check_provenance(Path(scratch, "copy"), digest)
+            upstream = record["source"].rpartition("@")[2]
+            if pinned and upstream != pinned:
+                raise MirrorError(f"its upstream index is {upstream}, but images.txt pins {pinned}")
+            progress(f"verified: {reference}@{digest} is the {record['platform']} image of {record['source']}")
+        except MirrorError as error:
+            fail(f"{reference}: {error}")
+            failed.append(reference)
+    if failed:
+        raise MirrorError(f"{len(failed)} of {checked_images} image(s) failed provenance: {', '.join(failed)}")
+    progress(f"{checked_images} image(s) verified")
 
 
 def pin(image):
@@ -956,7 +1098,10 @@ def sync(path, ledger_file, dry_run=False):
                 progress(f"pushed to MIRROR_REGISTRY: {low}/{image['target']}:{tag}@{transfer}")
                 copied += 1
                 changed.append({"repository": image["target"], "tag": tag, "digest": transfer})
-            ledger["synced"][key] = {"pin": pin(image), "digest": transfer, "tags": tags}
+            record = {"pin": pin(image), "digest": transfer, "tags": tags}
+            if platform and transfer != image["digest"] and not CHART_SOURCE.fullmatch(image["source"].partition("@")[0]):
+                record["provenance"] = push_provenance(image, transfer, low, ledger, dry_run)
+            ledger["synced"][key] = record
         except UsageError:
             raise
         except MirrorError as error:  # one image that still fails after retries does not stop the rest
@@ -1134,7 +1279,8 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
     entries = [name for text in entries for name in named(text)]
     entries += [name for file in files_from or () for _, text in list_lines(file) for name in named(text)]
     if entries:
-        return [found for entry in entries for found in export_tags(entry)]
+        found = [found for entry in entries for found in export_tags(entry)]
+        return found + [proof for image in found for proof in provenance_of(*image)]
     low = registry("MIRROR_REGISTRY")
     ledger = load_ledger(ledger_file, low)
     synced, sent = ledger["synced"], ledger["sent"]
@@ -1147,8 +1293,12 @@ def wanted_images(path, ledger_file, entries, files_from, everything):
             progress(f"not synced yet, {how}: {image['target']}:{image['tag']}")
             continue
         last = sent.get(f"{image['target']}:{image['tag']}") or {}
-        if everything or last.get("digest") != record["digest"]:
-            found += [(low, image["target"], tag) for tag in record["tags"]]
+        tags = record["tags"] if everything or last.get("digest") != record["digest"] else []
+        proof = provenance_tag(record["digest"])  # sent with its image, and again whenever it changes
+        if record.get("provenance") and (tags or (sent.get(f"{image['target']}:{proof}") or {}).get("digest") != record["provenance"]):
+            tags = [*tags, proof]
+        if tags:
+            found += [(low, image["target"], tag) for tag in tags]
         else:
             # The ledger keys on target path and digest, not source: a new source at a sent digest is not sent.
             when = f" on {last['time']}" if last.get("time") else ""
@@ -1457,6 +1607,12 @@ def import_tar(tar, staging=None, no_clobber=False, base=None, no_checksum=False
             directory = layout / image["dir"]
             if "sha256:" + sha256(directory / "manifest.json") != image["digest"]:
                 raise MirrorError(f"{image['target']}:{image['tag']} does not match its recorded digest")
+            proof = PROVENANCE_TAG.fullmatch(image["tag"])
+            if proof:
+                try:
+                    check_provenance(directory, "sha256:" + proof[1])
+                except MirrorError as error:
+                    raise MirrorError(f"{image['target']}:{image['tag']}: {error}") from error
             target = rebase(image["target"], base)
             destination = f"docker://{high}/{target}:{image['tag']}"
             present = present_digest(destination, "MIRROR_REGISTRY")
@@ -1619,6 +1775,7 @@ High side:
   export MIRROR_REGISTRY=registry.high.example.com
   {prog} import /mnt/diode/received              # every tar there, removed once imported
   {prog} import /media/usb/carry.tar             # one tar, kept (--no-checksum without its .sha256)
+  {prog} verify-provenance team/app:v1          # with MIRROR_PLATFORM: the image is that platform of the pinned index
 
 Run "{prog} <command> -h" for each command's options and examples.
 """
@@ -1754,6 +1911,18 @@ def build_parser():
     base_flag(import_command)
     dry_flag(import_command, "the pushes and the inbox files it would remove")
 
+    proof_command = command(
+        "verify-provenance", "check images in MIRROR_REGISTRY against the provenance images sync made beside them",
+        "  {prog} verify-provenance                    # every catalog image\n"
+        "  {prog} verify-provenance team/app:v1 team/db   # a tag, every tag of a repository",
+        "With MIRROR_PLATFORM, sync copies one platform's image out of the upstream index images.txt pins, and\n"
+        "pushes a provenance image beside it, tagged sha256-<image digest hex>.prov, holding the index's exact\n"
+        "bytes. This reads only MIRROR_REGISTRY, so it runs offline on the high side. An image passes when\n"
+        "images.txt pins it at its own digest (it crossed whole), or when its provenance image's index hashes\n"
+        "to the digest it records, lists the image for its platform and, when images.txt names the image, is\n"
+        "the digest it pins. Any failure exits 1.\n\n")
+    proof_command.add_argument("images", nargs="*", help="repo:tag or repo in MIRROR_REGISTRY, or an images.txt line")
+
     request_command = command(
         "request", "ask the low NiFi, through MIRROR_REQUEST_URL, to carry images from MIRROR_REGISTRY",
         "  {prog} request                       # synced and not yet sent (sync does this itself)\n"
@@ -1876,6 +2045,8 @@ def main(argv=None):
                    args.staging_dir, base, args.dry_run, args.from_source)
         elif args.command == "import":
             import_all(args.sources, args.staging_dir, args.no_clobber, base, args.keep, args.no_checksum, args.dry_run)
+        elif args.command == "verify-provenance":
+            verify_provenance(args.catalog, args.images)
         elif args.command == "login":
             login(args.login_registry, args.username, args.password_stdin)
         elif args.command == "add":
