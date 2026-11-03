@@ -72,8 +72,7 @@ Choose one source:
    | `release-assets.githubusercontent.com` | Where GitHub redirects release downloads |
    | The registry in `SYFT_IMAGE` and `GRYPE_IMAGE` | The [scanner images](#scanner-images). Also allow its blob storage host if it redirects layer downloads there |
 
-   `grype.anchore.io` is not needed. Set `GRYPE_CHECK_FOR_APP_UPDATE=false` and
-   `SYFT_CHECK_FOR_APP_UPDATE=false`, or each run also tries Anchore's release check (see
+   `grype.anchore.io` is not needed: `.gitlab-ci.yml` turns off Anchore's release check (see
    [Closed networks: update checks](#closed-networks-update-checks)). Set `HTTPS_PROXY` on the runner.
    On a shell runner, podman passes the proxy variables into the scanner container by default.
 3. **A copy inside a closed network.** Copy two files across, from Anchore or from the GitHub mirror,
@@ -124,8 +123,8 @@ On a shell runner, `run_image` passes every `GRYPE_` and `SYFT_` variable into t
 Syft and Grype each ask Anchore for a newer release of themselves on every run. Where Anchore is not
 reachable the check fails and logs an error such as
 `failed to fetch latest version ... toolbox-data.anchore.io ... no such host`. The scan carries on, but
-the line hides real errors. `.gitlab-ci.yml` sets `GRYPE_CHECK_FOR_APP_UPDATE=false`. Set
-`SYFT_CHECK_FOR_APP_UPDATE=false` as a CI/CD variable too, on the project or the group.
+the line hides real errors. `.gitlab-ci.yml` sets `GRYPE_CHECK_FOR_APP_UPDATE=false` and
+`SYFT_CHECK_FOR_APP_UPDATE=false`, so nothing needs setting by hand.
 
 These checks are separate from the database. `GRYPE_DB_AUTO_UPDATE` and `GRYPE_DB_UPDATE_URL` decide
 where the database comes from. `scan` sets `GRYPE_DB_AUTO_UPDATE=false` itself after its one update.
