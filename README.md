@@ -121,7 +121,7 @@ A flag wins over its variable.
 | Webhook | `MIRROR_REQUEST_URL`, `MIRROR_REQUEST_TOKEN`, `MIRROR_REQUEST_CA_BUNDLE` | none | Where `sync` and `request` post the request for NiFi to pull images. Unset: `sync` only copies. Token sent as `Authorization: Bearer` |
 | Resend | `MIRROR_RESEND_IMAGES`, `MIRROR_RESEND_ALL` | none, `false` | Send these images again, or every synced image, as [above](#send-a-batch-again). `MIRROR_RESEND_ALL` also applies to `sync`, `request` and `export` by hand |
 | Pipeline | `MIRROR_SCAN`, `GRYPE_FAIL_ON`, `MIRROR_JOB_TAG` | `false`, `critical`, any runner | The Syft and Grype gate before `sync`, its threshold, the runner tag. See [docs/scanning.md](docs/scanning.md) |
-| Pipeline | `MIRROR_RESCAN`, `GRYPE_DB_UPDATE_URL`, `GRYPE_DB_CA_CERT` | `false`, `grype.anchore.io`, system roots | Scan every image again and sync nothing, for a nightly schedule. Where Grype gets its database, and the CA it trusts there |
+| Pipeline | `MIRROR_RESCAN`, `GRYPE_DB_UPDATE_URL`, `GRYPE_DB_CA_CERT`, `GRYPE_DB_MAX_ALLOWED_BUILT_AGE` | `false`, `grype.anchore.io`, system roots, `120h` | Scan every image again and sync nothing, for a nightly schedule. Where Grype gets its database (Anchore, a GitHub release mirror or a copy in a closed network), the CA it trusts there, and how old the database may be. Set per project, group or instance. See [docs/scanning.md](docs/scanning.md#grypes-vulnerability-database) |
 | Pipeline | `DTRACK_URL`, `DTRACK_API_KEY` | unset | With `MIRROR_SCAN`, `sync` also sends each synced image's SBOM to Dependency-Track. See [docs/scanning.md](docs/scanning.md) |
 | Pipeline | `MIRROR_RENOVATE_PROJECT`, `MIRROR_RENOVATE_REF` | none, `main` | The Renovate runner project the `pin` job starts for a line without a digest. See [docs/renovate-pinning.md](docs/renovate-pinning.md) |
 
@@ -130,7 +130,7 @@ A flag wins over its variable.
 - Each `MIRROR_REGISTRY` holds the repositories, or the push account may create them.
 - The low NiFi's PlanRegistryTransfer lists every `images.txt` target path in Allowed Repositories.
 - A registry outside `MIRROR_REGISTRY` and `MIRROR_SOURCE_REGISTRY` that `export` reads needs your own `skopeo login`.
-- In the pipeline: a protected default branch, **Pipelines must succeed**, a nightly schedule. `MIRROR_SCAN=true` needs `grype.anchore.io` through the proxy or a copy at `GRYPE_DB_UPDATE_URL`, and `podman` on a shell runner.
+- In the pipeline: a protected default branch, **Pipelines must succeed**, a nightly schedule. `MIRROR_SCAN=true` needs `grype.anchore.io` through the proxy, a GitHub release mirror or a copy at `GRYPE_DB_UPDATE_URL`, and `podman` on a shell runner.
 
 ## Behaviour
 
