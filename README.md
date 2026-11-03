@@ -95,7 +95,7 @@ Global flags go before the command: `--catalog FILE` (default `images.txt`), `--
 | `list` | low | Validates and lists the catalog | none |
 | `pending` | low | Lists catalog sources `sync` has not copied yet | none |
 | `check FILE...` | low | Fails when a Containerfile or manifest uses an image the catalog lacks; `-` reads stdin | none |
-| `sync` | low | Copies every catalog image into `MIRROR_REGISTRY` at its pinned digest | `-n`, `--dry-run` |
+| `sync` | low | Copies every catalog image into `MIRROR_REGISTRY` at its pinned digest. Each tag also gets a digest tag that never moves, `<tag>-<first 12 hex of the digest>` (the platform image's digest with `MIRROR_PLATFORM`), so when upstream rebuilds a tag the old image stays tagged, safe from garbage collection. `request`, `export` and `import` carry it with its tag | `-n`, `--dry-run` |
 | `export IMAGE...` or `export --all` | low | Writes the named images, or every synced catalog image, to `NAME.tar` and `NAME.tar.sha256` | `--all`, `-T FILE` (`images.txt` lines work), `-o NAME.tar` or `-o -`, `--max-size SIZE`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |
 | `request [IMAGE...]` | low | POSTs one webhook request to `MIRROR_REQUEST_URL` naming images in `MIRROR_REGISTRY` for the low NiFi to carry: what is synced and not yet requested, `--all`, or the names given (references or `images.txt` lines) | `--all`, `-T FILE` (`-` is stdin), `-n` |
 | `import SOURCE...` | high | Pushes the images in tars, or every tar in a directory, into `MIRROR_REGISTRY` | `-k`, `--no-clobber`, `--no-checksum`, `--staging-dir DIR`, `--rewrite-base-path ORG` or `--strip-components N`, `-n` |

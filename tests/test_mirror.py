@@ -304,7 +304,8 @@ class MirrorTest(MirrorCase):
             os.environ.update(MIRROR_LEDGER_TOKEN='token', MIRROR_LEDGER=url)
             with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=urlopen):
                 self.assertEqual(self.cli('export', '--all', '-o', self.root / 'manual.tar'), 0)
-                self.assertEqual(self.tar_images(self.root / 'manual.tar'), [(f'{LOW}/team/app:1.0', 'team/app', '1.0')])
+                self.assertEqual([i[2] for i in self.tar_images(self.root / 'manual.tar')],
+                                 ['1.0', mirror.digest_tag('1.0', pipeline['synced']['team/app:1.0']['digest'])])
                 self.assertIn('the pipeline has not synced it at this digest; name it to export it anyway: team/db:2',
                               self.err.getvalue())
                 self.assertEqual(self.cli('sync'), 0)
@@ -321,9 +322,10 @@ class MirrorTest(MirrorCase):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
             self.assertEqual(self.cli('sync'), 0)
-            self.assertEqual(registry.tags, {f'{LOW}/team/app:1.0': app, f'{LOW}/team/db:2': db})
+            self.assertEqual(registry.tags, {f'{LOW}/team/app:1.0': app, f'{LOW}/team/app:1.0-{app[7:19]}': app,
+                                             f'{LOW}/team/db:2': db, f'{LOW}/team/db:2-{db[7:19]}': db})
             ledger = json.loads(self.ledger.read_text())
-            self.assertEqual(ledger['synced']['team/app:1.0'], {'pin': app, 'digest': app, 'tags': ['1.0']})
+            self.assertEqual(ledger['synced']['team/app:1.0'], {'pin': app, 'digest': app, 'tags': ['1.0', f'1.0-{app[7:19]}']})
             with mock.patch.object(mirror, 'copy') as again:
                 self.assertEqual(self.cli('sync'), 0)
             again.assert_not_called()
@@ -366,8 +368,10 @@ class MirrorTest(MirrorCase):
             [(args, headers, body, auth)] = sent
             self.assertEqual(body['registry'], LOW)
             self.assertEqual(body['images'], [{'repository': 'team/app', 'tag': '1.0', 'digest': app},
-                                              {'repository': 'team/db', 'tag': '2', 'digest': db}])
-            self.assertEqual(body['references'], 'team/app:1.0\nteam/db:2')
+                                              {'repository': 'team/app', 'tag': f'1.0-{app[7:19]}', 'digest': app},
+                                              {'repository': 'team/db', 'tag': '2', 'digest': db},
+                                              {'repository': 'team/db', 'tag': f'2-{db[7:19]}', 'digest': db}])
+            self.assertEqual(body['references'], f'team/app:1.0\nteam/app:1.0-{app[7:19]}\nteam/db:2\nteam/db:2-{db[7:19]}')
             for header in ('Content-Type: application/json', 'X-Artifact-Type: container-images-request',
                            'X-Artifact-Format: json', 'Filename: container-images-request.json', 'Expect:'):
                 self.assertIn(header, headers)
@@ -383,7 +387,7 @@ class MirrorTest(MirrorCase):
             code, sent = self.webhook(registry)
             headers = sent[0][1]
             self.assertIn(f'X-Registry: {LOW}', headers)
-            self.assertIn('X-Image-Count: 2', headers)
+            self.assertIn('X-Image-Count: 4', headers)
             self.assertFalse([h for h in headers if h.startswith('X-CI-')])
             self.assertTrue(max(map(len, headers)) < 200)  # the image list is in the body only
 
@@ -406,16 +410,17 @@ class MirrorTest(MirrorCase):
             app, db = self.two_images(registry)
             self.assertEqual(self.cli('sync'), 0)  # synced with no webhook set: nothing asked for yet
             code, sent = self.webhook(registry)
-            self.assertEqual(len(sent[0][2]['images']), 2)
+            self.assertEqual(len(sent[0][2]['images']), 4)
             ledger = json.loads(self.ledger.read_text())['sent']
-            self.assertEqual({k: v['digest'] for k, v in ledger.items()}, {'team/app:1.0': app, 'team/db:2': db})
+            self.assertEqual({k: v['digest'] for k, v in ledger.items()}, {
+                'team/app:1.0': app, f'team/app:1.0-{app[7:19]}': app, 'team/db:2': db, f'team/db:2-{db[7:19]}': db})
             self.assertRegex(ledger['team/app:1.0']['time'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
             code, sent = self.webhook(registry)  # every tag sent already
             self.assertEqual((code, sent), (0, []))
             self.assertIn(f"already sent at {app} on {ledger['team/app:1.0']['time']}", self.err.getvalue())
             with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'yes', 'CI_PIPELINE_URL': 'https://git.example/p/9'}):
                 code, sent = self.webhook(registry)
-            self.assertEqual(len(sent[0][2]['images']), 2)
+            self.assertEqual(len(sent[0][2]['images']), 4)
             self.assertEqual(json.loads(self.ledger.read_text())['sent']['team/db:2']['pipeline'], 'https://git.example/p/9',
                              'a resend records its own pipeline')
             del os.environ['MIRROR_REQUEST_URL']
@@ -425,7 +430,7 @@ class MirrorTest(MirrorCase):
     def test_a_tag_copied_again_at_a_sent_digest_is_asked_for_again_even_after_a_failed_request(self):
         with Registry(self) as registry:
             app, db = self.two_images(registry)
-            self.assertEqual(len(self.webhook(registry)[1][0][2]['images']), 2)
+            self.assertEqual(len(self.webhook(registry)[1][0][2]['images']), 4)
             del registry.tags[f'{LOW}/team/db:2']  # the low registry lost it, so the high one may have too
             code, sent = self.webhook(registry, error='curl: (7) Failed to connect')
             self.assertEqual((code, sent), (0, []))
@@ -443,13 +448,16 @@ class MirrorTest(MirrorCase):
             with mock.patch.object(mirror, 'notify') as post:
                 self.assertEqual(self.cli('request', '-T', listing, 'team/db:2'), 0)
             self.assertEqual(post.call_args[0][1], [{'repository': 'team/db', 'tag': '2', 'digest': db},
-                                                    {'repository': 'team/app', 'tag': '1.0', 'digest': app}])
+                                                    {'repository': 'team/db', 'tag': f'2-{db[7:19]}', 'digest': db},
+                                                    {'repository': 'team/app', 'tag': '1.0', 'digest': app},
+                                                    {'repository': 'team/app', 'tag': f'1.0-{app[7:19]}', 'digest': app}])
             self.assertEqual(self.cli('request', '-n', 'team/app:1.0'), 0)
-            self.assertEqual(self.out.getvalue(), f'would request: {LOW}/team/app:1.0@{app}\n')
+            self.assertEqual(self.out.getvalue(), f'would request: {LOW}/team/app:1.0@{app}\n'
+                                                  f'would request: {LOW}/team/app:1.0-{app[7:19]}@{app}\n')
             self.out.truncate(0)
             self.out.seek(0)
             self.assertEqual(self.cli('request', '--all', '--dry-run'), 0)
-            self.assertEqual(len(self.out.getvalue().splitlines()), 2)
+            self.assertEqual(len(self.out.getvalue().splitlines()), 4)
             with mock.patch.object(mirror, 'notify') as post:
                 self.assertEqual(self.cli('request', 'other.example.com/team/app:1.0'), 1)
                 self.assertEqual(self.cli('request', 'team/app:1.0', 'team/ap:1.0'), 1)
@@ -475,7 +483,7 @@ class MirrorTest(MirrorCase):
             self.assertEqual(code, 0)
             self.assertIn('warning: webhook not delivered', sys.stderr.getvalue())
             self.assertNotIn('s3cret', sys.stderr.getvalue())
-            self.assertEqual(len(registry.tags), 2)
+            self.assertEqual(len(registry.tags), 4)
 
     def test_latest_gets_its_version_tag_but_never_one_the_catalog_pins_or_pinned(self):
         with Registry(self) as registry, mock.patch.object(mirror, 'app_version', return_value='8.10.2'):
@@ -495,6 +503,75 @@ class MirrorTest(MirrorCase):
                 self.ledger.write_text(json.dumps(ledger))
                 self.assertEqual(self.cli('sync'), 0)
             self.assertEqual(registry.tags[f'{LOW}/team/redis:9.0.0'], pinned)
+
+    def test_a_moved_tag_leaves_the_old_image_tagged_by_digest_and_sends_only_the_new_tags(self):
+        os.environ['MIRROR_REQUEST_URL'] = 'https://nifi.example.internal/contentListener'
+        with Registry(self) as registry, mock.patch.object(mirror, 'notify') as post:
+            old, new = registry.image('nginx old'), registry.image('nginx rebuilt')
+            self.catalog.write_text(f'docker.io/library/nginx:1.38.1@{old} team/nginx\n')
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(self.cli('request'), 0)
+            self.catalog.write_text(f'docker.io/library/nginx:1.38.1@{new} team/nginx\n')  # upstream rebuilt the tag
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(registry.tags[f'{LOW}/team/nginx:1.38.1'], new)
+            self.assertEqual(registry.tags[f'{LOW}/team/nginx:1.38.1-{old[7:19]}'], old, 'the old image stays tagged')
+            self.assertEqual(registry.tags[f'{LOW}/team/nginx:1.38.1-{new[7:19]}'], new)
+            self.assertEqual(self.cli('request'), 0)
+            self.assertEqual(post.call_args[0][1], [{'repository': 'team/nginx', 'tag': '1.38.1', 'digest': new},
+                                                    {'repository': 'team/nginx', 'tag': f'1.38.1-{new[7:19]}', 'digest': new}])
+            # On the high side the tag moves like a docker push, and the old digest keeps its tag.
+            tar = self.root / 'moved.tar'
+            self.assertEqual(self.cli('export', 'team/nginx:1.38.1', '-o', tar), 0)
+            self.assertEqual([i[2] for i in self.tar_images(tar)], ['1.38.1', f'1.38.1-{new[7:19]}'])
+            os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
+            registry.tags['high.example.internal/team/nginx:1.38.1'] = old
+            registry.tags[f'high.example.internal/team/nginx:1.38.1-{old[7:19]}'] = old
+            self.assertEqual(self.cli('import', tar), 0)
+            self.assertEqual(registry.tags['high.example.internal/team/nginx:1.38.1'], new)
+            self.assertEqual(registry.tags[f'high.example.internal/team/nginx:1.38.1-{old[7:19]}'], old)
+
+    def test_an_image_synced_before_digest_tags_gains_its_tag_from_the_low_registry_and_sends_only_it(self):
+        os.environ['MIRROR_REQUEST_URL'] = 'https://nifi.example.internal/contentListener'
+        with Registry(self) as registry, mock.patch.object(mirror, 'notify') as post:
+            app, _ = self.two_images(registry)
+            self.catalog.write_text(f'docker.io/team/app:1.0@{app} team/app\n')
+            registry.tags[f'{LOW}/team/app:1.0'] = app
+            self.ledger.write_text(json.dumps({'registry': LOW, 'pinned': ['team/app:1.0'],
+                                               'platforms': {f'{app}  1.0': [app, ['1.0']]},
+                                               'synced': {'team/app:1.0': {'pin': app, 'digest': app, 'tags': ['1.0']}},
+                                               'sent': {'team/app:1.0': {'digest': app}}}))
+            copies = []
+            real = mirror.copy
+            with mock.patch.object(mirror, 'copy', side_effect=lambda *a: copies.append(a[:2]) or real(*a)), \
+                    mock.patch.object(mirror, 'platform_digest', side_effect=AssertionError('no upstream read')):
+                self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(copies, [(f'docker://{LOW}/team/app@{app}', f'docker://{LOW}/team/app:1.0-{app[7:19]}')])
+            self.assertEqual(self.cli('request'), 0)
+            self.assertEqual(post.call_args[0][1], [{'repository': 'team/app', 'tag': f'1.0-{app[7:19]}', 'digest': app}])
+            post.reset_mock()
+            self.assertEqual(self.cli('request'), 0)
+            post.assert_not_called()
+
+    def test_a_digest_tag_fits_the_tag_limit_and_pattern(self):
+        digest = 'sha256:' + '0123456789ab' + 'f' * 52
+        self.assertEqual(mirror.digest_tag('1.38.1', digest), '1.38.1-0123456789ab')
+        longest = mirror.digest_tag('v' * 128, digest)
+        self.assertEqual(len(longest), 128)
+        self.assertRegex(longest, rf'^{mirror.TAG}$')
+
+    def test_max_size_counts_another_tag_of_an_image_in_the_same_tar_as_free(self):
+        images = [{'host': LOW, 'repo': 'team/app', 'tag': t, 'digest': d}
+                  for t, d in (('1.0', 'sha256:a'), ('1.0-a', 'sha256:a'), ('2.0', 'sha256:b'))]
+        with mock.patch.object(mirror, 'image_bytes', return_value=10):
+            self.assertEqual([[i['tag'] for i in g] for g in mirror.groups(images, 5)], [['1.0', '1.0-a'], ['2.0']])
+
+    def test_latest_and_its_version_each_get_a_digest_tag(self):
+        with Registry(self) as registry, mock.patch.object(mirror, 'app_version', return_value='8.10.2'):
+            latest = registry.image('latest')
+            self.catalog.write_text(f'docker.io/bitnami/redis:latest@{latest} team/redis\n')
+            self.assertEqual(self.cli('sync'), 0)
+            self.assertEqual(json.loads(self.ledger.read_text())['synced']['team/redis:latest']['tags'],
+                             ['latest', '8.10.2', f'latest-{latest[7:19]}', f'8.10.2-{latest[7:19]}'])
 
     def test_pending_lists_what_sync_has_not_copied(self):
         with Registry(self) as registry:
@@ -555,19 +632,18 @@ class MirrorTest(MirrorCase):
             self.cli('sync')
             first = self.root / 'first.tar'
             self.assertEqual(self.cli('export', '--all', '-o', first), 0)
-            self.assertEqual(self.tar_images(first), [(f'{LOW}/team/app:1.0', 'team/app', '1.0'),
-                                                      (f'{LOW}/team/db:2', 'team/db', '2')])
+            self.assertEqual([i[2] for i in self.tar_images(first)], ['1.0', f'1.0-{app[7:19]}', '2', f'2-{db[7:19]}'])
             self.assertEqual(self.cli('export', '--all', '-o', self.root / 'again.tar'), 0)
-            self.assertEqual(len(self.tar_images(self.root / 'again.tar')), 2, 'export records nothing, so --all repeats')
+            self.assertEqual(len(self.tar_images(self.root / 'again.tar')), 4, 'export records nothing, so --all repeats')
             with mock.patch.dict(os.environ, {'MIRROR_RESEND_ALL': 'True'}):
                 self.assertEqual(self.cli('export', '-o', self.root / 'env-all.tar'), 0)
-            self.assertEqual(len(self.tar_images(self.root / 'env-all.tar')), 2)
+            self.assertEqual(len(self.tar_images(self.root / 'env-all.tar')), 4)
             new = registry.image('app-1.1')
             self.catalog.write_text(f'docker.io/team/app:1.1@{new} team/app\ndocker.io/team/db:2@{db} team/db\n')
             self.cli('sync')
             self.assertEqual(self.cli('export', '--all', '-o', self.root / 'all.tar'), 0)
-            self.assertEqual(self.tar_images(self.root / 'all.tar'), [(f'{LOW}/team/app:1.1', 'team/app', '1.1'),
-                                                                     (f'{LOW}/team/db:2', 'team/db', '2')])
+            self.assertEqual([i[2] for i in self.tar_images(self.root / 'all.tar')],
+                             ['1.1', f'1.1-{new[7:19]}', '2', f'2-{db[7:19]}'])
 
     def test_export_names_images_from_args_a_list_or_any_registry_and_rewrites_the_base_path(self):
         with Registry(self) as registry:
@@ -644,7 +720,7 @@ class MirrorTest(MirrorCase):
                 real(source, destination, *sides)
             with mock.patch.object(mirror, 'copy', side_effect=limited):
                 self.assertEqual(self.cli('sync'), 1)
-            self.assertEqual(registry.tags, {f'{LOW}/team/db:2': db})
+            self.assertEqual(registry.tags, {f'{LOW}/team/db:2': db, f'{LOW}/team/db:2-{db[7:19]}': db})
             ledger = json.loads(self.ledger.read_text())
             self.assertEqual(list(ledger['synced']), ['team/db:2'])
             self.assertIn('1 of 2 image(s) not synced:\n  team/app:1.0: skopeo copy failed: toomanyrequests',
@@ -1034,15 +1110,16 @@ class MirrorTest(MirrorCase):
                 self.out.seek(0)
                 self.assertEqual(self.cli(*args), 0)
                 self.assertEqual(self.out.getvalue().splitlines(), [
-                    f'would request: {LOW}/team/app:1.0@{amd}', f'would request: {LOW}/team/app:{proof}@{record["provenance"]}'])
+                    f'would request: {LOW}/team/app:1.0@{amd}', f'would request: {LOW}/team/app:1.0-{amd[7:19]}@{amd}',
+                    f'would request: {LOW}/team/app:{proof}@{record["provenance"]}'])
             ledger = json.loads(self.ledger.read_text())
-            ledger['sent'] = {'team/app:1.0': {'digest': amd}}  # sent before provenance existed
+            ledger['sent'] = {'team/app:1.0': {'digest': amd}, f'team/app:1.0-{amd[7:19]}': {'digest': amd}}  # before provenance
             self.ledger.write_text(json.dumps(ledger))
             self.assertEqual(mirror.wanted_images(self.catalog, self.ledger, (), None, False), [(LOW, 'team/app', proof)])
             # export and import carry it; import checks it before the first push.
             tar = self.root / 'carry.tar'
             self.assertEqual(self.cli('export', '--all', '-o', tar), 0)
-            self.assertEqual([i[2] for i in self.tar_images(tar)], ['1.0', proof])
+            self.assertEqual([i[2] for i in self.tar_images(tar)], ['1.0', f'1.0-{amd[7:19]}', proof])
             os.environ['MIRROR_REGISTRY'] = 'high.example.internal'
             self.assertEqual(self.cli('import', tar), 0)
             self.assertEqual(registry.tags['high.example.internal/team/app:' + proof], record['provenance'])
