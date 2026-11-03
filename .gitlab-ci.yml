@@ -9,9 +9,12 @@ workflow:
 stages: [verify, publish]
 variables:
   PYTHON_IMAGE: 'docker.io/python@sha256:cd7c412d000912f29075a1b8803e43cb2f38bb67f104019df526df5ceaf30569'
-  # Debug variants carry a busybox shell; the binaries are /syft and /grype.
-  SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
-  GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
+  # Debug variants carry a busybox shell; the binaries are /syft and /grype. Point both at your mirror's
+  # copies: replace registry.example.com here, or set SYFT_IMAGE and GRYPE_IMAGE as CI/CD variables.
+  # The digests are the amd64 images sync copies, the same in any mirror. Renovate moves them once sync
+  # has copied a new tag. See docs/scanning.md#scanner-images.
+  SYFT_IMAGE: 'registry.example.com/mirror/anchore--syft:v1.56.0-debug@sha256:9bea1a6186677711a05ab708cf90269d05fddd5c4dd7f176c6db29043093a1af'
+  GRYPE_IMAGE: 'registry.example.com/mirror/anchore--grype:v0.121.1-debug@sha256:f04c46a2e7d4d68c5a0a54f40ac727bd8a885600b4275116558d5f5518531285'
   GRYPE_FAIL_ON: 'critical'
   # true adds the Syft SBOM and Grype scan before sync; sync waits for them. Grype needs its database:
   # grype.anchore.io through the proxy, or a copy you host (GRYPE_DB_UPDATE_URL). See docs/scanning.md.
@@ -74,15 +77,23 @@ verify:
   tags: [$MIRROR_JOB_TAG]
   # A docker executor runs the job in the scanner's image; a shell executor has only podman, so
   # run_image starts the same image through it, with every GRYPE_ and SYFT_ variable. Grype's database
-  # goes in the job directory.
+  # goes in the job directory. For Syft only, the runner's podman login file, when it has one, is mounted
+  # read-only as its Docker config, so it can read a source in a private registry the runner can pull
+  # from. Grype reads SBOM files and gets no login.
   before_script:
     - |
       export GRYPE_DB_CACHE_DIR="$PWD/.grype-db"
       run_image() {
         image=$1; binary=$2; shift 2
-        if [ -x "$binary" ]; then "$binary" "$@"
-        else podman run --rm --user 0 -v "$PWD:$PWD:z" -w "$PWD" -e 'GRYPE_*' -e 'SYFT_*' \
-          --entrypoint "$binary" "$image" "$@"; fi
+        if [ -x "$binary" ]; then "$binary" "$@"; return; fi
+        login="${REGISTRY_AUTH_FILE:-$HOME/.config/containers/auth.json}"
+        if [ "$binary" = /syft ] && [ -r "$login" ]; then
+          set -- -v "$login:/run/registry-login/config.json:ro" -e DOCKER_CONFIG=/run/registry-login \
+            --entrypoint "$binary" "$image" "$@"
+        else
+          set -- --entrypoint "$binary" "$image" "$@"
+        fi
+        podman run --rm --user 0 -v "$PWD:$PWD:z" -w "$PWD" -e 'GRYPE_*' -e 'SYFT_*' "$@"
       }
   after_script:
     - rm -rf .grype-db

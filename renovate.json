@@ -34,6 +34,19 @@
       "autoReplaceStringTemplate": "{{{packageName}}}:{{newValue}}{{#if newDigest}}@{{newDigest}}{{/if}} ",
       "datasourceTemplate": "custom.helm-repository",
       "depTypeTemplate": "{{#if currentDigest}}pinned{{else}}unpinned{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.gitlab-ci\\.yml$/"
+      ],
+      "description": "The scanner images the sbom and scan jobs run, as copies in the mirror. Renovate offers a new tag only after sync has copied it there, so the images.txt merge request that brings a new scanner still scans with the previous one.",
+      "matchStrings": [
+        "(?m)^  (?:SYFT|GRYPE)_IMAGE: '(?<depName>[^\\s'@:]+/[^\\s'@:]+):(?<currentValue>[^\\s'@]+)@(?<currentDigest>sha256:[0-9a-f]{64})'"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
+      "depTypeTemplate": "pinned"
     }
   ],
   "customDatasources": {
