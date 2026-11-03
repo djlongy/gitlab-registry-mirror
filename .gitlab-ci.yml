@@ -19,8 +19,9 @@ variables:
   # true adds the Syft SBOM and Grype scan before sync; sync waits for them. Grype needs its database:
   # grype.anchore.io through the proxy, or a copy you host (GRYPE_DB_UPDATE_URL). See docs/scanning.md.
   MIRROR_SCAN: 'false'
-  # The check for a newer Grype release only adds an error line where toolbox-data.anchore.io is blocked.
+  # The checks for a newer Grype or Syft release only add an error line where toolbox-data.anchore.io is blocked.
   GRYPE_CHECK_FOR_APP_UPDATE: 'false'
+  SYFT_CHECK_FOR_APP_UPDATE: 'false'
   MIRROR_RESCAN:
     value: 'false'
     options: ['false', 'true']
