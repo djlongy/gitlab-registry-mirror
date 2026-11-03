@@ -70,7 +70,7 @@ Choose one source:
    |---|---|
    | `github.com` | The listing and the archive URL. Both answer with a redirect |
    | `release-assets.githubusercontent.com` | Where GitHub redirects release downloads |
-   | The registry in `SYFT_IMAGE` and `GRYPE_IMAGE` | The scanner images (see [Runner tools](#runner-tools)). Also allow its blob storage host if it redirects layer downloads there |
+   | The registry in `SYFT_IMAGE` and `GRYPE_IMAGE` | The [scanner images](#scanner-images). Also allow its blob storage host if it redirects layer downloads there |
 
    `grype.anchore.io` is not needed. Set `GRYPE_CHECK_FOR_APP_UPDATE=false` and
    `SYFT_CHECK_FOR_APP_UPDATE=false`, or each run also tries Anchore's release check (see
@@ -143,6 +143,31 @@ the runner host needs nothing installed. Installed binaries skip the image pull 
 host, and a Grype too old to read the v6 listing fails `grype db update` with
 `no db candidates with correct version available`. Distribution packages often lag that far behind.
 `sync` needs neither tool.
+
+## Scanner images
+
+`SYFT_IMAGE` and `GRYPE_IMAGE` name copies in your own mirror, pinned by tag and by the digest of the
+amd64 image that `sync` copies, so CI does not pull them from Docker Hub. The defaults in
+`.gitlab-ci.yml` use the placeholder registry `registry.example.com`: replace it there, or set both as
+CI/CD variables on the project or group. Mirror the scanners like any other image, with `images.txt`
+lines such as:
+
+```text
+docker.io/anchore/syft:v1.56.0-debug@sha256:56bca34e29df3269873c9c25ccf07731a7b6991aee7dbf0b33ad8a5bebd7951e mirror/anchore--syft
+docker.io/anchore/grype:v0.121.1-debug@sha256:d5d8088d489f7ab723758e528427d8ea3c87fc6aeca27993df2ae265174da1c2 mirror/anchore--grype
+```
+
+A new scanner release takes two Renovate merge requests:
+
+1. The `images.txt` merge request moves the `anchore/syft` or `anchore/grype` line. Its pipeline still
+   scans with the previous scanner, because the new tag is not in the mirror yet.
+2. After `sync` on main copies the new tag, the next Renovate run finds it in the mirror and moves
+   `.gitlab-ci.yml`.
+
+Renovate reads the mirror with a read-only login: `REGISTRY_HOST`, `REGISTRY_USERNAME` and
+`REGISTRY_PASSWORD` on the Renovate runner project. Without it, Renovate cannot list the mirror's tags
+and step 2 never happens. Set the scanner images as CI/CD variables instead and Renovate does not
+move them: bump the variables by hand.
 
 ## Rescan every image
 
