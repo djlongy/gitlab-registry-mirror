@@ -32,27 +32,104 @@ was built (`grype db status`). Without a database the job stops:
 no vulnerability database from https://grype.anchore.io/databases: allow it through the proxy or host a copy
 ```
 
-Choose one:
+The source is Grype's own configuration, read from environment variables. Set them as CI/CD variables
+(**Settings > CI/CD > Variables**) on the project, its group or the instance (**Admin > CI/CD >
+Variables**). No YAML changes. A project variable overrides a group one, which overrides an instance one, so
+an airgap group can point at its own copy while the rest keep the default.
 
-1. **Through the proxy (recommended).** Allow `grype.anchore.io` for the runners. The database stays
-   current with nothing to maintain.
-2. **A copy you host.** Use this when the proxy cannot allow it.
-   1. On a machine that can reach `grype.anchore.io`, download the listing and the archive it names:
+| Variable | Default | Set it to |
+|---|---|---|
+| `GRYPE_DB_UPDATE_URL` | `https://grype.anchore.io/databases` | The listing URL. A URL ending in `.json` is used as is. Any other URL gets `/v6/latest.json` appended |
+| `GRYPE_DB_CA_CERT` | system roots | A PEM bundle for a server with a private CA. Use a variable of type **File**, so GitLab writes the PEM to a file and passes its path. A PEM in the repository (`certs/ca-bundle.crt`) also works |
+| `GRYPE_DB_MAX_ALLOWED_BUILT_AGE` | `120h` | How old a database may be. Raise it where the copy arrives days late, for example `336h` |
+| `GRYPE_DB_VALIDATE_AGE` | `true` | Leave it on. `false` scans with a database of any age and gives no warning |
+
+`scan` runs `grype db update` and stops when it fails, so `GRYPE_DB_REQUIRE_UPDATE_CHECK` changes nothing
+here. Each network has one source, so there is no fallback list: set the URL that network can reach.
+
+Choose one source:
+
+1. **Anchore through the proxy (recommended).** Allow `grype.anchore.io` for the runners. The database
+   stays current with nothing to maintain.
+2. **A GitHub release mirror.** For networks that reach GitHub but not Anchore. A mirror that publishes
+   each Anchore build as a GitHub release with a `listing.json` whose `path` names the uploaded archive
+   asset, such as [grype-db-mirror](https://github.com/example-org/grype-db-mirror), needs no token when public:
+
+   ```text
+   GRYPE_DB_UPDATE_URL=https://github.com/example-org/grype-db-mirror/releases/latest/download/listing.json
+   ```
+
+   Grype resolves the archive next to the listing (`releases/latest/download/<archive>`). The upstream
+   `latest.json` does not work from a release: GitHub replaces `:` in asset names with `.`, so its `path`
+   names a file the release does not have. A mirror that syncs hourly, as that one does, serves a new
+   build at most about 1 hour after Anchore's daily publish (06:53 to 07:47 UTC).
+3. **A copy inside a closed network.** Copy two files across, from Anchore or from the GitHub mirror,
+   and serve them without authentication.
+   1. On a machine that can reach the source, download the listing and the archive it names, and check
+      the archive against the listing:
 
       ```sh
-      curl -fsSLO https://grype.anchore.io/databases/v6/latest.json
-      curl -fsSLO "https://grype.anchore.io/databases/v6/$(python3 -c 'import json; print(json.load(open("latest.json"))["path"])')"
+      base=https://github.com/example-org/grype-db-mirror/releases/latest/download
+      curl -fsSL -o latest.json "$base/listing.json"
+      archive=$(python3 -c 'import json; print(json.load(open("latest.json"))["path"])')
+      curl -fsSLO "$base/$archive"
+      python3 -c 'import json; print(json.load(open("latest.json"))["checksum"][7:] + "  '"$archive"'")' | sha256sum -c -
       ```
 
-   2. Put both files in `v6/` on a web server the runners reach without authentication, for example
-      `https://files.example.internal/grype/databases/v6/`.
-   3. In this project, set `GRYPE_DB_UPDATE_URL=https://files.example.internal/grype/databases` (without
-      `v6/`). If the server uses an internal CA, set `GRYPE_DB_CA_CERT` to a PEM file in the repository,
-      such as `certs/ca-bundle.crt`.
-   4. Repeat at least every 5 days. Grype refuses a database built more than 120 hours ago
-      (`GRYPE_DB_MAX_ALLOWED_BUILT_AGE` changes the limit). A copy refreshed daily keeps the findings current.
+      From Anchore instead: `base=https://grype.anchore.io/databases/v6`, and download `latest.json`
+      itself rather than `listing.json`.
+   2. Serve both files from one directory named `v6/`. Upload the archive first and `latest.json` last,
+      so the listing never names a missing archive:
+
+      ```text
+      https://files.example.internal/grype/databases/v6/latest.json
+      https://files.example.internal/grype/databases/v6/vulnerability-db_v6.1.10_2026-11-01T00.24.34Z_1793514012.tar.zst
+      ```
+
+   3. Set `GRYPE_DB_UPDATE_URL=https://files.example.internal/grype/databases` (without `v6/`), plus
+      `GRYPE_DB_CA_CERT` if the server uses a private CA.
+   4. Refresh it daily. Grype refuses a database older than `GRYPE_DB_MAX_ALLOWED_BUILT_AGE` (120 hours by
+      default). If the copy takes longer to arrive, raise that limit.
+4. **A GitLab generic package fed across a one-way link.** A pipeline on the connected side publishes
+   the GitHub mirror's release into a GitLab generic package, the bundle crosses, and a pipeline on the
+   closed side publishes the same files into a generic package there. Point Grype at the closed side's
+   `current` listing:
+
+   ```text
+   GRYPE_DB_UPDATE_URL=https://$GRYPE_DB_SCANNER_USERNAME:$GRYPE_DB_SCANNER_TOKEN@gitlab.example.internal/api/v4/projects/<id>/packages/generic/grype-db/current/latest.json
+   ```
+
+   A private project answers anonymous reads with 401, so the URL carries a deploy token with only
+   `read_package_registry`. Keep both parts in masked CI variables. Grype prints the whole URL in
+   `grype db status` (which `scan` runs) and at `-v`, and only GitLab's masking keeps the token out of
+   the job log.
 
 On a shell runner, `run_image` passes every `GRYPE_` and `SYFT_` variable into the container.
+
+## Closed networks: update checks
+
+Syft and Grype each ask Anchore for a newer release of themselves on every run. Where Anchore is not
+reachable the check fails and logs an error such as
+`failed to fetch latest version ... toolbox-data.anchore.io ... no such host`. The scan carries on, but
+the line hides real errors. `.gitlab-ci.yml` sets `GRYPE_CHECK_FOR_APP_UPDATE=false`. Set
+`SYFT_CHECK_FOR_APP_UPDATE=false` as a CI/CD variable too, on the project or the group.
+
+These checks are separate from the database. `GRYPE_DB_AUTO_UPDATE` and `GRYPE_DB_UPDATE_URL` decide
+where the database comes from. `scan` sets `GRYPE_DB_AUTO_UPDATE=false` itself after its one update.
+
+## Runner tools
+
+| Executor | What the runner needs | How `sbom` and `scan` run |
+|---|---|---|
+| docker | Pull access to `SYFT_IMAGE` and `GRYPE_IMAGE` (mirror them into a registry the runner may pull from) | The job runs inside the image and calls `/syft` or `/grype` directly |
+| shell | `podman`, and pull access to the same two images | `run_image` starts the image with `podman run`, mounting the job directory |
+| shell, with the binaries | Syft and Grype installed as `/syft` and `/grype` | `run_image` calls them directly and skips podman |
+
+The images are the default because one line in `.gitlab-ci.yml` pins each version for every runner, and
+the runner host needs nothing installed. Installed binaries skip the image pull but are kept current per
+host, and a Grype too old to read the v6 listing fails `grype db update` with
+`no db candidates with correct version available`. Distribution packages often lag that far behind.
+`sync` needs neither tool.
 
 ## Rescan every image
 
