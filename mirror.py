@@ -498,6 +498,63 @@ def prune_ledger(now=None):
         warn(f"old ledger uploads not pruned: {error}")
 
 
+def current_sent_digests(synced):
+    """Per sent key (target:tag, including the .prov tag), the digests a still-current sync points at. A sent
+    record whose digest is in here is what pending reads to skip a resend, so it is never pruned by age."""
+    current = {}
+    for s_key, record in synced.items():
+        target = s_key.rsplit(":", 1)[0]
+        for tag in record.get("tags", []):
+            current.setdefault(f"{target}:{tag}", set()).add(record.get("digest"))
+        if record.get("provenance"):
+            current.setdefault(f"{target}:{provenance_tag(record['digest'])}", set()).add(record["provenance"])
+    return current
+
+
+def retention_days():
+    """MIRROR_LEDGER_RETENTION_DAYS as a number (default 365, 0 keeps forever). A bad value is a MirrorError,
+    so a run fails in preflight, never after request has already posted the webhook but before it saves."""
+    setting = os.environ.get("MIRROR_LEDGER_RETENTION_DAYS", "").strip()
+    try:
+        return float(setting) if setting else 365.0
+    except ValueError:
+        raise MirrorError(f"MIRROR_LEDGER_RETENTION_DAYS is not a number: {setting!r}") from None
+
+
+def stale_sent(ledger, now=None):
+    """Send-history keys safe to prune: older than MIRROR_LEDGER_RETENTION_DAYS (default 365, 0 keeps forever)
+    and no longer current, so dropping them never makes pending resend an image. An entry with no (or an
+    unreadable) time is kept, since its age is unknown."""
+    days = retention_days()
+    if days <= 0:
+        return []
+    cutoff = (now or datetime.now(timezone.utc)).timestamp() - days * 86400
+    current = current_sent_digests(ledger.get("synced", {}))
+    stale = []
+    for key, record in ledger.get("sent", {}).items():
+        when = record.get("time")
+        if not when:
+            continue
+        try:
+            sent_at = datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        if sent_at >= cutoff or record.get("digest") in current.get(key, ()):
+            continue
+        stale.append(key)
+    return stale
+
+
+def prune_sent(ledger, now=None):
+    """Drop stale send-history entries from the ledger in place. Returns the keys removed."""
+    stale = stale_sent(ledger, now)
+    for key in stale:
+        del ledger["sent"][key]
+    if stale:
+        progress(f"ledger: pruned {len(stale)} send record(s) older than {retention_days():g} day(s)")
+    return stale
+
+
 def normalise(source):
     """Expand a short name the way docker pull does: alpine:3 is docker.io/library/alpine:3.
     Only for references this program reads elsewhere (FROM lines, list files); the catalog holds every
@@ -1537,12 +1594,16 @@ def request(path, ledger_file, entries=(), files_from=None, everything=False, dr
         if not digest:  # every name is checked before the post, so a typo sends nothing
             raise MirrorError(f"{low}/{repository}:{tag} is not in MIRROR_REGISTRY; check the name, nothing was requested")
         images.append({"repository": repository, "tag": tag, "digest": digest})
-    if not images:
+    if not images and not dry_run:
         progress("nothing new to request")
         return
     if dry_run:
         for image in images:
             print(f"would request: {low}/{image['repository']}:{image['tag']}@{image['digest']}")
+        ledger = load_ledger(ledger_file, low, create=False)
+        for key in stale_sent(ledger) if ledger else []:
+            record = ledger["sent"][key]
+            print(f"would prune send record: {key}@{record.get('digest', '')} (sent {record.get('time', '?')})")
         return
     notify(low, images)
     ledger = load_ledger(ledger_file, low)
@@ -1550,6 +1611,7 @@ def request(path, ledger_file, entries=(), files_from=None, everything=False, dr
     pipeline = os.environ.get("CI_PIPELINE_URL", "")
     ledger["sent"].update({f"{i['repository']}:{i['tag']}": {"digest": i["digest"], "time": when, "pipeline": pipeline}
                            for i in images})
+    prune_sent(ledger)
     save_ledger(ledger_file, ledger)
     progress(f"requested {len(images)} image tag(s) from {low}")
 
@@ -1953,7 +2015,7 @@ def build_parser():
     request_command.add_argument("-T", "--files-from", type=Path, action="append", metavar="FILE",
                                  help="a file of references or images.txt lines, one per line; - is stdin")
     request_command.add_argument("--all", action="store_true", help="every synced catalog image (or MIRROR_RESEND_ALL=true)")
-    dry_flag(request_command, "the images it would request")
+    dry_flag(request_command, "the images it would request and the stale send records it would prune")
 
     login_command = command(
         "login", "log in to a registry for skopeo, as skopeo login does",
@@ -2044,6 +2106,7 @@ def main(argv=None):
         ca_files("MIRROR_REQUEST_CA_BUNDLE")
         ca_files()  # before any staging directory moves TMPDIR, and so a bad path fails first
         rate_limit_wait()  # a bad value fails now, not at the first rate limit halfway through a sync
+        retention_days()  # likewise, so a bad value never fails request after it has posted but before it saves
         ledger_file = ledger_location(args.catalog)
         if args.command == "sync":
             try:
