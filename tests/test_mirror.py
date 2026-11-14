@@ -288,6 +288,29 @@ class MirrorTest(MirrorCase):
         self.assertIn('not pruned: DELETE', stderr.getvalue())
         self.assertEqual(len(gitlab.uploads), 5)
 
+    def test_retention_prunes_only_old_superseded_send_records_never_a_current_one(self):
+        a, b = 'sha256:' + 'a' * 64, 'sha256:' + 'b' * 64
+        now = mirror.datetime(2027, 1, 1, tzinfo=mirror.timezone.utc)  # cutoff at 365 days is 2026-01-01
+        ledger = {
+            'registry': LOW,
+            'synced': {'team/app:1.0': {'pin': 'p', 'digest': a, 'tags': ['1.0', 'latest']}},
+            'sent': {
+                'team/app:1.0': {'digest': a, 'time': '2025-06-01T00:00:00Z'},   # old but still current: keep
+                'team/app:latest': {'digest': a, 'time': '2025-06-01T00:00:00Z'},  # current via tags: keep
+                'team/gone:5': {'digest': b, 'time': '2025-06-01T00:00:00Z'},     # old and superseded: prune
+                'team/new:2': {'digest': b, 'time': '2026-12-01T00:00:00Z'},      # superseded but recent: keep
+                'team/legacy:1': {'digest': b},                                   # no time, age unknown: keep
+            },
+        }
+        self.assertEqual(mirror.stale_sent(ledger, now), ['team/gone:5'])
+        with mock.patch.dict(os.environ, {'MIRROR_LEDGER_RETENTION_DAYS': '0'}):
+            self.assertEqual(mirror.stale_sent(ledger, now), [])  # 0 keeps forever
+        self.assertEqual(mirror.prune_sent(ledger, now), ['team/gone:5'])
+        self.assertEqual(set(ledger['sent']), {'team/app:1.0', 'team/app:latest', 'team/new:2', 'team/legacy:1'})
+        with mock.patch.dict(os.environ, {'MIRROR_LEDGER_RETENTION_DAYS': 'soon'}):
+            with self.assertRaisesRegex(mirror.MirrorError, 'MIRROR_LEDGER_RETENTION_DAYS is not a number'):
+                mirror.stale_sent(ledger, now)  # a bad value fails before request posts, not after
+
     def test_a_ledger_url_gives_a_manual_export_the_pipelines_synced_images_and_is_never_written(self):
         url = 'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'
         requests = []
