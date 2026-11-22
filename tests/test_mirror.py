@@ -307,9 +307,10 @@ class MirrorTest(MirrorCase):
             self.assertEqual(mirror.stale_sent(ledger, now), [])  # 0 keeps forever
         self.assertEqual(mirror.prune_sent(ledger, now), ['team/gone:5'])
         self.assertEqual(set(ledger['sent']), {'team/app:1.0', 'team/app:latest', 'team/new:2', 'team/legacy:1'})
-        with mock.patch.dict(os.environ, {'MIRROR_LEDGER_RETENTION_DAYS': 'soon'}):
-            with self.assertRaisesRegex(mirror.MirrorError, 'MIRROR_LEDGER_RETENTION_DAYS is not a number'):
-                mirror.stale_sent(ledger, now)  # a bad value fails before request posts, not after
+        for bad in ('soon', 'nan', 'inf'):  # nan would prune recent records; each fails before request posts
+            with mock.patch.dict(os.environ, {'MIRROR_LEDGER_RETENTION_DAYS': bad}):
+                with self.assertRaisesRegex(mirror.MirrorError, 'MIRROR_LEDGER_RETENTION_DAYS is not a number'):
+                    mirror.stale_sent(ledger, now)
 
     def test_a_ledger_url_gives_a_manual_export_the_pipelines_synced_images_and_is_never_written(self):
         url = 'https://git.example.internal/api/v4/projects/7/packages/generic/registry-mirror-ledger/v2/ledger.json'
