@@ -516,9 +516,12 @@ def retention_days():
     so a run fails in preflight, never after request has already posted the webhook but before it saves."""
     setting = os.environ.get("MIRROR_LEDGER_RETENTION_DAYS", "").strip()
     try:
-        return float(setting) if setting else 365.0
+        days = float(setting) if setting else 365.0
     except ValueError:
-        raise MirrorError(f"MIRROR_LEDGER_RETENTION_DAYS is not a number: {setting!r}") from None
+        days = math.nan
+    if not math.isfinite(days):  # nan would make every age comparison false and prune any old-or-new record
+        raise MirrorError(f"MIRROR_LEDGER_RETENTION_DAYS is not a number: {setting!r}")
+    return days
 
 
 def stale_sent(ledger, now=None):
